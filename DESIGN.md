@@ -7,20 +7,13 @@ This project's name and original concept are based on
 — a DIY 5-track stereo loop station for the Electrosmith Daisy Seed. This
 firmware is a from-scratch rewrite adapted for the Daisy Pod's built-in
 controls plus an added OLED menu, with a different internal architecture
-(the DSP layer here has no direct hardware dependency) and an expanded
-feature set (per-layer filters/effects/reverb, tempo-locked count-in, SD
-card save/load), but the name, general concept, and file organization carry
-over from that original project.
+(the DSP layer has no direct hardware dependency) and an expanded feature
+set (per-layer filter/effect/reverb/pitch, tempo-locked count-in, a live
+waveform display, SD card save/load), but the name, general concept, and
+file organization carry over from that original project.
 
-This is the promised firmware for porting Ouroboros to the Daisy Pod with an
-I2C OLED added to its header, built around everything discussed: encoder+OLED
-menu, the two knobs/buttons going "soft" (their meaning depends on the
-screen), a BPM/bars/metronome/count-in engine with a shared loop length
-across all 5 tracks, overdub on any layer, and a per-layer filter + one
-selectable character effect + an optional loop-synced filter envelope.
-
-Read the "Known limitations & assumptions" section before wiring anything —
-a couple of things changed on purpose from the original pedal's behaviour.
+See **Known limitations & assumptions** below for the handful of things
+that deliberately differ from the original pedal's behaviour.
 
 ## Hardware
 
@@ -31,71 +24,83 @@ a couple of things changed on purpose from the original pedal's behaviour.
   0x3C; if your module is silent, it's very likely a 0x3D module — there's
   a commented-out line in `main.cpp` to switch it.
 - Because the OLED is I2C, the header's SPI1 pins (D7/D8/D9/D10) are
-  entirely free — more room than my first read of the Pod's spare pins
-  suggested when I assumed you'd want SPI for the display. That's spare
-  capacity if you want to keep an outboard input-conditioning board (see
-  below) or add something else later (D14 and the two spare ADC pins
-  D16/D22 are also still free).
+  entirely free, along with D14 and the two spare ADC pins D16/D22, if you
+  ever want to add something else.
 - Everything else — both knobs, both buttons, the encoder+click, the two
-  RGB LEDs — is the Pod's built-in hardware; nothing else needs wiring for
-  the core looper.
+  RGB LEDs — is the Pod's built-in hardware; nothing else needs wiring
+  for the core looper.
 
-### Input front-end (read this if you still want Mic/Guitar/Line switching)
+### Input front-end
 
 The Daisy Pod's two audio inputs are plain 3.5mm **line-level** stereo
-jacks — no mic preamp, no Hi-Z guitar buffering, no input relay, unlike your
-original PCB. The firmware still has a 3-way input selector (Mic/Guitar/
-Line) in the Global > Input menu, but on bare Pod hardware that's only
-choosing *which physical jack* (left/right) feeds a recording, and true
-stereo for "Line". Plugging a passive guitar straight into a Hi-Z-unaware
-line input will sound weak and dull (impedance mismatch), and there's no
-gain for a real microphone.
+jacks — no mic preamp, no Hi-Z guitar buffering, no input relay, unlike
+the original pedal's PCB. There is deliberately **no** Mic/Guitar/Line
+input-routing menu here (an earlier iteration had one, but on bare Pod
+hardware it never did anything beyond choosing which physical jack fed
+the recording — no actual gain difference — so it wasn't earning its
+menu slot). Both jacks are always captured in true stereo instead (see
+`LooperLayer::Process()`'s recording path).
 
-If you want the original's proper multi-input behaviour back, the practical
-path is to keep your existing preamp/Hi-Z-buffer/relay board as an outboard
-front-end feeding the Pod's line input, with the channel relay driven from
-one of the Pod's free header GPIOs (e.g. D7, now that SPI isn't needed for
-the OLED). That's not wired up in this firmware (I didn't want to guess at
-hardware you haven't confirmed keeping) — it's a small addition to
-`main.cpp` if you go that way: init a `GPIO` on D7 and write it based on
-`ui.GetInputChannel()`.
+The actual fix for a quiet source (a passive guitar, a mic, anything
+without its own preamp) is the per-layer **Gain** page — 1x-4x (0 to
++12dB), applied at record/overdub time only, live on the OLED so you can
+see the level before committing a take. If you want the original
+pedal's proper multi-input hardware behaviour back (real mic preamp,
+Hi-Z buffering, an input relay), that's an outboard front-end feeding the
+Pod's line input — not wired up in this firmware since it depends on
+hardware nobody's confirmed keeping.
 
 ## The menu system
 
 One consistent grammar everywhere:
 
-- **Rotate** the encoder: move the cursor / switch page (what it navigates
-  depends on which screen you're on).
-- **Click** the encoder: only meaningful on the Home screen, where it drills
-  into the layer under the cursor.
-- **Long-press** the encoder (~600ms): go back up a level. From Home (which
-  has no parent) it instead opens Global Settings.
+- **Rotate** the encoder: on Home, moves the layer cursor; on any other
+  screen, cycles through that screen's pages.
+- **Click** the encoder: only meaningful on Home, where it drills into
+  the layer under the cursor.
+- **Long-press** the encoder (~600ms): from Home, opens Global settings;
+  from anywhere else, goes back to Home.
 
 ```
-Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter / Effect / Envelope
+Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
+  │                                             Effect / Pitch / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
-  └──(long-press)──► Global ──(rotate)──► Tempo / Input
+  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / File
                                                 (long-press ⤴ back to Home)
 ```
 
-Both knobs and both physical buttons are "soft" — their function is shown on
-the OLED's footer line and changes with whichever screen/page is open, per
-your request. Full control map:
+Both knobs and both buttons are "soft" — their function depends on
+whichever page is open, and it's always shown on the OLED's footer: two
+rows, each with a label on either side of a small icon (a circle for the
+knob row, a square for the button row). Button labels are dynamic where
+it matters (e.g. Home's Button 1 reads "Rec"/"Pause/Overdub"/"Stop"
+depending on the layer's current state, not one static label covering
+several different behaviours).
 
-| Screen / Page      | Knob 1        | Knob 2          | Button 1 (short / long / release)          | Button 2 |
-|---------------------|---------------|-----------------|---------------------------------------------|----------|
-| Home                | Master volume | Metronome volume| Rec/Play/Overdub cycle for cursor layer      | Toggle bypass (dry monitor mix) |
-| Layer / Status      | Volume        | Pan             | Same transport as Home, for this layer       | Hold 800ms = Clear |
-| Layer / Speed       | Speed         | —               | Short = reset speed to 1.0x                  | — |
-| Layer / Filter      | Cutoff        | Resonance       | Cycle filter mode (Off/Low/High/Band)        | — |
-| Layer / Effect      | FX Param A    | FX Param B      | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo) | — |
-| Layer / Envelope    | Env Attack    | Env Depth       | Toggle envelope on/off                       | — |
-| Global / Tempo      | BPM           | Bars per loop   | Toggle metronome on/off                      | — |
-| Global / Input      | —             | —               | Cycle input channel (Mic/Guitar/Line)        | — |
+**Knob pickup**: a knob only starts driving its parameter once its
+physical position reaches the value already shown on screen (see
+`Ui::KnobPickUp()`) — switching pages/layers never yanks a value to
+wherever the knob physically happens to be sitting.
 
-BPM/Bars are greyed out ("locked") on screen once any layer holds a
-recording, and the knobs stop affecting them, so you can't accidentally pull
-every track out of sync — clear every layer to unlock and pick a new tempo.
+Full control map:
+
+| Screen / Page | Knob 1 | Knob 2 | Button 1 (tap / hold) | Button 2 |
+|---|---|---|---|---|
+| Home | Master volume | Metronome volume | Rec/Pause/Overdub cycle for cursor layer (see transport state machine) | Toggle bypass |
+| Layer: Status | Volume | Pan | Same transport as Home, for this layer | Hold 800ms = Clear |
+| Layer: Speed | Speed (0.3x-2x, deadzone-centered on 1.0x) | — | Tap = reset to 1.0x | — |
+| Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
+| Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
+| Layer: Pitch | Amount (-12..+12 semitones, unison at center) | Fun (internal modulation amount) | Toggle Pitch on/off | Cycle delay-line preset (Fast/Med/Smooth — see below) |
+| Layer: Reverb | Send | Size | — | — |
+| Layer: Gain | Input gain (1x-4x) | — | — | — |
+| Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | — |
+| Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
+| Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
+
+BPM/Bars are locked once any layer holds a recording, and the knobs stop
+affecting them, so you can't accidentally pull every track out of sync —
+clear every layer to unlock and pick a new tempo.
 
 ### Per-layer transport state machine
 
@@ -116,110 +121,131 @@ Empty ──long-press──► ArmedCountIn ──(count-in finishes)──► 
 
 ## Tempo, metronome, and count-in
 
-One `TempoClock`, shared by all 5 layers, is the single source of timing
+One `TempoClock`, shared by all 4 layers, is the single source of timing
 truth:
 
-- **BPM** (40–240) and **Bars** (1–16) together define the loop length
+- **BPM** (40-240) and **Bars** (1-16) together define the loop length
   every layer records to: `samples = 60/BPM * 4 beats/bar * Bars * sample_rate`.
   4/4 time is assumed throughout (not configurable — it's one constant in
   `tempo_clock.h` if you ever want to change it).
-- The metronome is a **single on/off switch** that governs both the audible
+- The metronome is a single on/off switch governing both the audible
   click during playback *and* whether arming a recording does a count-in
-  first, per how you described it. Metronome off = pressing record starts
-  immediately (same feel as the original pedal). Metronome on = a 1-bar
-  (4-beat) count-in always precedes recording, with an accented downbeat
-  click.
-- Once the first layer finishes recording, the tempo locks (see above) so
-  every subsequent layer's recording is exactly the same length and they
-  all loop in perfect sync — this is what "shared master length" means in
+  first. Metronome off = pressing record starts immediately. Metronome
+  on = a 1-bar (4-beat) count-in always precedes recording, with an
+  accented downbeat click.
+- Once the first layer finishes recording, the tempo locks so every
+  subsequent layer's recording is exactly the same length and they all
+  loop in perfect sync — this is what "shared master length" means in
   practice.
-- Changing BPM only affects *future* recordings once unlocked; it does not
-  retroactively time-stretch anything already captured (no pitch/tempo
-  shifting is implemented — that's a much bigger DSP undertaking than
-  scope here).
+- Changing BPM only affects *future* recordings once unlocked; it does
+  not retroactively time-stretch anything already captured.
 
 ## Overdubbing
 
 Long-press-and-hold the transport button on any layer that's Playing or
 Paused to overdub: new input is additively mixed into the existing loop
 buffer, sample-for-sample, in sync with playback, then clamped to ±1.5 to
-stop runaway buildup over many passes. Release to stop. This works
-identically on every layer (not just a "drum" layer) per your answer.
+stop runaway buildup over many passes. Release to stop. Works identically
+on every layer.
 
 ## Per-layer signal chain
 
 Applied on **playback only**, never baked into the recorded buffer — so
-retakes, overdubs, and effect tweaking are always working with clean
-material:
+retakes, overdubs, and tweaking any of this are always working with
+clean material:
 
 ```
-looped sample -> Filter (Svf: Low/High/Band, with optional loop-synced
-                  envelope pushing the cutoff upward) -> one selectable
-                  character effect -> Volume/Pan -> mixed to output bus
+looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
+                  effect -> Pitch shift (independent on/off, can run
+                  alongside the character effect) -> Volume/Pan ->
+                  this layer's own Reverb send -> mixed to output bus
 ```
 
-- **Filter**: cutoff (~20Hz–9kHz, log taper) and resonance are both live,
-  turnable while the loop plays — this is the "cool cutoff/resonance while
-  playing back" feature. Off/Low-pass/High-pass/Band-pass, cycled with
-  Button 1.
-- **Envelope**: an ADSR (DaisySP `Adsr`) retriggers every time the layer
-  loops back to the start, sweeping the filter cutoff upward by an amount
-  you dial in with "Depth", for an automatic filter-opening effect on every
-  repeat. To keep the 2-knob UI simple, only Attack and Depth are
-  knob-controlled; Decay/Sustain/Release sit at fixed defaults in
-  `looper_layer.cpp`'s `Init()` (0.2s/0.3/0.3s) — easy constants to change
-  in code if you want them exposed too, just not on the initial control
-  surface built here (5 ADSR parameters don't fit meaningfully on 2 knobs
-  at once).
-- **Character effect** (one per layer, DaisySP-backed): Drive (Overdrive),
-  Bitcrush (Decimator — Param A = bit depth, Param B = downsample),
-  Chorus (Param A = depth, Param B = rate — chorus is fed the left channel
-  only and generates its own stereo spread, a deliberate simplification),
-  Tremolo (Param A = depth, Param B = rate).
+- **Filter**: cutoff and resonance are both live, turnable while the
+  loop plays. Off/Low-pass/High-pass/Band-pass, cycled with Button 1.
+- **Character effect** (one per layer, DaisySP-backed, mutually
+  exclusive — pick one): Drive (Overdrive), Bitcrush (Decimator — Param
+  A = bit depth, Param B = downsample), Chorus (Param A = depth, Param B
+  = rate — fed the left channel only, generates its own stereo spread, a
+  deliberate simplification), Tremolo (depth/rate), Phaser (depth/rate),
+  AutoWah (wah amount/level), Flanger (depth/rate). Switching effect type
+  resets both params to 0 (a genuine "off" state for every one of these,
+  verified against DaisySP's actual source, not assumed) so a newly
+  selected effect never starts already dialed in loud — you turn each
+  knob up from 0 to bring it in.
+- **Pitch**: independent of the character effect above, not
+  mutually exclusive with it — a real on/off toggle (like `FilterMode::
+  Off`, not a knob position), so it can run alongside a character effect
+  or on its own. DaisySP's `PitchShifter` is a delay-line-based shifter
+  with real, audible processing latency that scales with its internal
+  buffer size — see the delay-preset note below.
+- **Reverb**: independent per layer (each layer owns its own `ReverbSc`
+  instance, not a shared bus) — Send is how much of this layer's signal
+  feeds it, Size is that instance's own feedback/decay.
 
-## What I verified vs. what still needs a real board
+### Pitch delay presets
 
-I don't have an ARM cross-compiler or your libDaisy/STM32 build environment
-in this sandbox, so I can't produce a flashable `.bin` here or prove this
-builds with `make`. What I *did* do, against the actual current
-`electro-smith/libDaisy` and `electro-smith/DaisySP` source (cloned fresh,
-not from memory):
+`PitchShifter`'s delay-line size trades sync latency against pitch-shift
+smoothness — a smaller buffer means the pitched signal lags the actual
+loop position less, but raises the internal crossfade rate for the same
+pitch amount, which shows up as more audible warble on bigger shifts.
+Three presets, cycled with Button 2 on the Pitch page:
 
-- Verified every class/method signature this firmware calls (`Encoder`,
-  `Switch`, `DaisyPod`, `RgbLed`, `AnalogControl`, the SSD130x OLED driver
-  stack, `Svf`, `Adsr`, `Overdrive`, `Decimator`, `Chorus`, `Tremolo`,
-  `Metro`) against the real headers, not from training-data recall.
-- Host-compiled and ran `tempo_clock.cpp` + `looper_layer.cpp` on this
-  machine against the **real** DaisySP source (it has no hardware
-  dependency, so this is a genuine build, not a simulation) — this caught
-  and fixed a real off-by-one bug in the count-in state machine (the first
-  count-in click was getting silently eaten by a state transition). Tests
-  covered: tempo/loop-length math, arm → count-in → record → auto-stop,
-  overdub start/stop, and a full loop pass with filter+envelope+chorus
-  active checked for NaNs, plus every effect × every filter mode.
-- Compiled `ui.cpp` and `main.cpp` against a hand-built mock of the Pod
-  hardware API (matching the real headers' signatures exactly) and linked
-  the whole thing together — this exercises every actual libDaisy call
-  site in the UI/wiring code for type-correctness, though it can't catch
-  STM32-HAL-specific issues since the mock doesn't model real hardware
-  registers/timing.
+| Preset | Delay size | Latency @48kHz |
+|---|---|---|
+| Fast (default) | ~2400 samples | ~50ms |
+| Med | ~6000 samples | ~125ms |
+| Smooth | 16384 samples (DaisySP's stock default) | ~341ms |
 
-What that leaves for you on real hardware: whether `make` succeeds against
-your actual `libDaisy`/`DaisySP` submodules (should be a drop-in — the
-Makefile only changed its source list), OLED orientation/contrast/I2C
-address quirks specific to your exact module, and obviously all the "does
-it feel good" tuning (filter range, envelope times, effect parameter
-scaling) that only makes sense with the display in front of you and a loop
-actually playing.
+## Save/load
 
-Note: the MAX7219 7-segment driver (`max7219.h`) and its SPI wiring are no
-longer used at all — the OLED plus the two RGB LEDs replace it entirely, so
-that board/chip doesn't need to come along to the Pod.
+`PerformanceStore` saves/loads a whole performance (all 4 layers' audio
+plus tempo/global/per-layer settings) as one flat binary file per slot,
+`PERF001.DAT` .. `PERF099.DAT`, via Global:File. The on-disk layout has a
+version tag (`kFileVersion` in `performance_store.cpp`) that gets bumped
+whenever a field is added — a save from an older firmware version is
+rejected cleanly on load (shown as a short error on the File page)
+rather than being misread, so a firmware update can mean older saves
+need re-saving under the new version.
+
+## Known limitations & assumptions
+
+A few things that are intentional, not bugs:
+
+- **No input routing selector** — see *Input front-end* above; per-layer
+  Gain is the actual fix for a quiet source.
+- **Bypass sums to mono**: the dry monitor mix (Home, Button 2) sums both
+  input channels together and sends that to both outputs, rather than
+  keeping them independent — the Pod has one physical stereo-TRS input
+  jack, and a plain mono instrument cable into it only excites one ADC
+  channel (the other's ring contact is unconnected), so a straight
+  per-channel passthrough left the signal audible on only one side.
+  Recording still captures each ADC channel independently, so a
+  genuinely stereo source still records in true stereo.
+- **No tempo/pitch-independent time-stretching**: changing BPM never
+  retroactively affects already-recorded audio.
+- **Waveform display is a downsampled cache, not the raw buffer**: each
+  layer keeps 63 peak values (one per display column), updated
+  incrementally per-sample while recording/overdubbing rather than
+  rescanned from the (up to ~33s) audio buffer on every redraw. Peaks
+  only ever rise within a take (max-hold), never fall, even if an
+  overdub happens to reduce net amplitude somewhere — a deliberate
+  simplification, not a bug.
+- **Save files are version-locked**: see *Save/load* above.
 
 ## Files
 
 - `main.cpp` — hardware init, audio callback, main loop
-- `looper_layer.h/.cpp` — per-layer state machine, filter/envelope/effects, audio
+- `looper_layer.h/.cpp` — per-layer state machine, filter/effects/pitch/
+  reverb, waveform cache, audio
 - `tempo_clock.h/.cpp` — BPM/bars/metronome/count-in engine
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering
-- `Makefile` — unchanged shape, just an updated source list
+- `font_tomthumb.h/.cpp` — the tiny proportional font used in the
+  footer rows (see `README.md`'s Thanks section for credit)
+- `performance_store.h/.cpp` — SD card save/load
+- `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio
+  callback output silence without touching any layer/tempo state, so
+  `PerformanceStore::Load()` (which restores layers one at a time,
+  streaming each from SD) can't leave layers starting at different
+  sample offsets just because the audio ISR kept running mid-restore
+- `Makefile` — source list for the build
