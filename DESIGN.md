@@ -67,7 +67,7 @@ One consistent grammar everywhere:
 Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
   │                                             Effect / Pitch / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
-  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / File
+  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / File / Export
                                                 (long-press ⤴ back to Home)
 ```
 
@@ -99,6 +99,7 @@ Full control map:
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | — |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
+| Global: Export | — | — | Tap = render current performance to WAV | — |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
 affecting them, so you can't accidentally pull every track out of sync —
@@ -210,6 +211,48 @@ rejected cleanly on load (shown as a short error on the File page)
 rather than being misread, so a firmware update can mean older saves
 need re-saving under the new version.
 
+## WAV export
+
+`PerformanceStore::ExportWav()` (Global:Export, single tap on Button 1)
+renders the current in-memory performance to a standard stereo 16-bit PCM
+`WAV/EXPnnn.WAV` on the SD card — kept in its own subfolder specifically
+so it's invisible to `ListSlots()`/`NextFreeSlot()`, which only ever look
+at bare `PERFxxx.DAT` names in the root. Unlike Save, this never
+overwrites anything (always the next free number), so there's no
+hold-to-confirm gesture.
+
+- **Exactly one full loop length** (`TempoClock::GetLoopLengthSamples()`),
+  always starting from the true downbeat regardless of where playback
+  happened to be when Export was triggered — every layer's `play_pos_` is
+  snapshotted, forced to 0 for the render, then restored afterward (even
+  if the render fails partway through).
+- **The real, live effects chain** — filter, character effect, pitch,
+  reverb, per layer, plus the master filter — not a dry sum. This means
+  the export calls each layer's actual `Process()` an extra time from the
+  main loop (with `g_audio_suspended` held for the whole operation, same
+  as `TriggerLoad()`, so it doesn't race the real audio ISR touching the
+  same objects).
+- **Master volume and the metronome click are excluded.** Master volume
+  is a monitor/output-level control, not mix content — including it would
+  mean the exported file's loudness depended on wherever that knob
+  happened to be sitting, including all the way down. The master filter
+  *is* included (it's a real mix-shaping tool), via a fresh local `Svf`
+  rather than main.cpp's live one, since a filter's only state is
+  short-term signal history — primed with a throwaway first pass over the
+  loop before the real render so it isn't starting cold.
+- **Peak-normalized, not just clamped.** That same throwaway first pass
+  doubles as a peak scan (it computes the exact same signal the real pass
+  will write, so this is free); the real pass then applies a flat makeup
+  gain so the loudest sample in the loop lands just under full scale,
+  capped so near-silent content doesn't get boosted into audible noise.
+  Without this, a loop that never got near clipping during normal
+  playback would export using only a fraction of the 16-bit range and
+  sound noticeably quiet no matter how loud it's played back.
+- **Refuses to run** while any layer is `Recording` or `ArmedCountIn`
+  (the Recording write path only checks `state_`, not real input, so
+  running it against silent dummy input would overwrite an in-progress
+  take), or if nothing's been recorded yet.
+
 ## Known limitations & assumptions
 
 A few things that are intentional, not bugs:
@@ -234,6 +277,9 @@ A few things that are intentional, not bugs:
   overdub happens to reduce net amplitude somewhere — a deliberate
   simplification, not a bug.
 - **Save files are version-locked**: see *Save/load* above.
+- **Export is one stereo mixdown, not per-track stems**: all 4 layers'
+  post-effects signal is summed into a single `WAV/EXPnnn.WAV` — there's
+  no way to export each layer as its own file.
 
 ## Files
 
@@ -244,7 +290,7 @@ A few things that are intentional, not bugs:
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering
 - `font_tomthumb.h/.cpp` — the tiny proportional font used in the
   footer rows (see `README.md`'s Thanks section for credit)
-- `performance_store.h/.cpp` — SD card save/load
+- `performance_store.h/.cpp` — SD card save/load + WAV export
 - `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio
   callback output silence without touching any layer/tempo state, so
   `PerformanceStore::Load()` (which restores layers one at a time,

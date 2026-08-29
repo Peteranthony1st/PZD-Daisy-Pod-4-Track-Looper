@@ -74,6 +74,10 @@ The name, general concept, and file organization are based on
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
   setting) to an SD card, up to 99 slots
+- Export the current performance as a standard stereo WAV file — one full
+  loop, every layer's live filter/effect/pitch/reverb chain and the
+  master filter applied, peak-normalized so it doesn't come out quiet —
+  ready to pull off the card and use elsewhere
 
 ## How to use it
 
@@ -118,6 +122,7 @@ suddenly yanks a setting to wherever the knob happens to be sitting.
 | Global: Tempo | BPM | Bars | Toggle metronome | — |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |
+| Global: Export | — | — | Tap = Export current performance as WAV | — |
 
 ## Building and flashing
 

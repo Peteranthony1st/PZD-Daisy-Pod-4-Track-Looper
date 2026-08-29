@@ -67,4 +67,24 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           ProgressFn   on_progress = nullptr);
 
+// Renders the current in-memory performance (one full shared loop length,
+// every layer's real filter/character-effect/pitch/reverb chain applied,
+// same as live playback) to a new stereo 16-bit PCM WAV file under a
+// "WAV/" subfolder on the SD card -- kept out of the root directory
+// specifically so it never shows up as a load target in ListSlots().
+// Master volume and the metronome click are deliberately NOT included
+// (see performance_store.cpp); the master filter is. Blocking, like
+// Save()/Load() -- call from main()'s loop, not the audio callback, and
+// with g_audio_suspended held true for the whole call (see
+// Ui::TriggerExport()) since this drives extra LooperLayer::Process()
+// calls from outside the real ISR. Refuses to run while any layer is
+// Recording or ArmedCountIn, or if nothing has been recorded yet.
+bool ExportWav(TempoClock&  tempo,
+               LooperLayer* layers,
+               int          num_layers,
+               FilterMode   master_filter_mode,
+               float        master_filter_cutoff01,
+               float        master_filter_res01,
+               ProgressFn   on_progress = nullptr);
+
 } // namespace PerformanceStore

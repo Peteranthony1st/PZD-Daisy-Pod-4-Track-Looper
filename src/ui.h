@@ -105,6 +105,7 @@ class Ui
         Tempo,
         Filter,
         File,
+        Export,
         kCount
     };
 
@@ -126,6 +127,7 @@ class Ui
         GlobalTempo,
         GlobalFilter,
         GlobalFile,
+        GlobalExport,
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -171,6 +173,7 @@ class Ui
     void DrawLayerScreen();
     void DrawGlobalScreen();
     void DrawFileScreen();
+    void DrawExportScreen();
 
     // --- SD save/load (Global:File page) -----------------------------
     // Refreshes file_slots_/file_slot_count_ from the card -- called
@@ -193,6 +196,12 @@ class Ui
     // replacing every layer's audio and all settings with the saved
     // performance's.
     void TriggerLoad();
+    // Button1 short press on Global:Export: renders one full loop of the
+    // current in-memory performance (every layer's real filter/effect/
+    // pitch/reverb chain, plus the master filter) to a new WAV/EXPnnn.WAV
+    // file. Simple tap, no hold-to-confirm -- unlike Save, this never
+    // overwrites anything, it only ever creates a new numbered file.
+    void TriggerExport();
     static void OnSaveLoadProgress(float progress01); // PerformanceStore::ProgressFn
     // Two-row control legend, drawn at the bottom of every screen in
     // Tom Thumb (see font_tomthumb.h): a knob row (circle icon) and a
@@ -298,4 +307,8 @@ class Ui
     bool file_slots_dirty_          = true; // forces one RefreshFileSlots() on first Draw()
     bool file_op_in_progress_       = false; // true only while inside Save()/Load()
     char file_status_[24]           = {};    // last result, shown briefly on the page
+
+    // --- WAV export (Global:Export page) ------------------------------
+    bool export_op_in_progress_     = false; // true only while inside ExportWav()
+    char export_status_[24]         = {};    // last result, shown briefly on the page
 };

@@ -1,6 +1,7 @@
 #include "performance_store.h"
 #include <cstdio>
 #include <cstring>
+#include <math.h>
 #include "per/sdmmc.h"
 #include "sys/fatfs.h"
 
@@ -51,6 +52,63 @@ void SlotFilename(int slot, char* out, size_t out_size)
 {
     snprintf(out, out_size, "PERF%03d.DAT", slot);
 }
+
+inline float Clampf(float v, float lo, float hi)
+{
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Kept inside its own "WAV/" subfolder (see ExportWav()) specifically so
+// these never get picked up by ListSlots()/NextFreeSlot(), which only
+// ever look at bare PERFxxx.DAT names in the SD root.
+void ExportFilename(int n, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "WAV/EXP%03d.WAV", n);
+}
+
+// Lowest-numbered "WAV/EXPnnn.WAV" that doesn't exist yet -- same
+// f_stat-scan pattern as NextFreeSlot(), just scoped to the export
+// folder/prefix instead. -1 if the whole 001..999 range is somehow full.
+int NextFreeExportNumber()
+{
+    for(int n = 1; n <= 999; n++)
+    {
+        char    fname[24];
+        FILINFO fno;
+        ExportFilename(n, fname, sizeof(fname));
+        if(f_stat(fname, &fno) != FR_OK)
+            return n;
+    }
+    return -1;
+}
+
+// Canonical 44-byte RIFF/WAVE PCM header. Every field lands on its own
+// natural alignment boundary in this exact order (verified by the
+// static_assert below), so this is portable across compilers without
+// needing a packed attribute -- same "plain fields, stable layout"
+// reasoning as FileHeader/LayerHeader above.
+struct WavHeader
+{
+    char     riff[4];         // "RIFF"
+    uint32_t riff_size;       // 36 + data_size
+    char     wave[4];         // "WAVE"
+    char     fmt[4];          // "fmt "
+    uint32_t fmt_size;        // 16 for PCM
+    uint16_t audio_format;    // 1 = PCM
+    uint16_t num_channels;    // 2
+    uint32_t sample_rate;
+    uint32_t byte_rate;       // sample_rate * block_align
+    uint16_t block_align;     // num_channels * bytes_per_sample
+    uint16_t bits_per_sample; // 16
+    char     data[4];         // "data"
+    uint32_t data_size;       // total_samples * num_channels * bytes_per_sample
+};
+static_assert(sizeof(WavHeader) == 44, "WavHeader must be the canonical 44-byte layout");
+
+// Upper bound on num_layers for the small play_pos_ snapshot/restore
+// array below -- this project only ever has 4 (kNumLayers in main.cpp);
+// generous headroom, not a hard architectural limit.
+constexpr int kMaxExportLayers = 8;
 
 // Fixed-layout header, written/read as one raw block. Every field is a
 // plain float/int32/uint8 (no bitfields, no padding-sensitive types) so
@@ -452,6 +510,255 @@ bool Load(int          slot,
 
     f_close(&file);
     return ok;
+}
+
+bool ExportWav(TempoClock&  tempo,
+              LooperLayer* layers,
+              int          num_layers,
+              FilterMode   master_filter_mode,
+              float        master_filter_cutoff01,
+              float        master_filter_res01,
+              ProgressFn   on_progress)
+{
+    if(!card_ready)
+        return false;
+
+    ClearError();
+
+    // Refuse mid-take: the Recording branch in LooperLayer::Process() is
+    // gated only on state_, not on the (all-zero, silent) ticks this
+    // offline render feeds it, so calling Process() on a Recording layer
+    // here would overwrite real in-progress audio with silence. Also
+    // refuse ArmedCountIn (nothing useful to export yet from that layer)
+    // and an entirely-empty performance.
+    bool any_content = false;
+    for(int i = 0; i < num_layers; i++)
+    {
+        LayerState s = layers[i].GetState();
+        if(s == LayerState::Recording || s == LayerState::ArmedCountIn)
+        {
+            SetError("busy", FR_OK);
+            return false;
+        }
+        if(layers[i].HasContent())
+            any_content = true;
+    }
+    if(!any_content)
+    {
+        SetError("empty", FR_OK);
+        return false;
+    }
+
+    FRESULT mkdir_res = f_mkdir("WAV");
+    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
+    {
+        SetError("mkdir", mkdir_res);
+        return false;
+    }
+
+    int num = NextFreeExportNumber();
+    if(num < 0)
+    {
+        SetError("full", FR_OK);
+        return false;
+    }
+    char fname[24];
+    ExportFilename(num, fname, sizeof(fname));
+
+    static FIL file; // see the DTCMRAM/DMA comment in Save() above
+    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    const uint32_t sample_rate   = (uint32_t)tempo.GetSampleRate();
+    const size_t   total_samples = tempo.GetLoopLengthSamples();
+    const uint32_t data_size     = (uint32_t)(total_samples * 2 * sizeof(int16_t));
+
+    static WavHeader hdr;
+    memcpy(hdr.riff, "RIFF", 4);
+    hdr.riff_size = 36 + data_size;
+    memcpy(hdr.wave, "WAVE", 4);
+    memcpy(hdr.fmt, "fmt ", 4);
+    hdr.fmt_size        = 16;
+    hdr.audio_format    = 1; // PCM
+    hdr.num_channels    = 2;
+    hdr.sample_rate     = sample_rate;
+    hdr.bits_per_sample = 16;
+    hdr.block_align     = (uint16_t)(hdr.num_channels * (hdr.bits_per_sample / 8));
+    hdr.byte_rate       = hdr.sample_rate * hdr.block_align;
+    memcpy(hdr.data, "data", 4);
+    hdr.data_size = data_size;
+
+    UINT bw;
+    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
+    bool ok = fr == FR_OK && bw == sizeof(hdr);
+    if(!ok)
+        SetError("hdr", fr);
+
+    // Snapshot every layer's real play_pos_ so live playback can resume
+    // exactly where it was after this function returns (success or not
+    // -- see the restore at the bottom, which always runs).
+    int   n_snap = num_layers < kMaxExportLayers ? num_layers : kMaxExportLayers;
+    static float saved_pos[kMaxExportLayers];
+    for(int i = 0; i < n_snap; i++)
+        saved_pos[i] = layers[i].GetPlayPosRaw();
+
+    // Local master filter -- a fresh instance rather than main.cpp's live
+    // fx_master_filter_l/r, since its only state is short-term signal
+    // history (not a delay line/reverb tail like the per-layer effects
+    // reused below), so a locally primed instance sounds the same as the
+    // live one without plumbing a new cross-module pointer through Ui.
+    // Same cutoff curve main.cpp already applies to the live master
+    // filter (kFilterMinHz/kFilterMaxHz from looper_layer.h).
+    daisysp::Svf mfilt_l, mfilt_r;
+    mfilt_l.Init((float)sample_rate);
+    mfilt_r.Init((float)sample_rate);
+    float mfilt_cutoff
+        = kFilterMinHz * powf(kFilterMaxHz / kFilterMinHz, master_filter_cutoff01);
+    float nyquist_guard = (float)sample_rate / 3.f - 1.f;
+    mfilt_cutoff         = Clampf(mfilt_cutoff, kFilterMinHz, nyquist_guard);
+    float mfilt_res      = Clampf(master_filter_res01, 0.f, 1.f) * 0.9f;
+    mfilt_l.SetFreq(mfilt_cutoff);
+    mfilt_l.SetRes(mfilt_res);
+    mfilt_r.SetFreq(mfilt_cutoff);
+    mfilt_r.SetRes(mfilt_res);
+
+    // Dummy input/ticks for the offline Process() calls below -- a
+    // Playing-state layer never reads either (confirmed against
+    // LooperLayer::Process()'s Playing/Paused/Overdubbing block), so an
+    // all-zero, never-written static array is safe to reuse every chunk.
+    static float                 dummy_in_l[kChunkSamples] = {};
+    static float                 dummy_in_r[kChunkSamples] = {};
+    const float*                 in_ptrs[2] = {dummy_in_l, dummy_in_r};
+    static TempoClock::TempoTick dummy_ticks[kChunkSamples] = {};
+
+    static float   chunk_l[kChunkSamples];
+    static float   chunk_r[kChunkSamples];
+    static int16_t pcm_chunk[kChunkSamples * 2];
+
+    // Two full passes over the loop: pass 0 is a throwaway priming pass
+    // (runs every layer's real effects chain plus the master filter, but
+    // writes nothing) so the master filter isn't starting cold at sample
+    // 0 of the real pass -- a cold Svf at low cutoff/high resonance has a
+    // real audible startup thump, not just a brief settle. Because the
+    // render always starts at play_pos_==0 and runs exactly one loop
+    // length, pass 0 naturally wraps play_pos_ back to (very near) 0 via
+    // the normal modulo wraparound already in Process() -- forcing it
+    // again below is just cheap insurance against float drift. Both
+    // passes count toward on_progress so the bar moves smoothly across
+    // the whole operation instead of sitting at 0% through all of pass 0.
+    //
+    // Pass 0 doubles as a peak scan: nothing here normalizes or limits
+    // the live signal path, so a loop that never gets near clipping would
+    // otherwise export using only a fraction of the 16-bit range and play
+    // back noticeably quiet. Since pass 0 already computes the exact same
+    // post-filter signal pass 1 will write, tracking its peak is free --
+    // pass 1 then applies a flat makeup gain so the loudest sample lands
+    // just under full scale instead of wherever it naturally fell.
+    float peak   = 0.f;
+    float makeup = 1.f;
+    for(int pass = 0; pass < 2 && ok; pass++)
+    {
+        bool write_this_pass = pass == 1;
+        if(write_this_pass)
+        {
+            const float kExportTarget = 0.98f; // just under full scale, avoids quantizing right at the edge
+            const float kMaxMakeup    = 8.f;   // don't blow up near-silent content into hiss/noise
+            makeup = peak > 0.0001f ? Clampf(kExportTarget / peak, 0.f, kMaxMakeup) : 1.f;
+        }
+
+        for(int i = 0; i < n_snap; i++)
+            layers[i].SetPlayPosRaw(0.f);
+
+        size_t remaining = total_samples;
+        while(remaining > 0 && ok)
+        {
+            UINT n = (UINT)(remaining < kChunkSamples ? remaining : kChunkSamples);
+
+            for(UINT i = 0; i < n; i++)
+            {
+                chunk_l[i] = 0.f;
+                chunk_r[i] = 0.f;
+            }
+            float* out_ptrs[2] = {chunk_l, chunk_r};
+
+            for(int L = 0; L < num_layers; L++)
+                layers[L].Process(in_ptrs, out_ptrs, n, dummy_ticks, tempo);
+
+            for(UINT i = 0; i < n; i++)
+            {
+                float l = chunk_l[i];
+                float r = chunk_r[i];
+                if(master_filter_mode != FilterMode::Off)
+                {
+                    mfilt_l.Process(l);
+                    mfilt_r.Process(r);
+                    switch(master_filter_mode)
+                    {
+                        case FilterMode::LowPass:
+                            l = mfilt_l.Low();
+                            r = mfilt_r.Low();
+                            break;
+                        case FilterMode::HighPass:
+                            l = mfilt_l.High();
+                            r = mfilt_r.High();
+                            break;
+                        case FilterMode::BandPass:
+                            l = mfilt_l.Band();
+                            r = mfilt_r.Band();
+                            break;
+                        default: break;
+                    }
+                }
+                if(write_this_pass)
+                {
+                    l = Clampf(l * makeup, -1.f, 1.f);
+                    r = Clampf(r * makeup, -1.f, 1.f);
+                    pcm_chunk[2 * i]     = (int16_t)(l * 32767.f);
+                    pcm_chunk[2 * i + 1] = (int16_t)(r * 32767.f);
+                }
+                else
+                {
+                    float a = fabsf(l) > fabsf(r) ? fabsf(l) : fabsf(r);
+                    if(a > peak)
+                        peak = a;
+                }
+            }
+
+            if(write_this_pass)
+            {
+                UINT bytes = n * 2 * (UINT)sizeof(int16_t);
+                UINT written;
+                fr = f_write(&file, pcm_chunk, bytes, &written);
+                ok = fr == FR_OK && written == bytes;
+                if(!ok)
+                    SetError("data", fr);
+            }
+
+            remaining -= n;
+            if(on_progress)
+            {
+                size_t done  = (size_t)pass * total_samples + (total_samples - remaining);
+                size_t total = total_samples * 2;
+                on_progress((float)done / (float)total);
+            }
+        }
+    }
+
+    // Always restore -- runs whether the render above succeeded or bailed
+    // out partway through, so a failed export never leaves live playback
+    // resuming from the wrong phase.
+    for(int i = 0; i < n_snap; i++)
+        layers[i].SetPlayPosRaw(saved_pos[i]);
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK && ok)
+        SetError("close", close_res);
+
+    return ok && close_res == FR_OK;
 }
 
 const char* GetLastError()

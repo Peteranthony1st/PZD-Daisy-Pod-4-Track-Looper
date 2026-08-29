@@ -207,6 +207,13 @@ struct LooperLayer
         return record_len_ > 0 ? play_pos_ / (float)record_len_ : 0.f;
     }
 
+    // Raw play_pos_ in samples (not normalized). Export-only: lets
+    // PerformanceStore::ExportWav() snapshot the real position, force it
+    // to 0 (the true loop downbeat) for a clean render, then restore it
+    // afterward -- not intended for general use.
+    float GetPlayPosRaw() const { return play_pos_; }
+    void  SetPlayPosRaw(float p) { play_pos_ = p; }
+
     // --- Save/load (see performance_store.h) ------------------------
     // Raw buffer access + a way to declare a buffer "recorded" without
     // going through the normal record transport -- used only when

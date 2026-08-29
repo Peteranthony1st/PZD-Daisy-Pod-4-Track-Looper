@@ -196,6 +196,8 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             GlobalPage new_page = (GlobalPage)p;
             if(new_page == GlobalPage::File && global_page_ != GlobalPage::File)
                 file_slots_dirty_ = true; // re-scan the card on entry
+            if(new_page == GlobalPage::Export && global_page_ != GlobalPage::Export)
+                export_status_[0] = '\0'; // clear any stale result on entry
             global_page_ = new_page;
         }
     }
@@ -345,6 +347,8 @@ void Ui::OnButton1Short()
             }
             else if(global_page_ == GlobalPage::File)
                 TriggerSave();
+            else if(global_page_ == GlobalPage::Export)
+                TriggerExport();
             break;
     }
 }
@@ -408,6 +412,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Tempo: return KnobContext::GlobalTempo;
                 case GlobalPage::Filter: return KnobContext::GlobalFilter;
                 case GlobalPage::File: return KnobContext::GlobalFile;
+                case GlobalPage::Export: return KnobContext::GlobalExport;
                 default: return KnobContext::GlobalTempo;
             }
     }
@@ -465,6 +470,7 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             k2_pickup_raw_[i] = master_filter_res01_;
             break;
         case KnobContext::GlobalFile: break; // browses a list directly, no pickup used
+        case KnobContext::GlobalExport: break; // no continuous knob values, Button1 triggers it
         default: break;
     }
 }
@@ -755,7 +761,11 @@ void Ui::DrawHome()
     // box width tuned for one specific count.
     const int box_gap = 4;
     const int box_w = (disp_->Width() - (num_layers_ - 1) * box_gap) / num_layers_;
-    const int box_h = 24, top = 18;
+    // Vertically centered in the space between the top row's content
+    // (beat dots + BPM/Bars/Metro text, rows 0-5) and the footer divider
+    // (row kFooterDividerY=46) -- that's 40 rows (6..45) for a 24px box,
+    // so top=14 splits the remaining 16px into an 8px gap on each side.
+    const int box_h = 24, top = 14;
     for(int i = 0; i < num_layers_; i++)
     {
         int x0 = i * (box_w + box_gap);
@@ -1068,6 +1078,11 @@ void Ui::DrawGlobalScreen()
         DrawFileScreen();
         return;
     }
+    if(global_page_ == GlobalPage::Export)
+    {
+        DrawExportScreen();
+        return;
+    }
 
     // Compact form (not "Global Settings") for the same reason as the
     // Layer screen's title -- leaves room for the beat indicator on the
@@ -1202,6 +1217,39 @@ void Ui::DrawFileScreen()
     DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save", "", "", "Hold=Load");
 }
 
+void Ui::DrawExportScreen()
+{
+    disp_->SetCursor(0, 0);
+    disp_->WriteString("Global:Export", Font_6x8, true);
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    // One line, centered in the space between the title divider (y9) and
+    // the footer divider (kFooterDividerY=46) -- 36 rows (10..45) for an
+    // 8px-tall Font_6x8 line, so y=24 splits the remaining 28px evenly.
+    // Font_6x8 is fixed-width (6px/char), so horizontal centering is a
+    // plain strlen() * 6.
+    const char* msg = PerformanceStore::IsCardPresent()
+                           ? (export_status_[0] != '\0' ? export_status_ : "Export WAV File")
+                           : "No SD card";
+    int x = (disp_->Width() - 6 * (int)strlen(msg)) / 2;
+    disp_->SetCursor(x < 0 ? 0 : x, 24);
+    disp_->WriteString(msg, Font_6x8, true);
+
+    if(!PerformanceStore::IsCardPresent())
+    {
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        return;
+    }
+
+    // No hold-to-confirm here (unlike File's New/Load) -- Export always
+    // creates a new numbered file and never overwrites/destroys anything,
+    // so a plain tap is safe.
+    DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Export", "", "", "");
+}
+
 void Ui::RefreshFileSlots()
 {
     file_slot_count_ = PerformanceStore::ListSlots(file_slots_, kMaxFileSlots);
@@ -1287,6 +1335,28 @@ void Ui::TriggerLoad()
     }
 }
 
+void Ui::TriggerExport()
+{
+    // ExportWav() drives every layer's real Process() an extra time from
+    // the main loop to render the mix -- must not race the live ISR
+    // doing the same on the same objects, same reasoning as TriggerLoad().
+    g_audio_suspended       = true;
+    g_progress_disp         = disp_;
+    export_op_in_progress_  = true;
+    bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
+                                            master_filter_cutoff01_, master_filter_res01_,
+                                            &Ui::OnSaveLoadProgress);
+    export_op_in_progress_  = false;
+    g_progress_disp         = nullptr;
+    g_audio_suspended       = false;
+
+    if(ok)
+        snprintf(export_status_, sizeof(export_status_), "Exported WAV");
+    else
+        snprintf(export_status_, sizeof(export_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+}
+
 void Ui::OnSaveLoadProgress(float progress01)
 {
     if(!g_progress_disp)
@@ -1302,8 +1372,12 @@ void Ui::OnSaveLoadProgress(float progress01)
 
     OneBitGraphicsDisplay* d = g_progress_disp;
     d->Fill(false);
-    d->SetCursor(0, 20);
-    d->WriteString("Working...", Font_6x8, true);
+    d->SetCursor(0, 14);
+    // Font_7x10, not the footer's usual Font_6x8 -- an 8-row-tall font
+    // only has room for a 1-pixel descender, which reads as a clipped
+    // "g" in "Working..." at this size no matter how it's positioned;
+    // this font's extra 2 rows actually give it a real tail.
+    d->WriteString("Working...", Font_7x10, true);
     int w = (int)(Clampf(progress01, 0.f, 1.f) * (d->Width() - 2));
     d->DrawRect(0, 32, d->Width() - 1, 40, true, false);
     if(w > 0)

@@ -55,6 +55,8 @@ class TempoClock
     // call Lock() so every subsequent layer records to the exact same
     // sample count and they all stay in phase. Call Unlock() only after
     // every layer has been cleared back to empty.
+    float GetSampleRate() const { return sample_rate_; }
+
     void  SetBpm(float bpm);   // clamped to [40, 240]
     float GetBpm() const { return bpm_; }
     void  SetBars(int bars);   // clamped to [1, 16]
