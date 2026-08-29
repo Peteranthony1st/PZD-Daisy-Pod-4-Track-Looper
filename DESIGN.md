@@ -5,12 +5,14 @@
 This project's name and original concept are based on
 [kooliha's Ouroboros Loop Station](https://github.com/kooliha/Ouroboros_Loop_Station)
 — a DIY 5-track stereo loop station for the Electrosmith Daisy Seed. This
-firmware is a from-scratch rewrite adapted for the Daisy Pod's built-in
-controls plus an added OLED menu, with a different internal architecture
-(the DSP layer has no direct hardware dependency) and an expanded feature
-set (per-layer filter/effect/reverb/pitch, tempo-locked count-in, a live
-waveform display, SD card save/load), but the name, general concept, and
-file organization carry over from that original project.
+firmware follows that project's per-layer loop-buffer struct as a direct
+structural template — the same field set (`buffer_l`/`buffer_r`/
+`record_len`/`write_idx`/`play_pos`/`speed`/`volume`/`pan`) and the same
+linear-interpolated playback loop — but removes its direct hardware
+coupling (this DSP layer takes no `Switch*`/ADC pointers at all) and adds
+everything else from scratch: per-layer filter/effect/reverb/pitch,
+tempo-locked count-in, a live waveform display, the whole OLED menu/UI
+layer, and SD card save/load, none of which exist in the original.
 
 See **Known limitations & assumptions** below for the handful of things
 that deliberately differ from the original pedal's behaviour.

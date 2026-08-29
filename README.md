@@ -138,10 +138,13 @@ building from source.
 ## Thanks
 
 - [**kooliha's Ouroboros Loop Station**](https://github.com/kooliha/Ouroboros_Loop_Station)
-  — this project's name, general concept, and file organization are
-  based on that original design, a DIY 5-track stereo loop station for
-  the Daisy Seed. This firmware is a from-scratch rewrite for the Pod
-  with an expanded feature set, but the lineage carries over.
+  — this project's name and general concept come from that original
+  design, a DIY 5-track stereo loop station for the Daisy Seed. This
+  firmware follows its per-layer loop-buffer struct as a direct
+  structural template, then rewrites everything else — no direct
+  hardware coupling in the DSP layer, plus filter/effects/reverb/pitch,
+  the OLED menu, and SD save/load, none of which exist in the original.
+  See [DESIGN.md](DESIGN.md) for the specifics.
 - **[Robey Pointer](http://robey.lag.net/2010/01/23/tiny-monospace-font.html)**,
   for the tiny "Tom Thumb" font used throughout the OLED UI — a
   readability-tuned version of the original 3x5 font by Brian J.
