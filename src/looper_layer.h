@@ -32,11 +32,16 @@ using namespace daisy;
 //    otherwise stack irreversibly take after take).
 //
 //  - Signal chain per layer, applied to the looped-back sample before
-//    it's mixed to the bus: Filter -> character effect -> volume/pan
-//    -> this layer's own reverb (send amount + size both per-layer, see
-//    SetReverbSend01()/SetReverbSize01()) -- each layer owns an
-//    independent ReverbSc instance (externally owned in SDRAM, like
-//    fx_phaser_/fx_pitchshift_), not a shared bus.
+//    it's mixed to the bus: Filter -> character effect -> Pitch ->
+//    volume/pan -> this layer's Send amount (SetReverbSend01()) into
+//    ONE shared reverb bus, owned and Process()'d by main.cpp -- not a
+//    per-layer ReverbSc any more. That used to mean up to 4 independent
+//    ReverbSc instances running simultaneously in the worst case (by
+//    far the heaviest thing in this chain), which could push the audio
+//    callback's CPU budget hard enough to cause real glitches/dropouts;
+//    one shared instance cuts that worst case ~4x. The tradeoff: Size/
+//    decay is now one Global:Reverb setting shared by every layer's
+//    send, not independently tunable per layer any more.
 
 enum class LayerState
 {
@@ -80,22 +85,23 @@ enum class LayerEffect
 struct LooperLayer
 {
     // --- Setup -----------------------------------------------------
-    // fx_phaser/fx_pitchshift/fx_reverb are externally-owned (must
-    // outlive this object) and must already be default-constructed but
-    // NOT yet Init()'d -- this call does that. They're pointers rather
-    // than direct members because they're too big to live in a
-    // LooperLayer array in ordinary SRAM: Phaser is ~75KB, PitchShifter
-    // ~128KB, and ReverbSc ~386KB *per instance*, so main.cpp places
-    // one of each per layer in SDRAM (like buffer_l/buffer_r) and hands
-    // in the pointer. Every other effect is small enough to live
-    // directly as a member below.
+    // fx_phaser/fx_pitchshift are externally-owned (must outlive this
+    // object) and must already be default-constructed but NOT yet
+    // Init()'d -- this call does that. They're pointers rather than
+    // direct members because they're too big to live in a LooperLayer
+    // array in ordinary SRAM: Phaser is ~75KB, PitchShifter ~128KB, so
+    // main.cpp places one of each per layer in SDRAM (like buffer_l/
+    // buffer_r) and hands in the pointer. Every other effect is small
+    // enough to live directly as a member below. Reverb is NOT a
+    // per-layer effect (see SetReverbSend01()'s comment) -- there's a
+    // single shared ReverbSc, owned and Process()'d by main.cpp, that
+    // every layer sends into.
     void Init(float*             buf_l,
               float*             buf_r,
               size_t             buffer_size,
               float              sample_rate,
               daisysp::Phaser*       fx_phaser,
-              daisysp::PitchShifter* fx_pitchshift,
-              daisysp::ReverbSc*     fx_reverb);
+              daisysp::PitchShifter* fx_pitchshift);
     void Reset(); // hard reset to Empty, clears controls to defaults
 
     // --- Transport (call from the UI layer on button edges) --------
@@ -153,13 +159,16 @@ struct LooperLayer
     void SetEffectParamB01(float v);
     float GetEffectParamB01() const { return effect_param_b_; }
 
-    // This layer's own independent reverb (see fx_reverb_ and Init()).
-    // Send is how much of this layer's (post-filter/effect, post-pan)
-    // signal feeds it; Size is that reverb instance's feedback/decay.
+    // How much of this layer's (post-filter/effect, post-pan) signal
+    // feeds the ONE shared reverb bus main.cpp owns -- there is no
+    // per-layer Size/decay control any more (that used to mean 4
+    // independent ReverbSc instances running simultaneously in the
+    // worst case, by far the heaviest thing in the signal chain, and it
+    // could push the audio callback's CPU budget hard enough to cause
+    // real glitches/dropouts). Size is now a single Global:Reverb
+    // setting shared by every layer's send -- see Ui::GetReverbSize01().
     void  SetReverbSend01(float v);
     float GetReverbSend01() const { return reverb_send_; }
-    void  SetReverbSize01(float v);
-    float GetReverbSize01() const { return reverb_size01_; }
 
     // Pitch shift, independent of (and can run alongside) the character
     // effect above -- unlike SetEffect()'s mutually-exclusive slot, this
@@ -232,9 +241,15 @@ struct LooperLayer
     // --- Audio ------------------------------------------------------
     // ticks[i] must be the SAME TempoClock tick array shared by every
     // layer this block (computed once per block in main.cpp, not once
-    // per layer -- see tempo_clock.h).
+    // per layer -- see tempo_clock.h). reverb_send_out is a per-block
+    // accumulation buffer (like out, but not the same one) -- this
+    // layer ADDS its Send-scaled signal into it; main.cpp runs the one
+    // shared ReverbSc over the sum of every layer's contribution once
+    // per sample, after this loop, and mixes the wet result into out[]
+    // itself (see AudioCallback()).
     void Process(AudioHandle::InputBuffer  in,
                  AudioHandle::OutputBuffer out,
+                 AudioHandle::OutputBuffer reverb_send_out,
                  size_t                    size,
                  const TempoClock::TempoTick* ticks,
                  TempoClock&                  tempo);
@@ -279,7 +294,7 @@ struct LooperLayer
     // PitchShifter are also mono-in (fed a summed L+R, output to both
     // channels) -- not for the same reason as Chorus, but because a
     // stereo pair of either would cost too much SDRAM per layer (see
-    // fx_phaser_/fx_pitchshift_/fx_reverb_ below and Init()'s comment).
+    // fx_phaser_/fx_pitchshift_ below and Init()'s comment).
     daisysp::Overdrive  fx_drive_[2];
     daisysp::Decimator  fx_bitcrush_[2];
     daisysp::Chorus     fx_chorus_;
@@ -288,10 +303,8 @@ struct LooperLayer
     daisysp::Autowah    fx_autowah_[2];
     daisysp::Phaser*       fx_phaser_     = nullptr; // externally owned, see Init()
     daisysp::PitchShifter* fx_pitchshift_ = nullptr; // externally owned, see Init()
-    daisysp::ReverbSc*     fx_reverb_     = nullptr; // externally owned, see Init()
 
-    float reverb_send_   = 0.f;  // 0 = this layer's reverb hears nothing
-    float reverb_size01_ = 0.6f; // this layer's own reverb feedback/decay
+    float reverb_send_ = 0.f; // 0 = nothing sent to the shared reverb bus
 
     bool  pitch_enabled_  = false;
     float pitch_amount01_ = 0.5f; // raw 0..1, save/restore; 0.5 = unison

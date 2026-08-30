@@ -63,13 +63,14 @@ The name, general concept, and file organization are based on
 - Independent Pitch shift (±12 semitones) that can run *alongside* the
   character effect, with 3 selectable delay presets trading sync latency
   against pitch-shift smoothness (Fast/Med/Smooth)
-- Reverb send and size
+- Reverb send (each layer sends into one shared reverb — see Size below)
 - Input gain (1x–4x) for quiet sources
 
 **Global**
 - Tempo (40–240 BPM), bars per loop (1–16), metronome on/off — locked
   once any layer holds a recording, so you can't pull layers out of sync
 - Master-bus filter, applied to the full mix
+- Reverb size/decay — one shared room for every layer's reverb send
 - Bypass: hear your live input mixed into the output before you've even
   recorded anything
 
@@ -113,6 +114,9 @@ I have uploaded a short video showing basic workflow using pocket operators (app
 https://github.com/user-attachments/assets/1c081390-e61f-4a1b-9088-a552860b9a5d
 [Headphones_as_mic.WAV](https://github.com/user-attachments/files/31609801/Headphones_as_mic.WAV)
 
+**LEDs** — LED1 shows the currently-selected layer's state at a glance
+(off = empty, amber = counting in, red = recording, orange = overdubbing,
+green = playing, blue = paused). LED2 is a steady Bypass on/off indicator.
 
 **Control reference**
 
@@ -124,10 +128,11 @@ https://github.com/user-attachments/assets/1c081390-e61f-4a1b-9088-a552860b9a5d
 | Layer: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect | — |
 | Layer: Pitch | Amount | Fun (modulation) | Toggle Pitch on/off | Cycle delay preset |
-| Layer: Reverb | Send | Size | — | — |
+| Layer: Reverb | Send | — | — | — |
 | Layer: Gain | Input gain | — | — | — |
 | Global: Tempo | BPM | Bars | Toggle metronome | — |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Global: Reverb | Size | — | — | — |
 | Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |
 | Global: Export | — | — | Tap = Export current performance as WAV | — |
 

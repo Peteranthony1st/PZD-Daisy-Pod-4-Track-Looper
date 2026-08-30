@@ -129,6 +129,9 @@ struct FileHeader
     int32_t  master_filter_mode;
     float    master_filter_cutoff01;
     float    master_filter_res01;
+    // Shared reverb bus's Size/decay (see main.cpp's fx_reverb_shared) --
+    // global now, not per-layer any more (see LayerHeader below).
+    float    reverb_size01;
 };
 
 struct LayerHeader
@@ -144,19 +147,20 @@ struct LayerHeader
     int32_t  effect;
     float    effect_param_a01;
     float    effect_param_b01;
-    float    reverb_send01;
-    float    reverb_size01;
+    float    reverb_send01; // Size is now a global FileHeader field, not per-layer
     uint8_t  pitch_enabled;
     float    pitch_amount01;
     float    pitch_fun01;
     int32_t  pitch_delay_preset;
 };
 
-// Bumped 1 -> 2 -> 3 as LayerHeader gained fields (most recently
-// pitch_delay_preset) -- Load() already rejects a version mismatch
-// cleanly (see below), so a performance saved under an older version
-// will correctly fail to load rather than being misread.
-constexpr uint32_t kFileVersion = 3;
+// Bumped 1 -> 2 -> 3 -> 4 as FileHeader/LayerHeader's layout changed
+// (most recently: reverb Size moved from a per-layer LayerHeader field
+// to a single global FileHeader one, see the shared-reverb-bus comment
+// on LooperLayer::SetReverbSend01()) -- Load() already rejects a
+// version mismatch cleanly (see below), so a performance saved under an
+// older version will correctly fail to load rather than being misread.
+constexpr uint32_t kFileVersion = 4;
 
 } // namespace
 
@@ -229,6 +233,7 @@ bool Save(int                slot,
           FilterMode         master_filter_mode,
           float              master_filter_cutoff01,
           float              master_filter_res01,
+          float              reverb_size01,
           ProgressFn         on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -276,6 +281,7 @@ bool Save(int                slot,
     hdr.master_filter_mode      = (int32_t)master_filter_mode;
     hdr.master_filter_cutoff01  = master_filter_cutoff01;
     hdr.master_filter_res01     = master_filter_res01;
+    hdr.reverb_size01           = reverb_size01;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -308,7 +314,6 @@ bool Save(int                slot,
         lh.effect_param_a01   = layer.GetEffectParamA01();
         lh.effect_param_b01   = layer.GetEffectParamB01();
         lh.reverb_send01      = layer.GetReverbSend01();
-        lh.reverb_size01      = layer.GetReverbSize01();
         lh.pitch_enabled      = layer.GetPitchEnabled() ? 1 : 0;
         lh.pitch_amount01     = layer.GetPitchAmount01();
         lh.pitch_fun01        = layer.GetPitchFun01();
@@ -367,6 +372,7 @@ bool Load(int          slot,
           FilterMode*  out_master_filter_mode,
           float*       out_master_filter_cutoff01,
           float*       out_master_filter_res01,
+          float*       out_reverb_size01,
           ProgressFn   on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -429,6 +435,7 @@ bool Load(int          slot,
         *out_master_filter_mode      = (FilterMode)hdr.master_filter_mode;
         *out_master_filter_cutoff01  = hdr.master_filter_cutoff01;
         *out_master_filter_res01     = hdr.master_filter_res01;
+        *out_reverb_size01           = hdr.reverb_size01;
     }
 
     int n = ok ? (int)hdr.num_layers : 0;
@@ -466,7 +473,6 @@ bool Load(int          slot,
         layer.SetEffectParamA01(lh.effect_param_a01);
         layer.SetEffectParamB01(lh.effect_param_b01);
         layer.SetReverbSend01(lh.reverb_send01);
-        layer.SetReverbSize01(lh.reverb_size01);
         layer.SetPitchAmount01(lh.pitch_amount01);
         layer.SetPitchFun01(lh.pitch_fun01);
         layer.SetPitchDelayPreset((int)lh.pitch_delay_preset);
@@ -518,6 +524,7 @@ bool ExportWav(TempoClock&  tempo,
               FilterMode   master_filter_mode,
               float        master_filter_cutoff01,
               float        master_filter_res01,
+              float        reverb_size01,
               ProgressFn   on_progress)
 {
     if(!card_ready)
@@ -626,6 +633,26 @@ bool ExportWav(TempoClock&  tempo,
     mfilt_r.SetFreq(mfilt_cutoff);
     mfilt_r.SetRes(mfilt_res);
 
+    // Local shared reverb bus, mirroring main.cpp's fx_reverb_shared --
+    // every layer's Send-scaled signal (see LooperLayer::Process()'s
+    // reverb_send_out parameter) is summed and run through this ONE
+    // instance, same as live playback. `static` (not stack-local) AND
+    // SDRAM-placed like main.cpp's, since it's the same ~386KB object --
+    // this project's stack lives in DTCMRAM (128K total), nowhere near
+    // enough room. Primed by pass 0 below same as the master filter.
+    // Zeroed before every Init() call, same reasoning as main.cpp's
+    // fx_reverb_shared and LooperLayer::Init()'s fx_phaser/fx_pitchshift:
+    // .sdram_bss isn't zero-initialized by startup code, so this object's
+    // memory is raw leftover contents the first time this runs, and
+    // (being `static`) whatever a previous export call left behind on
+    // every call after that -- re-zeroing each time keeps every export
+    // starting from the same clean state.
+    static daisysp::ReverbSc DSY_SDRAM_BSS export_reverb;
+    memset(&export_reverb, 0, sizeof(export_reverb));
+    export_reverb.Init((float)sample_rate);
+    export_reverb.SetLpFreq(9000.f); // fixed damping, matches the live default
+    export_reverb.SetFeedback(Clampf(reverb_size01, 0.f, 1.f));
+
     // Dummy input/ticks for the offline Process() calls below -- a
     // Playing-state layer never reads either (confirmed against
     // LooperLayer::Process()'s Playing/Paused/Overdubbing block), so an
@@ -637,6 +664,8 @@ bool ExportWav(TempoClock&  tempo,
 
     static float   chunk_l[kChunkSamples];
     static float   chunk_r[kChunkSamples];
+    static float   reverb_send_l[kChunkSamples];
+    static float   reverb_send_r[kChunkSamples];
     static int16_t pcm_chunk[kChunkSamples * 2];
 
     // Two full passes over the loop: pass 0 is a throwaway priming pass
@@ -680,16 +709,24 @@ bool ExportWav(TempoClock&  tempo,
 
             for(UINT i = 0; i < n; i++)
             {
-                chunk_l[i] = 0.f;
-                chunk_r[i] = 0.f;
+                chunk_l[i]        = 0.f;
+                chunk_r[i]        = 0.f;
+                reverb_send_l[i]  = 0.f;
+                reverb_send_r[i]  = 0.f;
             }
-            float* out_ptrs[2] = {chunk_l, chunk_r};
+            float* out_ptrs[2]         = {chunk_l, chunk_r};
+            float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
 
             for(int L = 0; L < num_layers; L++)
-                layers[L].Process(in_ptrs, out_ptrs, n, dummy_ticks, tempo);
+                layers[L].Process(in_ptrs, out_ptrs, reverb_send_ptrs, n, dummy_ticks, tempo);
 
             for(UINT i = 0; i < n; i++)
             {
+                float rev_wet_l, rev_wet_r;
+                export_reverb.Process(reverb_send_l[i], reverb_send_r[i], &rev_wet_l, &rev_wet_r);
+                chunk_l[i] += rev_wet_l;
+                chunk_r[i] += rev_wet_r;
+
                 float l = chunk_l[i];
                 float r = chunk_r[i];
                 if(master_filter_mode != FilterMode::Off)

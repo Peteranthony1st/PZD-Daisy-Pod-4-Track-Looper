@@ -58,11 +58,7 @@ class Ui
               int                           num_layers);
 
     // Call once per main-loop iteration (NOT from the audio callback).
-    // beat_count/downbeat_count should be free-running counters that the
-    // audio callback increments on every TempoTick::beat / ::downbeat --
-    // Ui uses the fact that they *changed* since last call to flash an
-    // LED in time with the metronome, without needing any locking.
-    void Update(uint32_t beat_count, uint32_t downbeat_count, const UiControlEvents& events);
+    void Update(const UiControlEvents& events);
 
     // Read by main.cpp's audio callback every block.
     float GetMasterVolume() const { return master_volume_; }
@@ -75,6 +71,12 @@ class Ui
     FilterMode GetMasterFilterMode() const { return master_filter_mode_; }
     float GetMasterFilterCutoff01() const { return master_filter_cutoff01_; }
     float GetMasterFilterResonance01() const { return master_filter_res01_; }
+    // Shared reverb bus's Size/decay (see main.cpp's fx_reverb_shared) --
+    // every layer's independent Send feeds this ONE instance now, not a
+    // per-layer ReverbSc any more (see LooperLayer::SetReverbSend01()'s
+    // comment for why). Raw 0..1, applied via SetFeedback() directly
+    // (same range DaisySP's ReverbSc expects), no curve needed.
+    float GetReverbSize01() const { return reverb_size01_; }
     // Gain applied to the Bypass dry monitor mix -- uses whichever layer
     // is currently selected on the Home screen, since Bypass is mainly
     // used to check levels right before recording into that layer (see
@@ -104,6 +106,7 @@ class Ui
     {
         Tempo,
         Filter,
+        Reverb,
         File,
         Export,
         kCount
@@ -126,6 +129,7 @@ class Ui
         LayerPitch,
         GlobalTempo,
         GlobalFilter,
+        GlobalReverb,
         GlobalFile,
         GlobalExport,
         kCount
@@ -167,7 +171,7 @@ class Ui
     void OnButton1Release();
     void OnButton2Short();
     void ApplyKnobs();
-    void UpdateLeds(uint32_t beat_count, uint32_t downbeat_count);
+    void UpdateLeds();
     void Draw();
     void DrawHome();
     void DrawLayerScreen();
@@ -287,9 +291,7 @@ class Ui
     float      master_filter_cutoff01_  = 0.5f;
     float      master_filter_res01_     = 0.f;
 
-    uint32_t last_beat_count_     = 0;
-    uint32_t last_downbeat_count_ = 0;
-    float    led2_flash_          = 0.f; // decays each Update() call
+    float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
 

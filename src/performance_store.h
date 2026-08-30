@@ -54,6 +54,7 @@ bool Save(int                slot,
           FilterMode         master_filter_mode,
           float              master_filter_cutoff01,
           float              master_filter_res01,
+          float              reverb_size01,
           ProgressFn         on_progress = nullptr);
 
 bool Load(int          slot,
@@ -65,6 +66,7 @@ bool Load(int          slot,
           FilterMode*  out_master_filter_mode,
           float*       out_master_filter_cutoff01,
           float*       out_master_filter_res01,
+          float*       out_reverb_size01,
           ProgressFn   on_progress = nullptr);
 
 // Renders the current in-memory performance (one full shared loop length,
@@ -73,9 +75,10 @@ bool Load(int          slot,
 // "WAV/" subfolder on the SD card -- kept out of the root directory
 // specifically so it never shows up as a load target in ListSlots().
 // Master volume and the metronome click are deliberately NOT included
-// (see performance_store.cpp); the master filter is. Blocking, like
-// Save()/Load() -- call from main()'s loop, not the audio callback, and
-// with g_audio_suspended held true for the whole call (see
+// (see performance_store.cpp); the master filter and the shared reverb
+// bus (reverb_size01 -- see Ui::GetReverbSize01()) both are. Blocking,
+// like Save()/Load() -- call from main()'s loop, not the audio callback,
+// and with g_audio_suspended held true for the whole call (see
 // Ui::TriggerExport()) since this drives extra LooperLayer::Process()
 // calls from outside the real ISR. Refuses to run while any layer is
 // Recording or ArmedCountIn, or if nothing has been recorded yet.
@@ -85,6 +88,7 @@ bool ExportWav(TempoClock&  tempo,
                FilterMode   master_filter_mode,
                float        master_filter_cutoff01,
                float        master_filter_res01,
+               float        reverb_size01,
                ProgressFn   on_progress = nullptr);
 
 } // namespace PerformanceStore

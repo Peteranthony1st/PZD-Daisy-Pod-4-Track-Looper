@@ -138,7 +138,7 @@ void Ui::Init(daisy::DaisyPod*              pod,
     SyncPickupTargets(KnobContext::Home);
 }
 
-void Ui::Update(uint32_t beat_count, uint32_t downbeat_count, const UiControlEvents& events)
+void Ui::Update(const UiControlEvents& events)
 {
     HandleEncoder(events);
     HandleButton1(events);
@@ -157,7 +157,7 @@ void Ui::Update(uint32_t beat_count, uint32_t downbeat_count, const UiControlEve
     else
         tempo_->Unlock();
 
-    UpdateLeds(beat_count, downbeat_count);
+    UpdateLeds();
 
     // The OLED redraw is a blocking I2C transfer of ~1KB -- a few
     // milliseconds. Throttled to ~30Hz here; Update() is expected to be
@@ -411,6 +411,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
             {
                 case GlobalPage::Tempo: return KnobContext::GlobalTempo;
                 case GlobalPage::Filter: return KnobContext::GlobalFilter;
+                case GlobalPage::Reverb: return KnobContext::GlobalReverb;
                 case GlobalPage::File: return KnobContext::GlobalFile;
                 case GlobalPage::Export: return KnobContext::GlobalExport;
                 default: return KnobContext::GlobalTempo;
@@ -444,8 +445,10 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             k2_pickup_raw_[i] = Cur().GetEffectParamB01();
             break;
         case KnobContext::LayerReverb:
+            // Knob2 does nothing here any more -- Size moved to
+            // Global:Reverb (see the shared-bus comment on
+            // LooperLayer::SetReverbSend01()).
             k1_pickup_raw_[i] = Cur().GetReverbSend01();
-            k2_pickup_raw_[i] = Cur().GetReverbSize01();
             break;
         case KnobContext::LayerGain:
             k1_pickup_raw_[i] = Cur().GetInputGain01();
@@ -468,6 +471,9 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalFilter:
             k1_pickup_raw_[i] = master_filter_cutoff01_;
             k2_pickup_raw_[i] = master_filter_res01_;
+            break;
+        case KnobContext::GlobalReverb:
+            k1_pickup_raw_[i] = reverb_size01_;
             break;
         case KnobContext::GlobalFile: break; // browses a list directly, no pickup used
         case KnobContext::GlobalExport: break; // no continuous knob values, Button1 triggers it
@@ -553,13 +559,12 @@ void Ui::ApplyKnobs()
                         Cur().SetEffectParamB01(k2);
                     break;
                 case LayerPage::Reverb:
-                    // Both knobs are this layer's own independent
-                    // reverb now (send amount + size/decay) -- each
-                    // layer owns its own ReverbSc instance.
+                    // Only Send is per-layer -- Size is a shared
+                    // Global:Reverb setting now (see the shared-bus
+                    // comment on LooperLayer::SetReverbSend01()), so
+                    // Knob2 does nothing on this page.
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         Cur().SetReverbSend01(k1);
-                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        Cur().SetReverbSize01(k2);
                     break;
                 case LayerPage::Gain:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
@@ -590,6 +595,11 @@ void Ui::ApplyKnobs()
                 if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                     master_filter_res01_ = Clampf(k2, 0.f, 1.f);
             }
+            else if(global_page_ == GlobalPage::Reverb)
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    reverb_size01_ = Clampf(k1, 0.f, 1.f);
+            }
             else if(global_page_ == GlobalPage::File)
             {
                 // Knob1 browses the list of existing saved slots (the
@@ -608,7 +618,7 @@ void Ui::ApplyKnobs()
     }
 }
 
-void Ui::UpdateLeds(uint32_t beat_count, uint32_t downbeat_count)
+void Ui::UpdateLeds()
 {
     // Led1: at-a-glance state of the cursor layer, visible without
     // squinting at the OLED.
@@ -623,22 +633,15 @@ void Ui::UpdateLeds(uint32_t beat_count, uint32_t downbeat_count)
         case LayerState::Paused: pod_->led1.Set(0.f, 0.f, 0.6f); break;
     }
 
-    // Led2: flashes with the metronome so you can see tempo even with
-    // the click turned down (or off) on a loud stage. Brighter/white on
-    // the downbeat, dimmer blue on the other beats.
-    bool new_beat     = (beat_count != last_beat_count_);
-    bool new_downbeat = (downbeat_count != last_downbeat_count_);
-    last_beat_count_     = beat_count;
-    last_downbeat_count_ = downbeat_count;
-    if(new_downbeat)
-        led2_flash_ = 1.f;
-    else if(new_beat)
-        led2_flash_ = 0.5f;
-    if(tempo_->IsMetronomeEnabled())
-        pod_->led2.Set(led2_flash_, led2_flash_, led2_flash_ * 0.6f);
+    // Led2: steady Bypass on/off indicator (Home screen's Button2) -- was
+    // a metronome flash before, but that could only ever be as accurate
+    // as the main loop's call rate allows (see UpdateLeds()'s old comment
+    // history), and under load never quite landed on the beat. A plain
+    // on/off readout has no timing to get wrong.
+    if(bypass_)
+        pod_->led2.Set(1.f, 1.f, 1.f);
     else
         pod_->led2.Set(0.f, 0.f, 0.f);
-    led2_flash_ *= 0.8f; // quick decay so it reads as a flash, not a glow
 
     pod_->UpdateLeds();
 }
@@ -1005,20 +1008,19 @@ void Ui::DrawLayerScreen()
         }
         case LayerPage::Reverb:
         {
-            // Independent per layer now (each layer owns its own
-            // ReverbSc) -- both Send and Size are this layer's alone.
-            snprintf(line1, sizeof(line1), "Send:%d%% Size:%d%%",
-                      (int)(Cur().GetReverbSend01() * 100.f + 0.5f),
-                      (int)(Cur().GetReverbSize01() * 100.f + 0.5f));
+            // Send only -- Size is a shared Global:Reverb setting now
+            // (every layer sends into ONE reverb bus, see the shared-bus
+            // comment on LooperLayer::SetReverbSend01()), so Knob2 does
+            // nothing on this page, same as Speed/Gain's idle knob2.
+            snprintf(line1, sizeof(line1), "Send: %d%%",
+                      (int)(Cur().GetReverbSend01() * 100.f + 0.5f));
             disp_->SetCursor(0, 20);
             disp_->WriteString(line1, Font_6x8, true);
 
-            char send_val[8], size_val[8];
+            char send_val[8];
             snprintf(send_val, sizeof(send_val), "%d%%",
                       (int)(Cur().GetReverbSend01() * 100.f + 0.5f));
-            snprintf(size_val, sizeof(size_val), "%d%%",
-                      (int)(Cur().GetReverbSize01() * 100.f + 0.5f));
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, size_val, "Size");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
@@ -1087,9 +1089,13 @@ void Ui::DrawGlobalScreen()
     // Compact form (not "Global Settings") for the same reason as the
     // Layer screen's title -- leaves room for the beat indicator on the
     // same row.
+    const char* title = "Global:Tempo";
+    if(global_page_ == GlobalPage::Filter)
+        title = "Global:Filter";
+    else if(global_page_ == GlobalPage::Reverb)
+        title = "Global:Reverb";
     disp_->SetCursor(0, 0);
-    disp_->WriteString(global_page_ == GlobalPage::Tempo ? "Global:Tempo" : "Global:Filter",
-                         Font_6x8, true);
+    disp_->WriteString(title, Font_6x8, true);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
     disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
@@ -1116,8 +1122,9 @@ void Ui::DrawGlobalScreen()
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "BPM", bpm_val, bars_val, "Bars");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Metro on/off", "", "", "");
     }
-    else // GlobalPage::Filter -- master-bus filter, applied once to the
-         // full mix in main.cpp, not per-layer like the Layer Filter page.
+    else if(global_page_ == GlobalPage::Filter) // master-bus filter, applied
+         // once to the full mix in main.cpp, not per-layer like the Layer
+         // Filter page.
     {
         snprintf(line1, sizeof(line1), "Mode: %s", FilterModeName(master_filter_mode_));
         disp_->SetCursor(0, 16);
@@ -1131,6 +1138,15 @@ void Ui::DrawGlobalScreen()
         snprintf(res_val, sizeof(res_val), "%d%%", (int)(master_filter_res01_ * 100.f + 0.5f));
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Cutoff", cutoff_val, res_val, "Res");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle mode", "", "", "");
+    }
+    else // GlobalPage::Reverb -- Size/decay for the ONE reverb bus every
+         // layer's Send feeds (see LooperLayer::SetReverbSend01()'s
+         // comment for why this isn't per-layer any more).
+    {
+        char size_val[8];
+        snprintf(size_val, sizeof(size_val), "%d%%", (int)(reverb_size01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Size", size_val, "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
     }
 }
 
@@ -1271,7 +1287,8 @@ void Ui::TriggerSave()
     file_op_in_progress_ = true;
     bool ok = PerformanceStore::Save(slot, *tempo_, layers_, num_layers_, master_volume01_,
                                        bypass_, master_filter_mode_, master_filter_cutoff01_,
-                                       master_filter_res01_, &Ui::OnSaveLoadProgress);
+                                       master_filter_res01_, reverb_size01_,
+                                       &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
 
@@ -1314,7 +1331,8 @@ void Ui::TriggerLoad()
     file_op_in_progress_ = true;
     bool ok = PerformanceStore::Load(slot, *tempo_, layers_, num_layers_, &master_volume01_,
                                        &bypass_, &master_filter_mode_, &master_filter_cutoff01_,
-                                       &master_filter_res01_, &Ui::OnSaveLoadProgress);
+                                       &master_filter_res01_, &reverb_size01_,
+                                       &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
     g_audio_suspended     = false; // every layer + tempo phase is consistent now
@@ -1345,7 +1363,7 @@ void Ui::TriggerExport()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            &Ui::OnSaveLoadProgress);
+                                            reverb_size01_, &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;

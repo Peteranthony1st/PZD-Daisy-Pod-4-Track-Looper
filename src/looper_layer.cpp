@@ -1,5 +1,6 @@
 #include "looper_layer.h"
 #include <math.h>
+#include <cstring>
 
 using namespace daisysp;
 
@@ -18,8 +19,7 @@ void LooperLayer::Init(float*             buf_l,
                        size_t             buffer_size,
                        float              sample_rate,
                        daisysp::Phaser*       fx_phaser,
-                       daisysp::PitchShifter* fx_pitchshift,
-                       daisysp::ReverbSc*     fx_reverb)
+                       daisysp::PitchShifter* fx_pitchshift)
 {
     buffer_l_    = buf_l;
     buffer_r_    = buf_r;
@@ -39,6 +39,24 @@ void LooperLayer::Init(float*             buf_l,
     }
     fx_chorus_.Init(sample_rate_);
 
+    // fx_phaser/fx_pitchshift live in SDRAM (see the class comment) --
+    // libDaisy's own sdram.h documents that .sdram_bss is NOT zero-
+    // initialized by startup code (confirmed against the actual linker
+    // script/startup .s file: only ordinary .bss gets zero-filled), so
+    // these objects start out holding raw leftover SDRAM contents, not
+    // zero. That's harmless for most fields (Init()/SetX() below
+    // overwrite what they use), but DaisySP's PitchShifter::Init()
+    // itself doesn't touch several internal fields it reads on the very
+    // first Process() call (prev_phs_a_/b_, mod_a_amt_/b_, mod_coeff_,
+    // slewed_mod_, mod_, pitch_shift_) -- garbage there has a real chance
+    // of decoding as NaN/Inf, which is self-sustaining once it appears
+    // and (since every layer sends into ONE shared reverb bus) silently
+    // poisons the entire mix, permanently, until a full power cycle.
+    // Zeroing the whole object first is cheap insurance against this
+    // exact class of bug for any current or future SDRAM-placed effect,
+    // not just this one field set.
+    memset(fx_phaser, 0, sizeof(*fx_phaser));
+    memset(fx_pitchshift, 0, sizeof(*fx_pitchshift));
     fx_phaser_ = fx_phaser;
     fx_phaser_->Init(sample_rate_);
     fx_pitchshift_ = fx_pitchshift;
@@ -48,10 +66,6 @@ void LooperLayer::Init(float*             buf_l,
     // Fast, the lowest-latency option) instead of leaving that in place
     // until the user happens to cycle it.
     SetPitchDelayPreset(pitch_delay_preset_);
-    fx_reverb_ = fx_reverb;
-    fx_reverb_->Init(sample_rate_);
-    fx_reverb_->SetLpFreq(9000.f); // fixed damping, matches the old shared reverb's default
-    fx_reverb_->SetFeedback(reverb_size01_);
 
     Reset();
 }
@@ -272,12 +286,6 @@ void LooperLayer::SetReverbSend01(float v)
     reverb_send_ = Clampf(v, 0.f, 1.f);
 }
 
-void LooperLayer::SetReverbSize01(float v)
-{
-    reverb_size01_ = Clampf(v, 0.f, 1.f);
-    fx_reverb_->SetFeedback(reverb_size01_);
-}
-
 // --- Save/load ------------------------------------------------------------
 
 void LooperLayer::RestoreRecordedLength(size_t len)
@@ -392,6 +400,7 @@ void LooperLayer::ProcessEffectsChain(float dry_l, float dry_r, float& out_l, fl
 
 void LooperLayer::Process(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
+                          AudioHandle::OutputBuffer reverb_send_out,
                           size_t                    size,
                           const TempoClock::TempoTick* ticks,
                           TempoClock&                  tempo)
@@ -569,6 +578,19 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                     fx_pitchshift_->SetTransposition(pitch_amount01_ * 24.f - 12.f);
                     fx_pitchshift_->SetFun(pitch_fun01_);
                     float wet = fx_pitchshift_->Process(mono);
+                    // Safety net: a NaN/Inf here (e.g. from a DaisySP edge
+                    // case, or any future SDRAM-placed effect that isn't
+                    // fully self-initializing) would otherwise sail
+                    // straight through Clampf() unchanged -- NaN compares
+                    // false against both bounds in IEEE-754, so a plain
+                    // min/max clamp doesn't catch it -- and flow into the
+                    // shared reverb bus below, permanently poisoning its
+                    // internal feedback state and silencing the entire
+                    // mix until a power cycle. One branch, only on this
+                    // path, to make that failure mode structurally
+                    // impossible regardless of cause.
+                    if(!isfinite(wet))
+                        wet = 0.f;
                     // DaisySP's PitchShifter crossfades two overlapping
                     // delay-line reads internally and isn't guaranteed to
                     // stay at unity gain doing it -- its output can come
@@ -589,19 +611,17 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 out[0][i] += fx_l * volume_ * panL;
                 out[1][i] += fx_r * volume_ * panR;
 
-                // This layer's own reverb (see fx_reverb_), fed by the
-                // same signal at this layer's send level -- same pan so
-                // the reverb return stays spatially consistent with the
-                // dry mix. Only run when there's an actual send, so a
-                // muted layer doesn't pay for reverb processing.
+                // Add this layer's Send-scaled contribution to the ONE
+                // shared reverb bus (main.cpp runs the actual ReverbSc
+                // once per sample, after every layer's Process() call --
+                // see AudioCallback()) -- same pan so the eventual return
+                // stays spatially consistent with this layer's dry mix.
+                // Only accumulate when there's an actual send, same
+                // "don't pay for it if it's not used" rule as before.
                 if(reverb_send_ > 0.f)
                 {
-                    float send_l = fx_l * volume_ * panL * reverb_send_;
-                    float send_r = fx_r * volume_ * panR * reverb_send_;
-                    float wet_l, wet_r;
-                    fx_reverb_->Process(send_l, send_r, &wet_l, &wet_r);
-                    out[0][i] += wet_l;
-                    out[1][i] += wet_r;
+                    reverb_send_out[0][i] += fx_l * volume_ * panL * reverb_send_;
+                    reverb_send_out[1][i] += fx_r * volume_ * panR * reverb_send_;
                 }
             }
             else

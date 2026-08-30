@@ -67,7 +67,8 @@ One consistent grammar everywhere:
 Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
   │                                             Effect / Pitch / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
-  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / File / Export
+  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / Reverb / File /
+                                             Export
                                                 (long-press ⤴ back to Home)
 ```
 
@@ -94,16 +95,32 @@ Full control map:
 | Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
 | Layer: Pitch | Amount (-12..+12 semitones, unison at center) | Fun (internal modulation amount) | Toggle Pitch on/off | Cycle delay-line preset (Fast/Med/Smooth — see below) |
-| Layer: Reverb | Send | Size | — | — |
+| Layer: Reverb | Send (into the shared reverb bus, see below) | — | — | — |
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | — |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
+| Global: Reverb | Size/decay (shared bus, see below) | — | — | — |
 | Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
 | Global: Export | — | — | Tap = render current performance to WAV | — |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
 affecting them, so you can't accidentally pull every track out of sync —
 clear every layer to unlock and pick a new tempo.
+
+### LED indicators
+
+Both are set once per `Ui::Update()` call (`Ui::UpdateLeds()`), not from
+the audio ISR:
+
+- **LED1**: the cursor layer's state (Empty=off, ArmedCountIn=amber,
+  Recording=red, Overdubbing=orange, Playing=green, Paused=blue) —
+  whichever layer `cursor_layer_` currently points at, not a fixed layer.
+- **LED2**: a steady Bypass on/off indicator (white when on). This used
+  to flash with the metronome instead, as a visual tempo reference when
+  the click was turned down — removed because that flash could only ever
+  be as accurate as the main loop's call rate, which under heavy DSP load
+  isn't perfectly steady, so it visibly stopped landing on the beat. A
+  plain on/off readout has no timing to get wrong.
 
 ### Per-layer transport state machine
 
@@ -161,7 +178,9 @@ clean material:
 looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
                   effect -> Pitch shift (independent on/off, can run
                   alongside the character effect) -> Volume/Pan ->
-                  this layer's own Reverb send -> mixed to output bus
+                  this layer's Reverb send -> ONE shared reverb bus,
+                  Process()'d once per sample in main.cpp -> mixed to
+                  output bus
 ```
 
 - **Filter**: cutoff and resonance are both live, turnable while the
@@ -182,9 +201,43 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   or on its own. DaisySP's `PitchShifter` is a delay-line-based shifter
   with real, audible processing latency that scales with its internal
   buffer size — see the delay-preset note below.
-- **Reverb**: independent per layer (each layer owns its own `ReverbSc`
-  instance, not a shared bus) — Send is how much of this layer's signal
-  feeds it, Size is that instance's own feedback/decay.
+- **Reverb**: ONE shared `ReverbSc` bus (`main.cpp`'s `fx_reverb_shared`),
+  not one per layer. Every layer's Send-scaled signal is summed into a
+  shared accumulator (`LooperLayer::Process()`'s `reverb_send_out`
+  parameter) and run through the single instance once per sample, in
+  `AudioCallback()`, after every layer's own `Process()` call. Send stays
+  independent per layer; Size/decay (Global:Reverb) is one setting shared
+  by everyone's send. This used to be 4 independent instances (one per
+  layer) — that was by far the heaviest thing in this signal chain
+  (~386KB per instance) and, in the worst case (reverb active on all 4
+  layers at once), was enough real-time DSP cost to starve the main loop/
+  TIM5 badly enough to cause actual audio glitches and OLED corruption,
+  not just UI lag. Consolidating to one instance cut that worst case
+  ~4x; measured with a cycle counter, even the heaviest combination this
+  firmware can produce (all 4 layers with a character effect, one layer
+  with pitch, reverb active) uses under half the audio callback's
+  real-time budget.
+
+### SDRAM-placed effects are explicitly zeroed before use
+
+`Phaser`, `PitchShifter` (both per-layer), and `ReverbSc` (the shared bus,
+plus its counterpart in `PerformanceStore::ExportWav()`) all live in
+SDRAM — libDaisy's `sdram.h` documents, and this project's linker script/
+startup code confirm, that `.sdram_bss` is **not** zero-initialized at
+boot, unlike ordinary SRAM `.bss`. `LooperLayer::Init()` and the
+equivalent setup in `main.cpp`/`performance_store.cpp` now `memset()`
+each of these objects to zero before calling their own `Init()`. This
+isn't cosmetic: it was a real, reproducible bug — `PitchShifter::Init()`
+doesn't touch several of its own internal fields, so without this they
+started out holding raw leftover SDRAM contents, and on some boots that
+decoded as NaN/Inf. Since NaN survives a plain min/max clamp unchanged
+(NaN compares false against both bounds) and DaisySP's `ReverbSc` has no
+NaN/Inf guard anywhere in its feedback path, one bad sample from a
+pitch-enabled layer could permanently poison the shared reverb bus's
+internal state — silencing the *entire* mix, not just that layer, until
+a full power cycle. `LooperLayer::Process()` also clamps the pitch
+stage's output to a finite value directly, as a second line of defense
+against this exact failure shape regardless of cause.
 
 ### Pitch delay presets
 
@@ -226,12 +279,15 @@ hold-to-confirm gesture.
   happened to be when Export was triggered — every layer's `play_pos_` is
   snapshotted, forced to 0 for the render, then restored afterward (even
   if the render fails partway through).
-- **The real, live effects chain** — filter, character effect, pitch,
-  reverb, per layer, plus the master filter — not a dry sum. This means
+- **The real, live effects chain** — filter, character effect, pitch, and
+  reverb per layer, plus the master filter — not a dry sum. This means
   the export calls each layer's actual `Process()` an extra time from the
   main loop (with `g_audio_suspended` held for the whole operation, same
   as `TriggerLoad()`, so it doesn't race the real audio ISR touching the
-  same objects).
+  same objects). Reverb is handled the same way live playback does it: a
+  local `ReverbSc` mirroring `main.cpp`'s shared bus, fed by every
+  layer's Send-scaled signal summed together, rather than a separate
+  instance per layer.
 - **Master volume and the metronome click are excluded.** Master volume
   is a monitor/output-level control, not mix content — including it would
   mean the exported file's loudness depended on wherever that knob
