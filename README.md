@@ -1,5 +1,7 @@
 <img height="220" alt="IMG_20260829_153832" src="https://github.com/user-attachments/assets/2b5ef4e8-39c5-4f6e-b0f3-ebab1151912c" /><img height="220" alt="IMG_20260829_153742" src="https://github.com/user-attachments/assets/c5dccf4c-f985-4fb2-90eb-8b50f2cbe780" /><img height="220" alt="IMG_20260829_153938" src="https://github.com/user-attachments/assets/f0e90580-c2f8-4c6a-9800-b38b15a6b568" />
 
+Video and looper generated WAV file below!
+
 # PZD: Daisy Pod 4 Track Looper
 
 A 4-layer stereo loop station firmware for the [Electrosmith Daisy
@@ -106,6 +108,11 @@ for the buttons).
 shows its live current value; turning the physical knob only takes
 control once it reaches that value, so switching pages or layers never
 suddenly yanks a setting to wherever the knob happens to be sitting.
+
+I have uploaded a short video showing basic workflow using pocket operators (applied effects before making the video). Also, I included a WAV file of acoustic guitar input, Microdexed Touch for drums and testing using some headphones as a mic input (put the gain up to x4).
+https://github.com/user-attachments/assets/1c081390-e61f-4a1b-9088-a552860b9a5d
+[Headphones_as_mic.WAV](https://github.com/user-attachments/files/31609801/Headphones_as_mic.WAV)
+
 
 **Control reference**
 
