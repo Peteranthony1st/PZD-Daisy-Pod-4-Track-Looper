@@ -32,7 +32,10 @@ The name, general concept, and file organization are based on
   `main.cpp` to switch it.
 
 - **Micro SD Card** formatted to FAT32.
-  Inserted into the pod to save and load your files.
+  Inserted into the pod to save and load your files. This is a
+  hand-wired socket with no card-detect pin, so swapping cards while the
+  Pod is powered on isn't reliably picked up — power off before
+  removing/reinserting a card, then power back on.
 
 - **PZD Daisy Pod Case**
   available at:
@@ -70,7 +73,8 @@ The name, general concept, and file organization are based on
 - Tempo (40–240 BPM), bars per loop (1–16), metronome on/off — locked
   once any layer holds a recording, so you can't pull layers out of sync
 - Master-bus filter, applied to the full mix
-- Reverb size/decay — one shared room for every layer's reverb send
+- Reverb size/decay — one shared room for every layer's reverb send, plus
+  Bypass's own independent send into that same room
 - Bypass: hear your live input mixed into the output before you've even
   recorded anything
 - Startup defaults — save your usual BPM/Bars/Volume/Metro/Filter/Reverb
@@ -82,8 +86,11 @@ The name, general concept, and file organization are based on
   setting) to an SD card, up to 99 slots
 - Export the current performance as a standard stereo WAV file — one full
   loop, every layer's live filter/effect/pitch/reverb chain and the
-  master filter applied, peak-normalized so it doesn't come out quiet —
-  ready to pull off the card and use elsewhere
+  master filter applied, peak-normalized so it doesn't come out quiet.
+  Two output options: full-quality native 48kHz for general use, or a
+  44.1kHz-resampled copy saved straight into a `custom/` folder so the
+  same SD card can go directly into a MicroDexed Touch's second card
+  slot and be picked up as a sample with no copying needed
 
 ## How to use it
 
@@ -143,9 +150,9 @@ every current setting exactly as-is and only clears recorded audio.
 | Layer: Gain | Input gain | — | — | — |
 | Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Global: Reverb | Size | — | — | — |
+| Global: Reverb | Size | Bypass reverb send | — | — |
 | Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |
-| Global: Export | — | — | Tap = Export current performance as WAV | — |
+| Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
 
 ## Building and flashing
 

@@ -84,6 +84,11 @@ class Ui
     // comment for why). Raw 0..1, applied via SetFeedback() directly
     // (same range DaisySP's ReverbSc expects), no curve needed.
     float GetReverbSize01() const { return reverb_size01_; }
+    // How much of the Bypass live-monitor signal feeds the shared reverb
+    // bus above -- independent of every layer's own Send, same shared
+    // bus though (see main.cpp's AudioCallback()). 0 (default) = none,
+    // matching every per-layer Send's own default.
+    float GetBypassReverbSend01() const { return bypass_reverb_send01_; }
     // Gain applied to the Bypass dry monitor mix -- uses whichever layer
     // is currently selected on the Home screen, since Bypass is mainly
     // used to check levels right before recording into that layer (see
@@ -216,10 +221,17 @@ class Ui
     void TriggerSaveDefaults();
     // Button1 short press on Global:Export: renders one full loop of the
     // current in-memory performance (every layer's real filter/effect/
-    // pitch/reverb chain, plus the master filter) to a new WAV/EXPnnn.WAV
-    // file. Simple tap, no hold-to-confirm -- unlike Save, this never
-    // overwrites anything, it only ever creates a new numbered file.
+    // pitch/reverb chain, plus the master filter) to a new WAV/EXPnnn.wav
+    // file at the Pod's native 48kHz. Simple tap, no hold-to-confirm --
+    // unlike Save, this never overwrites anything, it only ever creates a
+    // new numbered file.
     void TriggerExport();
+    // Button2 short press on Global:Export: same render as TriggerExport()
+    // but resampled to 44100 Hz and written under custom/EXPnnn.wav
+    // instead of WAV/EXPnnn.wav -- see PerformanceStore::ExportWav()'s
+    // for_microdexed param. Plain tap, no hold-to-confirm, same reasoning
+    // as TriggerExport() (never overwrites anything).
+    void TriggerExportMicroDexed();
     static void OnSaveLoadProgress(float progress01); // PerformanceStore::ProgressFn
     // Two-row control legend, drawn at the bottom of every screen in
     // Tom Thumb (see font_tomthumb.h): a knob row (circle icon) and a
@@ -306,6 +318,7 @@ class Ui
     float      master_filter_res01_     = 0.f;
 
     float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
+    float bypass_reverb_send01_ = 0.f; // see GetBypassReverbSend01()
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
 
@@ -327,4 +340,7 @@ class Ui
     // --- WAV export (Global:Export page) ------------------------------
     bool export_op_in_progress_     = false; // true only while inside ExportWav()
     char export_status_[24]         = {};    // last result, shown briefly on the page
+
+    // --- Startup defaults (Global:Tempo page) -------------------------
+    char tempo_status_[24]          = {};    // last "save as default" result, shown briefly here
 };

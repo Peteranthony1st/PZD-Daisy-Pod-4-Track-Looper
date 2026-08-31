@@ -99,9 +99,9 @@ Full control map:
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
-| Global: Reverb | Size/decay (shared bus, see below) | — | — | — |
+| Global: Reverb | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
 | Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
-| Global: Export | — | — | Tap = render current performance to WAV | — |
+| Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
 affecting them, so you can't accidentally pull every track out of sync —
@@ -218,6 +218,23 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   with pitch, reverb active) uses under half the audio callback's
   real-time budget.
 
+### Bypass reverb send
+
+Bypass (Home, Button 2 — the live-input monitor mix, e.g. for a powered
+mic plugged straight into the Pod) has its own independent send into
+that same shared reverb bus, set on Global:Reverb's Knob 2. In
+`AudioCallback()` this is one small block right before the shared
+reverb's `Process()` call (the same `bypass_gain`-scaled, L+R-summed-to-
+mono treatment the existing dry bypass mix already uses, for the same
+reason — see *Bypass sums to mono* below): if Bypass is on and the send
+is above zero, the live input adds into `reverb_send_l/r` alongside
+whatever the 4 layers are already contributing, then the one shared
+`ReverbSc` processes the combined total as usual. No new reverb
+instance, no measurable extra cost — a multiply-add per sample. Turning
+Bypass off silences this contribution too, and recordings stay
+completely dry regardless of this setting (it only ever feeds the
+monitor-mix reverb tail, never the recording path).
+
 ### SDRAM-placed effects are explicitly zeroed before use
 
 `Phaser`, `PitchShifter` (both per-layer), and `ReverbSc` (the shared bus,
@@ -257,7 +274,10 @@ Three presets, cycled with Button 2 on the Pitch page:
 
 `PerformanceStore` saves/loads a whole performance (all 4 layers' audio
 plus tempo/global/per-layer settings) as one flat binary file per slot,
-`PERF001.DAT` .. `PERF099.DAT`, via Global:File. The on-disk layout has a
+`PERF/PERF001.DAT` .. `PERF/PERF099.DAT`, via Global:File — kept in its
+own subfolder for the same reason WAV exports get their own (see below):
+a tidier SD root, and it keeps `ListSlots()`/`NextFreeSlot()`'s directory
+scan scoped to just that folder. The on-disk layout has a
 version tag (`kFileVersion` in `performance_store.cpp`) that gets bumped
 whenever a field is added — a save from an older firmware version is
 rejected cleanly on load (shown as a short error on the File page)
@@ -296,13 +316,38 @@ matters at power-on.
 
 ## WAV export
 
-`PerformanceStore::ExportWav()` (Global:Export, single tap on Button 1)
-renders the current in-memory performance to a standard stereo 16-bit PCM
-`WAV/EXPnnn.WAV` on the SD card — kept in its own subfolder specifically
-so it's invisible to `ListSlots()`/`NextFreeSlot()`, which only ever look
-at bare `PERFxxx.DAT` names in the root. Unlike Save, this never
-overwrites anything (always the next free number), so there's no
-hold-to-confirm gesture.
+`PerformanceStore::ExportWav()` renders the current in-memory performance
+to a standard stereo 16-bit PCM WAV file on the SD card. Two independent
+output modes, both on Global:Export, both kept out of `PERF/` so they're
+invisible to `ListSlots()`/`NextFreeSlot()`:
+
+- **Button 1 ("Studio")** — full-quality native 48kHz (the Pod's actual
+  audio rate), written to `WAV/EXPnnn.wav`. General purpose.
+- **Button 2 ("CD")** — the same render, but resampled to 44100 Hz and
+  written to `custom/EXPnnn.wav` instead. That folder name is required,
+  not cosmetic: it's what a **MicroDexed Touch** (a Teensy 4.1-based FM
+  synth with its own second SD card slot) scans for user sample content,
+  at its native 44.1kHz — so the same card can go straight from this
+  looper into MicroDexed's second slot and be picked up immediately, no
+  copying needed. This mode exists because a straight 48kHz file plays
+  back audibly slow and pitched down on that device (confirmed on real
+  hardware): 44100/48000 reduces to an exact **147/160** ratio, so
+  `Resampler48to44_1` (in `performance_store.cpp`, right after
+  `kMaxExportLayers`) tracks phase with plain integer arithmetic instead
+  of a float accumulator — zero long-term drift no matter how long the
+  loop is, and the exact output frame count for a given input frame
+  count (needed for the WAV header's `data_size`, written before the
+  render loop even starts) is a closed-form calculation
+  (`Resampler48to44_1::OutputFrames()`), not something requiring a dry
+  run first. The DSP chain itself — master filter, shared reverb — always
+  keeps running at the true native 48kHz regardless of mode; only the
+  final quantized output samples are resampled, right after the master
+  filter and before the makeup-gain/16-bit conversion step. Each mode has
+  its own independent `EXPnnn` numbering sequence.
+
+Unlike Save, neither mode ever overwrites anything (always the next free
+number in its own folder), so there's no hold-to-confirm gesture on
+either button.
 
 - **Exactly one full loop length** (`TempoClock::GetLoopLengthSamples()`),
   always starting from the true downbeat regardless of where playback
@@ -364,8 +409,21 @@ A few things that are intentional, not bugs:
   simplification, not a bug.
 - **Save files are version-locked**: see *Save/load* above.
 - **Export is one stereo mixdown, not per-track stems**: all 4 layers'
-  post-effects signal is summed into a single `WAV/EXPnnn.WAV` — there's
-  no way to export each layer as its own file.
+  post-effects signal is summed into a single file (either export mode)
+  — there's no way to export each layer as its own file.
+- **No SD card hot-swapping while powered on**: the SD socket is
+  hand-wired with no card-detect pin (see *Hardware* above), so the
+  firmware has no way to know a card was physically pulled and
+  reinserted while the Pod stays on — `PerformanceStore::Remount()`
+  (triggered automatically on Home→Global, and manually via the "Retry"
+  button when Global:File/Export show "No SD card") re-runs `f_mount()`,
+  which recovers a merely-stale mount, but not a card that was actually
+  swapped live: the low-level SDMMC peripheral can be left in a state a
+  plain re-`Init()` doesn't cleanly recover from (a proper fix needs a
+  full `HAL_SD_DeInit()`/re-`Init()` cycle, which broke the *boot-time*
+  mount when tried and was reverted rather than risk it further without
+  more careful testing). Power off before swapping cards, then power
+  back on — every boot-time mount in testing has been reliable.
 
 ## Files
 

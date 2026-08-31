@@ -135,6 +135,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const float mv           = ui.GetMasterVolume();
     const bool  byp          = ui.IsBypassed();
     const float bypass_gain  = ui.GetBypassGain();
+    const float bypass_reverb_send01 = ui.GetBypassReverbSend01();
     const FilterMode mfilt_mode = ui.GetMasterFilterMode();
 
     // Block-rate controls (matches LooperLayer's own per-layer filter
@@ -159,6 +160,19 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
     for(size_t i = 0; i < size; i++)
     {
+        // Bypass's own Send into the shared reverb bus -- independent of
+        // every layer's own Send, same bus though. Must happen BEFORE
+        // the Process() call right below, which is what actually
+        // consumes reverb_send_l/r for this sample. Same bypass_gain-
+        // scaled, L+R-summed-to-mono treatment as the dry bypass mix
+        // further down (see its own comment for why mono).
+        if(byp && bypass_reverb_send01 > 0.f)
+        {
+            float byp_send = (in[0][i] + in[1][i]) * bypass_gain * bypass_reverb_send01;
+            reverb_send_l[i] += byp_send;
+            reverb_send_r[i] += byp_send;
+        }
+
         // Shared reverb: process the summed sends once per sample and
         // mix the wet result into out[] -- BEFORE bypass/master filter/
         // click, same position this used to be added in when it ran

@@ -140,12 +140,13 @@ void Ui::Init(daisy::DaisyPod*              pod,
 
 void Ui::ApplyStartupDefaults()
 {
-    float      bpm, master_vol01, cutoff01, res01, reverb_sz01, metro_vol01;
+    float      bpm, master_vol01, cutoff01, res01, reverb_sz01, byp_send01, metro_vol01;
     int        bars;
     bool       byp, metro_on;
     FilterMode mode;
     if(!PerformanceStore::LoadPrefs(&bpm, &bars, &master_vol01, &byp, &mode, &cutoff01,
-                                      &res01, &reverb_sz01, &metro_on, &metro_vol01))
+                                      &res01, &reverb_sz01, &byp_send01, &metro_on,
+                                      &metro_vol01))
         return; // nothing saved yet -- Init()'s hardcoded defaults already stand
 
     // SetBpm()/SetBars() are no-ops while locked, but nothing can be
@@ -165,6 +166,7 @@ void Ui::ApplyStartupDefaults()
     master_filter_cutoff01_  = cutoff01;
     master_filter_res01_     = res01;
     reverb_size01_           = reverb_sz01;
+    bypass_reverb_send01_    = byp_send01;
 
     // Init() already called this once with the pre-defaults values (see
     // its own comment above) -- re-seed now that the real starting
@@ -243,6 +245,13 @@ void Ui::HandleEncoder(const UiControlEvents& events)
         {
             screen_      = Screen::Global;
             global_page_ = GlobalPage::Tempo;
+            // This hand-wired SD socket has no card-detect pin, so the
+            // firmware otherwise never notices a card was swapped out
+            // (e.g. pulled to move a WAV export to another device) and
+            // put back -- re-mount here so Global:File/Export reflect
+            // whatever card is actually in the slot right now, rather
+            // than a stale mount from boot.
+            PerformanceStore::Remount();
         }
         else
         {
@@ -395,9 +404,27 @@ void Ui::OnButton1Short()
                 master_filter_mode_ = (FilterMode)m;
             }
             else if(global_page_ == GlobalPage::File)
-                TriggerSave();
+            {
+                // No card: this hand-wired socket has no card-detect pin
+                // (see PerformanceStore::Remount()'s doc comment), so a
+                // card swapped out and back in needs an explicit re-mount
+                // attempt -- repurpose Button1 for that instead of Save
+                // while there's nothing to save to anyway.
+                if(!PerformanceStore::IsCardPresent())
+                {
+                    PerformanceStore::Remount();
+                    file_slots_dirty_ = true; // re-scan once actually mounted
+                }
+                else
+                    TriggerSave();
+            }
             else if(global_page_ == GlobalPage::Export)
-                TriggerExport();
+            {
+                if(!PerformanceStore::IsCardPresent())
+                    PerformanceStore::Remount();
+                else
+                    TriggerExport();
+            }
             break;
     }
 }
@@ -434,6 +461,8 @@ void Ui::OnButton2Short()
         int p = (Cur().GetPitchDelayPreset() + 1) % n;
         Cur().SetPitchDelayPreset(p);
     }
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::Export)
+        TriggerExportMicroDexed();
     // All other screens: Button2 is unused (Status page's Button2 is
     // handled separately in HandleButton2 as a hold-to-confirm clear).
 }
@@ -523,6 +552,7 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             break;
         case KnobContext::GlobalReverb:
             k1_pickup_raw_[i] = reverb_size01_;
+            k2_pickup_raw_[i] = bypass_reverb_send01_;
             break;
         case KnobContext::GlobalFile: break; // browses a list directly, no pickup used
         case KnobContext::GlobalExport: break; // no continuous knob values, Button1 triggers it
@@ -648,6 +678,8 @@ void Ui::ApplyKnobs()
             {
                 if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                     reverb_size01_ = Clampf(k1, 0.f, 1.f);
+                if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    bypass_reverb_send01_ = Clampf(k2, 0.f, 1.f);
             }
             else if(global_page_ == GlobalPage::File)
             {
@@ -1189,7 +1221,16 @@ void Ui::DrawGlobalScreen()
         disp_->WriteString(bars_line, Font_6x8, true);
         disp_->SetCursor(0, 24);
         disp_->WriteString(line2, Font_6x8, true);
-        if(tempo_->IsLocked())
+        // Same row either way -- the "save as default" result (if any)
+        // is a direct response to something the user just did, so it
+        // takes priority over the locked hint on the rare chance both
+        // are true at once.
+        if(tempo_status_[0] != '\0')
+        {
+            disp_->SetCursor(0, 36);
+            disp_->WriteString(tempo_status_, Font_6x8, true);
+        }
+        else if(tempo_->IsLocked())
         {
             disp_->SetCursor(0, 36);
             disp_->WriteString("Clear layers first", Font_6x8, true);
@@ -1221,11 +1262,15 @@ void Ui::DrawGlobalScreen()
     }
     else // GlobalPage::Reverb -- Size/decay for the ONE reverb bus every
          // layer's Send feeds (see LooperLayer::SetReverbSend01()'s
-         // comment for why this isn't per-layer any more).
+         // comment for why this isn't per-layer any more), plus Bypass's
+         // own independent Send into that same bus.
     {
-        char size_val[8];
+        char size_val[8], byp_send_val[8];
         snprintf(size_val, sizeof(size_val), "%d%%", (int)(reverb_size01_ * 100.f + 0.5f));
-        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Size", size_val, "", "");
+        snprintf(byp_send_val, sizeof(byp_send_val), "%d%%",
+                  (int)(bypass_reverb_send01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Size", size_val, byp_send_val,
+                         "Byp Send");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
     }
 }
@@ -1242,7 +1287,7 @@ void Ui::DrawFileScreen()
         disp_->SetCursor(0, 20);
         disp_->WriteString("No SD card", Font_6x8, true);
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
         return;
     }
 
@@ -1337,7 +1382,7 @@ void Ui::DrawExportScreen()
     if(!PerformanceStore::IsCardPresent())
     {
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
         return;
     }
 
@@ -1345,7 +1390,7 @@ void Ui::DrawExportScreen()
     // creates a new numbered file and never overwrites/destroys anything,
     // so a plain tap is safe.
     DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
-    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Export", "", "", "");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "STUDIO 48K", "", "", "CD 44.1K");
 }
 
 void Ui::RefreshFileSlots()
@@ -1370,7 +1415,7 @@ void Ui::TriggerSave()
     bool ok = PerformanceStore::Save(slot, *tempo_, layers_, num_layers_, master_volume01_,
                                        bypass_, master_filter_mode_, master_filter_cutoff01_,
                                        master_filter_res01_, reverb_size01_,
-                                       &Ui::OnSaveLoadProgress);
+                                       bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
 
@@ -1414,7 +1459,7 @@ void Ui::TriggerLoad()
     bool ok = PerformanceStore::Load(slot, *tempo_, layers_, num_layers_, &master_volume01_,
                                        &bypass_, &master_filter_mode_, &master_filter_cutoff01_,
                                        &master_filter_res01_, &reverb_size01_,
-                                       &Ui::OnSaveLoadProgress);
+                                       &bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
     g_audio_suspended     = false; // every layer + tempo phase is consistent now
@@ -1439,11 +1484,12 @@ void Ui::TriggerSaveDefaults()
 {
     bool ok = PerformanceStore::SavePrefs(*tempo_, master_volume01_, bypass_,
                                             master_filter_mode_, master_filter_cutoff01_,
-                                            master_filter_res01_, reverb_size01_);
+                                            master_filter_res01_, reverb_size01_,
+                                            bypass_reverb_send01_);
     if(ok)
-        snprintf(file_status_, sizeof(file_status_), "Saved as default");
+        snprintf(tempo_status_, sizeof(tempo_status_), "Saved as default");
     else
-        snprintf(file_status_, sizeof(file_status_), "Fail:%s", PerformanceStore::GetLastError());
+        snprintf(tempo_status_, sizeof(tempo_status_), "Fail:%s", PerformanceStore::GetLastError());
 }
 
 void Ui::TriggerExport()
@@ -1456,13 +1502,36 @@ void Ui::TriggerExport()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            reverb_size01_, &Ui::OnSaveLoadProgress);
+                                            reverb_size01_, /*for_microdexed=*/false,
+                                            &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;
 
     if(ok)
         snprintf(export_status_, sizeof(export_status_), "Exported WAV");
+    else
+        snprintf(export_status_, sizeof(export_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+}
+
+void Ui::TriggerExportMicroDexed()
+{
+    // Same reasoning as TriggerExport() above -- must not race the live
+    // audio ISR while this drives an extra offline render pass.
+    g_audio_suspended       = true;
+    g_progress_disp         = disp_;
+    export_op_in_progress_  = true;
+    bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
+                                            master_filter_cutoff01_, master_filter_res01_,
+                                            reverb_size01_, /*for_microdexed=*/true,
+                                            &Ui::OnSaveLoadProgress);
+    export_op_in_progress_  = false;
+    g_progress_disp         = nullptr;
+    g_audio_suspended       = false;
+
+    if(ok)
+        snprintf(export_status_, sizeof(export_status_), "Exported 44.1k");
     else
         snprintf(export_status_, sizeof(export_status_), "Fail:%s",
                   PerformanceStore::GetLastError());

@@ -48,13 +48,17 @@ void ClearError()
 // by per-call SD overhead.
 constexpr UINT kChunkSamples = 4096;
 
+// Kept inside its own "PERF/" subfolder, same reasoning as "custom/"
+// below -- tidier SD root, and it's still a plain PERFxxx.DAT name
+// underneath so nothing else about the format changes.
 void SlotFilename(int slot, char* out, size_t out_size)
 {
-    snprintf(out, out_size, "PERF%03d.DAT", slot);
+    snprintf(out, out_size, "PERF/PERF%03d.DAT", slot);
 }
 
-// Bare filename in the SD root, same convention as PERFxxx.DAT -- see
-// SavePrefs()/LoadPrefs().
+// Bare filename in the SD root (unlike PERFxxx.DAT/EXPnnn.wav, this one's
+// not in its own subfolder -- it's a single file, not something that
+// clutters a listing) -- see SavePrefs()/LoadPrefs().
 constexpr const char* kPrefsFilename = "PREFS.DAT";
 
 inline float Clampf(float v, float lo, float hi)
@@ -62,24 +66,33 @@ inline float Clampf(float v, float lo, float hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
-// Kept inside its own "WAV/" subfolder (see ExportWav()) specifically so
-// these never get picked up by ListSlots()/NextFreeSlot(), which only
-// ever look at bare PERFxxx.DAT names in the SD root.
-void ExportFilename(int n, char* out, size_t out_size)
+// Each export mode is kept in its own subfolder with its own independent
+// EXPnnn numbering sequence (see ExportWav()'s for_microdexed param) --
+// "WAV/" for full-quality native exports, "custom/" for MicroDexed-ready
+// 44.1kHz ones. "custom" is deliberate, not cosmetic -- that's the exact
+// folder name MicroDexed Touch scans its SD slots for, so that card,
+// moved straight into MicroDexed's second slot, is already laid out the
+// way it expects with no copy step needed at all. Neither ever collides
+// with ListSlots()/NextFreeSlot(), which only look inside "PERF/" (see
+// SlotFilename() above).
+void ExportFilename(bool for_microdexed, int n, char* out, size_t out_size)
 {
-    snprintf(out, out_size, "WAV/EXP%03d.WAV", n);
+    if(for_microdexed)
+        snprintf(out, out_size, "custom/EXP%03d.wav", n);
+    else
+        snprintf(out, out_size, "WAV/EXP%03d.wav", n);
 }
 
-// Lowest-numbered "WAV/EXPnnn.WAV" that doesn't exist yet -- same
-// f_stat-scan pattern as NextFreeSlot(), just scoped to the export
-// folder/prefix instead. -1 if the whole 001..999 range is somehow full.
-int NextFreeExportNumber()
+// Lowest-numbered free EXPnnn file in the given mode's folder -- same
+// f_stat-scan pattern as NextFreeSlot(), just scoped per-mode. -1 if that
+// mode's whole 001..999 range is somehow full.
+int NextFreeExportNumber(bool for_microdexed)
 {
     for(int n = 1; n <= 999; n++)
     {
         char    fname[24];
         FILINFO fno;
-        ExportFilename(n, fname, sizeof(fname));
+        ExportFilename(for_microdexed, n, fname, sizeof(fname));
         if(f_stat(fname, &fno) != FR_OK)
             return n;
     }
@@ -114,6 +127,61 @@ static_assert(sizeof(WavHeader) == 44, "WavHeader must be the canonical 44-byte 
 // generous headroom, not a hard architectural limit.
 constexpr int kMaxExportLayers = 8;
 
+// Exact-ratio linear-interpolation downsampler, 48000 -> 44100 Hz
+// (44100/48000 == 147/160 exactly, gcd 300). Integer phase tracking, not
+// a float accumulator, so there's zero long-term drift over an
+// arbitrarily long loop. Streaming by design -- Push() only ever looks
+// at the two most-recently-pushed samples, so its state survives being
+// called across ExportWav()'s chunked I/O loop with no discontinuity at
+// chunk boundaries; the chunking is purely an I/O detail this never
+// sees. Only ever driven during ExportWav()'s pass 1 (the real write
+// pass) when for_microdexed is true.
+struct Resampler48to44_1
+{
+    static constexpr uint64_t kInRate  = 160;
+    static constexpr uint64_t kOutRate = 147;
+
+    bool     have_prev = false;
+    float    prev_l = 0.f, prev_r = 0.f;
+    uint64_t in_count  = 0;
+    uint64_t out_count = 0;
+
+    // Push one native-rate sample. Returns true if an output sample was
+    // produced (written to *out_l/*out_r) -- most calls return false,
+    // since kOutRate < kInRate. Never more than one emission per call
+    // (kInRate/kOutRate < 2, so consecutive output positions are always
+    // further apart than one input-sample interval).
+    bool Push(float in_l, float in_r, float* out_l, float* out_r)
+    {
+        bool emitted = false;
+        if(have_prev)
+        {
+            uint64_t n = in_count + 1;
+            if(out_count * kInRate < n * kOutRate)
+            {
+                uint64_t base = in_count * kOutRate;
+                float    frac = (float)(out_count * kInRate - base) / (float)kOutRate;
+                *out_l  = prev_l + (in_l - prev_l) * frac;
+                *out_r  = prev_r + (in_r - prev_r) * frac;
+                out_count++;
+                emitted = true;
+            }
+        }
+        prev_l = in_l;
+        prev_r = in_r;
+        have_prev = true;
+        in_count++;
+        return emitted;
+    }
+
+    // Exact output-frame count for `n` native input frames -- needed to
+    // size the WAV header's data_size before the render loop runs.
+    static uint32_t OutputFrames(size_t n)
+    {
+        return (uint32_t)(((uint64_t)n * kOutRate + (kInRate - 1)) / kInRate);
+    }
+};
+
 // Fixed-layout header, written/read as one raw block. Every field is a
 // plain float/int32/uint8 (no bitfields, no padding-sensitive types) so
 // the layout is stable across compilers -- this firmware is both the only
@@ -136,6 +204,10 @@ struct FileHeader
     // Shared reverb bus's Size/decay (see main.cpp's fx_reverb_shared) --
     // global now, not per-layer any more (see LayerHeader below).
     float    reverb_size01;
+    // How much of the Bypass live-monitor signal feeds that same shared
+    // reverb bus (see Ui::GetBypassReverbSend01()) -- independent of
+    // every layer's own Send.
+    float    bypass_reverb_send01;
 };
 
 struct LayerHeader
@@ -158,13 +230,12 @@ struct LayerHeader
     int32_t  pitch_delay_preset;
 };
 
-// Bumped 1 -> 2 -> 3 -> 4 as FileHeader/LayerHeader's layout changed
-// (most recently: reverb Size moved from a per-layer LayerHeader field
-// to a single global FileHeader one, see the shared-reverb-bus comment
-// on LooperLayer::SetReverbSend01()) -- Load() already rejects a
-// version mismatch cleanly (see below), so a performance saved under an
-// older version will correctly fail to load rather than being misread.
-constexpr uint32_t kFileVersion = 4;
+// Bumped 1 -> 2 -> 3 -> 4 -> 5 as FileHeader/LayerHeader's layout
+// changed (most recently: added bypass_reverb_send01) -- Load() already
+// rejects a version mismatch cleanly (see below), so a performance
+// saved under an older version will correctly fail to load rather than
+// being misread.
+constexpr uint32_t kFileVersion = 5;
 
 } // namespace
 
@@ -192,6 +263,12 @@ void Init()
     card_ready = f_mount(&fs, fsi.GetSDPath(), 1) == FR_OK;
 }
 
+void Remount()
+{
+    FATFS& fs = fsi.GetSDFileSystem();
+    card_ready = f_mount(&fs, fsi.GetSDPath(), 1) == FR_OK;
+}
+
 bool IsCardPresent()
 {
     return card_ready;
@@ -204,7 +281,7 @@ int ListSlots(int* out_slots, int max_out)
     int count = 0;
     for(int slot = 1; slot <= kMaxSlots && count < max_out; slot++)
     {
-        char    fname[16];
+        char    fname[20];
         FILINFO fno;
         SlotFilename(slot, fname, sizeof(fname));
         if(f_stat(fname, &fno) == FR_OK)
@@ -219,7 +296,7 @@ int NextFreeSlot()
         return -1;
     for(int slot = 1; slot <= kMaxSlots; slot++)
     {
-        char    fname[16];
+        char    fname[20];
         FILINFO fno;
         SlotFilename(slot, fname, sizeof(fname));
         if(f_stat(fname, &fno) != FR_OK)
@@ -238,13 +315,21 @@ bool Save(int                slot,
           float              master_filter_cutoff01,
           float              master_filter_res01,
           float              reverb_size01,
+          float              bypass_reverb_send01,
           ProgressFn         on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
         return false;
 
-    char fname[16];
+    char fname[20];
     SlotFilename(slot, fname, sizeof(fname));
+
+    FRESULT mkdir_res = f_mkdir("PERF");
+    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
+    {
+        SetError("mkdir", mkdir_res);
+        return false;
+    }
 
     // FIL/FileHeader/LayerHeader are `static` here rather than ordinary
     // locals on purpose: this project's stack lives in DTCMRAM (see
@@ -286,6 +371,7 @@ bool Save(int                slot,
     hdr.master_filter_cutoff01  = master_filter_cutoff01;
     hdr.master_filter_res01     = master_filter_res01;
     hdr.reverb_size01           = reverb_size01;
+    hdr.bypass_reverb_send01    = bypass_reverb_send01;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -377,12 +463,13 @@ bool Load(int          slot,
           float*       out_master_filter_cutoff01,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
+          float*       out_bypass_reverb_send01,
           ProgressFn   on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
         return false;
 
-    char fname[16];
+    char fname[20];
     SlotFilename(slot, fname, sizeof(fname));
 
     ClearError();
@@ -440,6 +527,7 @@ bool Load(int          slot,
         *out_master_filter_cutoff01  = hdr.master_filter_cutoff01;
         *out_master_filter_res01     = hdr.master_filter_res01;
         *out_reverb_size01           = hdr.reverb_size01;
+        *out_bypass_reverb_send01    = hdr.bypass_reverb_send01;
     }
 
     int n = ok ? (int)hdr.num_layers : 0;
@@ -529,6 +617,7 @@ bool ExportWav(TempoClock&  tempo,
               float        master_filter_cutoff01,
               float        master_filter_res01,
               float        reverb_size01,
+              bool         for_microdexed,
               ProgressFn   on_progress)
 {
     if(!card_ready)
@@ -560,21 +649,21 @@ bool ExportWav(TempoClock&  tempo,
         return false;
     }
 
-    FRESULT mkdir_res = f_mkdir("WAV");
+    FRESULT mkdir_res = f_mkdir(for_microdexed ? "custom" : "WAV");
     if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
     {
         SetError("mkdir", mkdir_res);
         return false;
     }
 
-    int num = NextFreeExportNumber();
+    int num = NextFreeExportNumber(for_microdexed);
     if(num < 0)
     {
         SetError("full", FR_OK);
         return false;
     }
     char fname[24];
-    ExportFilename(num, fname, sizeof(fname));
+    ExportFilename(for_microdexed, num, fname, sizeof(fname));
 
     static FIL file; // see the DTCMRAM/DMA comment in Save() above
     FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
@@ -584,9 +673,19 @@ bool ExportWav(TempoClock&  tempo,
         return false;
     }
 
-    const uint32_t sample_rate   = (uint32_t)tempo.GetSampleRate();
-    const size_t   total_samples = tempo.GetLoopLengthSamples();
-    const uint32_t data_size     = (uint32_t)(total_samples * 2 * sizeof(int16_t));
+    // sample_rate/total_samples stay at the true native rate -- they
+    // drive mfilt_l/r.Init(), export_reverb.Init(), and nyquist_guard
+    // below, all of which must keep running at the Pod's real 48kHz
+    // regardless of export mode (only the final written samples get
+    // resampled, see the write loop below). out_sample_rate/out_frames
+    // are the separate, WAV-header/output-facing values.
+    const uint32_t sample_rate     = (uint32_t)tempo.GetSampleRate();
+    const size_t   total_samples   = tempo.GetLoopLengthSamples();
+    const uint32_t out_sample_rate = for_microdexed ? 44100u : sample_rate;
+    const uint32_t out_frames      = for_microdexed
+                                          ? Resampler48to44_1::OutputFrames(total_samples)
+                                          : (uint32_t)total_samples;
+    const uint32_t data_size       = out_frames * 2 * (uint32_t)sizeof(int16_t);
 
     static WavHeader hdr;
     memcpy(hdr.riff, "RIFF", 4);
@@ -596,7 +695,7 @@ bool ExportWav(TempoClock&  tempo,
     hdr.fmt_size        = 16;
     hdr.audio_format    = 1; // PCM
     hdr.num_channels    = 2;
-    hdr.sample_rate     = sample_rate;
+    hdr.sample_rate     = out_sample_rate;
     hdr.bits_per_sample = 16;
     hdr.block_align     = (uint16_t)(hdr.num_channels * (hdr.bits_per_sample / 8));
     hdr.byte_rate       = hdr.sample_rate * hdr.block_align;
@@ -691,8 +790,9 @@ bool ExportWav(TempoClock&  tempo,
     // post-filter signal pass 1 will write, tracking its peak is free --
     // pass 1 then applies a flat makeup gain so the loudest sample lands
     // just under full scale instead of wherever it naturally fell.
-    float peak   = 0.f;
-    float makeup = 1.f;
+    float             peak   = 0.f;
+    float             makeup = 1.f;
+    Resampler48to44_1 resampler; // only driven below when for_microdexed and write_this_pass
     for(int pass = 0; pass < 2 && ok; pass++)
     {
         bool write_this_pass = pass == 1;
@@ -709,7 +809,10 @@ bool ExportWav(TempoClock&  tempo,
         size_t remaining = total_samples;
         while(remaining > 0 && ok)
         {
-            UINT n = (UINT)(remaining < kChunkSamples ? remaining : kChunkSamples);
+            UINT n      = (UINT)(remaining < kChunkSamples ? remaining : kChunkSamples);
+            UINT wcount = 0; // frames actually written into pcm_chunk this chunk (== n
+                              // unless for_microdexed, since resampling emits 0 or 1
+                              // output frame per native frame, not always 1)
 
             for(UINT i = 0; i < n; i++)
             {
@@ -756,10 +859,26 @@ bool ExportWav(TempoClock&  tempo,
                 }
                 if(write_this_pass)
                 {
-                    l = Clampf(l * makeup, -1.f, 1.f);
-                    r = Clampf(r * makeup, -1.f, 1.f);
-                    pcm_chunk[2 * i]     = (int16_t)(l * 32767.f);
-                    pcm_chunk[2 * i + 1] = (int16_t)(r * 32767.f);
+                    if(for_microdexed)
+                    {
+                        float rl, rr;
+                        if(resampler.Push(l, r, &rl, &rr))
+                        {
+                            rl = Clampf(rl * makeup, -1.f, 1.f);
+                            rr = Clampf(rr * makeup, -1.f, 1.f);
+                            pcm_chunk[2 * wcount]     = (int16_t)(rl * 32767.f);
+                            pcm_chunk[2 * wcount + 1] = (int16_t)(rr * 32767.f);
+                            wcount++;
+                        }
+                    }
+                    else
+                    {
+                        l = Clampf(l * makeup, -1.f, 1.f);
+                        r = Clampf(r * makeup, -1.f, 1.f);
+                        pcm_chunk[2 * wcount]     = (int16_t)(l * 32767.f);
+                        pcm_chunk[2 * wcount + 1] = (int16_t)(r * 32767.f);
+                        wcount++;
+                    }
                 }
                 else
                 {
@@ -771,7 +890,7 @@ bool ExportWav(TempoClock&  tempo,
 
             if(write_this_pass)
             {
-                UINT bytes = n * 2 * (UINT)sizeof(int16_t);
+                UINT bytes = wcount * 2 * (UINT)sizeof(int16_t);
                 UINT written;
                 fr = f_write(&file, pcm_chunk, bytes, &written);
                 ok = fr == FR_OK && written == bytes;
@@ -808,7 +927,8 @@ bool SavePrefs(TempoClock&  tempo,
               FilterMode   master_filter_mode,
               float        master_filter_cutoff01,
               float        master_filter_res01,
-              float        reverb_size01)
+              float        reverb_size01,
+              float        bypass_reverb_send01)
 {
     if(!card_ready)
         return false;
@@ -837,6 +957,7 @@ bool SavePrefs(TempoClock&  tempo,
     hdr.master_filter_cutoff01  = master_filter_cutoff01;
     hdr.master_filter_res01     = master_filter_res01;
     hdr.reverb_size01           = reverb_size01;
+    hdr.bypass_reverb_send01    = bypass_reverb_send01;
 
     UINT bw;
     fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -859,6 +980,7 @@ bool LoadPrefs(float*      out_bpm,
               float*      out_master_filter_cutoff01,
               float*      out_master_filter_res01,
               float*      out_reverb_size01,
+              float*      out_bypass_reverb_send01,
               bool*       out_metronome_enabled,
               float*      out_metronome_vol01)
 {
@@ -890,6 +1012,7 @@ bool LoadPrefs(float*      out_bpm,
     *out_master_filter_cutoff01 = hdr.master_filter_cutoff01;
     *out_master_filter_res01    = hdr.master_filter_res01;
     *out_reverb_size01          = hdr.reverb_size01;
+    *out_bypass_reverb_send01   = hdr.bypass_reverb_send01;
     *out_metronome_enabled      = hdr.metronome_enabled != 0;
     *out_metronome_vol01        = hdr.metronome_vol01;
     return true;

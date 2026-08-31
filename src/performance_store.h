@@ -30,6 +30,15 @@ constexpr int kMaxSlots = 99;
 void Init();
 bool IsCardPresent();
 
+// Re-mount the card (same f_mount() call Init() does). This hand-wired
+// SD socket has no card-detect pin, so the firmware has no way to know a
+// card was physically pulled/swapped/reinserted -- IsCardPresent()
+// otherwise stays whatever it was at boot forever. Call this whenever
+// it's reasonable to assume the card might have changed (see
+// Ui::HandleEncoder()'s Home->Global transition) rather than waiting for
+// a Save/Load/Export call to fail against a stale mount.
+void Remount();
+
 // Short diagnostic for the most recent Save()/Load() failure -- a step
 // tag plus the FatFS FRESULT code ("hdr:3", "aud0:5", ...), e.g. for
 // display on the File page. Empty string if the last call succeeded (or
@@ -55,6 +64,7 @@ bool Save(int                slot,
           float              master_filter_cutoff01,
           float              master_filter_res01,
           float              reverb_size01,
+          float              bypass_reverb_send01,
           ProgressFn         on_progress = nullptr);
 
 bool Load(int          slot,
@@ -67,13 +77,23 @@ bool Load(int          slot,
           float*       out_master_filter_cutoff01,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
+          float*       out_bypass_reverb_send01,
           ProgressFn   on_progress = nullptr);
 
 // Renders the current in-memory performance (one full shared loop length,
 // every layer's real filter/character-effect/pitch/reverb chain applied,
-// same as live playback) to a new stereo 16-bit PCM WAV file under a
-// "WAV/" subfolder on the SD card -- kept out of the root directory
-// specifically so it never shows up as a load target in ListSlots().
+// same as live playback) to a new stereo 16-bit PCM WAV file. Two
+// independent output modes, selected by for_microdexed:
+//   false: full-quality native 48000 Hz, under "WAV/" -- general
+//     purpose, kept out of the SD root so it never shows up as a load
+//     target in ListSlots().
+//   true: same performance/DSP chain (the chain itself always runs at
+//     native 48kHz -- see ExportWav()'s sample_rate local), but the
+//     final output is resampled to 44100 Hz (Resampler48to44_1, in the
+//     .cpp) and written under "custom/" -- that folder name is
+//     required, not cosmetic: MicroDexed Touch scans its SD card for a
+//     folder literally named "custom" and expects 44100 Hz PCM.
+// Each mode has its own independent EXPnnn numbering sequence.
 // Master volume and the metronome click are deliberately NOT included
 // (see performance_store.cpp); the master filter and the shared reverb
 // bus (reverb_size01 -- see Ui::GetReverbSize01()) both are. Blocking,
@@ -89,11 +109,12 @@ bool ExportWav(TempoClock&  tempo,
                float        master_filter_cutoff01,
                float        master_filter_res01,
                float        reverb_size01,
+               bool         for_microdexed,
                ProgressFn   on_progress = nullptr);
 
 // User-settable startup defaults -- every *global* setting, deliberately
-// no per-layer ones (see the Global:File page's Button2 tap). Stored as
-// a single small "PREFS.DAT" in the SD root, reusing the same on-disk
+// no per-layer ones (see Global:Tempo's Button2 hold). Stored as a
+// single small "PREFS.DAT" in the SD root, reusing the same on-disk
 // header shape Save()/Load() already use for these exact fields (just
 // without any layers/audio following it) rather than a second format.
 //
@@ -108,7 +129,8 @@ bool SavePrefs(TempoClock&  tempo,
                FilterMode   master_filter_mode,
                float        master_filter_cutoff01,
                float        master_filter_res01,
-               float        reverb_size01);
+               float        reverb_size01,
+               float        bypass_reverb_send01);
 
 bool LoadPrefs(float*      out_bpm,
                int*        out_bars,
@@ -118,6 +140,7 @@ bool LoadPrefs(float*      out_bpm,
                float*      out_master_filter_cutoff01,
                float*      out_master_filter_res01,
                float*      out_reverb_size01,
+               float*      out_bypass_reverb_send01,
                bool*       out_metronome_enabled,
                float*      out_metronome_vol01);
 
