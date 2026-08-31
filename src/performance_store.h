@@ -91,4 +91,34 @@ bool ExportWav(TempoClock&  tempo,
                float        reverb_size01,
                ProgressFn   on_progress = nullptr);
 
+// User-settable startup defaults -- every *global* setting, deliberately
+// no per-layer ones (see the Global:File page's Button2 tap). Stored as
+// a single small "PREFS.DAT" in the SD root, reusing the same on-disk
+// header shape Save()/Load() already use for these exact fields (just
+// without any layers/audio following it) rather than a second format.
+//
+// LoadPrefs() returns false (every output left untouched) if the card
+// is missing, no PREFS.DAT exists yet, or it doesn't look like a prefs
+// file (bad magic/version, e.g. left over from an older firmware) --
+// none of those are errors worth surfacing; the caller's own hardcoded
+// defaults should just stand.
+bool SavePrefs(TempoClock&  tempo,
+               float        master_volume01,
+               bool         bypass,
+               FilterMode   master_filter_mode,
+               float        master_filter_cutoff01,
+               float        master_filter_res01,
+               float        reverb_size01);
+
+bool LoadPrefs(float*      out_bpm,
+               int*        out_bars,
+               float*      out_master_volume01,
+               bool*       out_bypass,
+               FilterMode* out_master_filter_mode,
+               float*      out_master_filter_cutoff01,
+               float*      out_master_filter_res01,
+               float*      out_reverb_size01,
+               bool*       out_metronome_enabled,
+               float*      out_metronome_vol01);
+
 } // namespace PerformanceStore

@@ -57,6 +57,13 @@ class Ui
               LooperLayer*                  layers,
               int                           num_layers);
 
+    // Call once from main(), right after Init() -- applies the user's
+    // saved startup defaults (see PerformanceStore::LoadPrefs()) on top
+    // of Init()'s own hardcoded ones. A no-op if nothing's been saved
+    // yet (no SD card, or the user's never used Global:File's Button2
+    // tap to save one).
+    void ApplyStartupDefaults();
+
     // Call once per main-loop iteration (NOT from the audio callback).
     void Update(const UiControlEvents& events);
 
@@ -200,6 +207,13 @@ class Ui
     // replacing every layer's audio and all settings with the saved
     // performance's.
     void TriggerLoad();
+    // Global:Tempo's Button2 held 800ms: saves the current global
+    // settings (BPM/Bars/Volume/Metro/Filter/Reverb size/Bypass --
+    // deliberately no per-layer settings) as the startup default -- see
+    // ApplyStartupDefaults() and PerformanceStore::SavePrefs(). A hold,
+    // not a tap, since this is a deliberate write, same weight as
+    // Global:File's hold-to-Load/Layer:Status's hold-to-Clear.
+    void TriggerSaveDefaults();
     // Button1 short press on Global:Export: renders one full loop of the
     // current in-memory performance (every layer's real filter/effect/
     // pitch/reverb chain, plus the master filter) to a new WAV/EXPnnn.WAV

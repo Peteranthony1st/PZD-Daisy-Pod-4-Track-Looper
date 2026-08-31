@@ -138,6 +138,40 @@ void Ui::Init(daisy::DaisyPod*              pod,
     SyncPickupTargets(KnobContext::Home);
 }
 
+void Ui::ApplyStartupDefaults()
+{
+    float      bpm, master_vol01, cutoff01, res01, reverb_sz01, metro_vol01;
+    int        bars;
+    bool       byp, metro_on;
+    FilterMode mode;
+    if(!PerformanceStore::LoadPrefs(&bpm, &bars, &master_vol01, &byp, &mode, &cutoff01,
+                                      &res01, &reverb_sz01, &metro_on, &metro_vol01))
+        return; // nothing saved yet -- Init()'s hardcoded defaults already stand
+
+    // SetBpm()/SetBars() are no-ops while locked, but nothing can be
+    // locked this early (no layer has recorded anything yet).
+    tempo_->SetBpm(bpm);
+    tempo_->SetBars(bars);
+    tempo_->SetMetronomeEnabled(metro_on);
+    tempo_->SetMetronomeVolume01(metro_vol01);
+
+    master_volume01_ = master_vol01;
+    master_volume_   = powf(Clampf(master_volume01_, 0.f, 1.f), 2.5f) * 1.43f;
+    if(master_volume_ < 0.f)
+        master_volume_ = 0.f;
+
+    bypass_                  = byp;
+    master_filter_mode_      = mode;
+    master_filter_cutoff01_  = cutoff01;
+    master_filter_res01_     = res01;
+    reverb_size01_           = reverb_sz01;
+
+    // Init() already called this once with the pre-defaults values (see
+    // its own comment above) -- re-seed now that the real starting
+    // values are in place, same reasoning, same fix.
+    SyncPickupTargets(KnobContext::Home);
+}
+
 void Ui::Update(const UiControlEvents& events)
 {
     HandleEncoder(events);
@@ -274,6 +308,21 @@ void Ui::HandleButton2(const UiControlEvents& events)
         {
             button2_long_fired_ = true;
             TriggerLoad();
+        }
+        if(events.btn2_released)
+            button2_long_fired_ = false;
+    }
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::Tempo)
+    {
+        // Button2 does nothing else on this page -- save the current
+        // global settings as the startup default (see
+        // TriggerSaveDefaults()/PerformanceStore::SavePrefs()). A hold,
+        // not a tap, since this is a deliberate write, same weight as
+        // File's hold-to-Load/Status's hold-to-Clear.
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_)
+        {
+            button2_long_fired_ = true;
+            TriggerSaveDefaults();
         }
         if(events.btn2_released)
             button2_long_fired_ = false;
@@ -1102,12 +1151,42 @@ void Ui::DrawGlobalScreen()
     char line1[32], line2[32];
     if(global_page_ == GlobalPage::Tempo)
     {
-        snprintf(line1, sizeof(line1), "BPM: %d %s", (int)(tempo_->GetBpm() + 0.5f),
-                  tempo_->IsLocked() ? "(locked)" : "");
+        // Held Button2 takes over this space with a hold-to-confirm
+        // progress bar, same pattern as Global:File's Hold=New/Load --
+        // see TriggerSaveDefaults()'s comment for why this is a hold,
+        // not a tap.
+        if(pod_->button2.Pressed())
+        {
+            float held = pod_->button2.TimeHeldMs();
+            int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+            disp_->SetCursor(0, 20);
+            disp_->WriteString("Hold: Default...", Font_6x8, true);
+            disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
+            if(w > 0)
+                disp_->DrawRect(1, 31, w, 33, true, true);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            return;
+        }
+
+        // Bars right-aligned on the same row as BPM -- it was previously
+        // the only thing on this page not shown in the "big" Font_6x8
+        // text, only as a small footer readout. "(locked)" dropped from
+        // here since the "Clear layers first" line below already says
+        // the same thing when it's relevant, and dropping it keeps this
+        // row's left side free of a variable-length suffix that would
+        // otherwise sometimes collide with the right-aligned Bars text.
+        snprintf(line1, sizeof(line1), "BPM: %d", (int)(tempo_->GetBpm() + 0.5f));
+        char bars_line[12];
+        snprintf(bars_line, sizeof(bars_line), "Bars: %d", tempo_->GetBars());
         snprintf(line2, sizeof(line2), "Metro: %s",
                   tempo_->IsMetronomeEnabled() ? "On" : "Off");
         disp_->SetCursor(0, 12);
         disp_->WriteString(line1, Font_6x8, true);
+        // Font_6x8 is fixed-width (6px/char), so right-aligning is a
+        // plain strlen() * 6 -- same trick DrawExportScreen() uses.
+        disp_->SetCursor(disp_->Width() - 6 * (int)strlen(bars_line), 12);
+        disp_->WriteString(bars_line, Font_6x8, true);
         disp_->SetCursor(0, 24);
         disp_->WriteString(line2, Font_6x8, true);
         if(tempo_->IsLocked())
@@ -1120,7 +1199,8 @@ void Ui::DrawGlobalScreen()
         snprintf(bpm_val, sizeof(bpm_val), "%d", (int)(tempo_->GetBpm() + 0.5f));
         snprintf(bars_val, sizeof(bars_val), "%d", tempo_->GetBars());
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "BPM", bpm_val, bars_val, "Bars");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Metro on/off", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Metro on/off", "", "",
+                         "Hold=Default");
     }
     else if(global_page_ == GlobalPage::Filter) // master-bus filter, applied
          // once to the full mix in main.cpp, not per-layer like the Layer
@@ -1221,16 +1301,18 @@ void Ui::DrawFileScreen()
     // -- show the slot number it's currently on, same index shown in the
     // "Load: N - Performance" line above. Empty when there's nothing to
     // browse (no saves yet), same "nothing if it does nothing" rule as an
-    // idle knob elsewhere. "Hold=New" isn't mentioned in the button row,
-    // same convention as the Status page's footer omitting its own
-    // button1 long-press meaning -- the "Hold: New..." progress bar
-    // (shown once you actually hold it) is the discoverability path for
-    // that one.
+    // idle knob elsewhere. Button1's label spells out its hold behaviour
+    // explicitly; Button2's doesn't repeat "Load" as a tap meaning since
+    // it doesn't have one here (see Global:Tempo's Button2 for where
+    // that idle-tap slot went instead) -- the "Hold: New.../Hold:
+    // Load..." progress-bar overlay (shown once you actually hold either
+    // one) is still the fallback discovery path either way.
     char load_val[8] = "";
     if(file_slot_count_ > 0)
         snprintf(load_val, sizeof(load_val), "%d", file_slots_[file_cursor_]);
     DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Load", load_val, "", "");
-    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save", "", "", "Hold=Load");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save/Hold=New", "", "",
+                     "Hold=Load");
 }
 
 void Ui::DrawExportScreen()
@@ -1351,6 +1433,17 @@ void Ui::TriggerLoad()
     {
         snprintf(file_status_, sizeof(file_status_), "Fail:%s", PerformanceStore::GetLastError());
     }
+}
+
+void Ui::TriggerSaveDefaults()
+{
+    bool ok = PerformanceStore::SavePrefs(*tempo_, master_volume01_, bypass_,
+                                            master_filter_mode_, master_filter_cutoff01_,
+                                            master_filter_res01_, reverb_size01_);
+    if(ok)
+        snprintf(file_status_, sizeof(file_status_), "Saved as default");
+    else
+        snprintf(file_status_, sizeof(file_status_), "Fail:%s", PerformanceStore::GetLastError());
 }
 
 void Ui::TriggerExport()

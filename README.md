@@ -73,6 +73,9 @@ The name, general concept, and file organization are based on
 - Reverb size/decay — one shared room for every layer's reverb send
 - Bypass: hear your live input mixed into the output before you've even
   recorded anything
+- Startup defaults — save your usual BPM/Bars/Volume/Metro/Filter/Reverb
+  size/Bypass as what the pedal boots into, so powering on lands exactly
+  where you like it instead of the factory defaults
 
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
@@ -118,6 +121,14 @@ https://github.com/user-attachments/assets/1c081390-e61f-4a1b-9088-a552860b9a5d
 (off = empty, amber = counting in, red = recording, orange = overdubbing,
 green = playing, blue = paused). LED2 is a steady Bypass on/off indicator.
 
+**Startup defaults** — dial in the Tempo/Volume/Metro/Filter/Reverb size/
+Bypass you always want to start with, then hold Button 2 on Global:Tempo
+for 800ms to remember it. From then on, powering the pedal on applies
+that saved state automatically — nothing saved yet just boots with the
+firmware's own defaults. This only covers global settings, never
+per-layer ones, and it's separate from "New" on Global:File, which keeps
+every current setting exactly as-is and only clears recorded audio.
+
 **Control reference**
 
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
@@ -130,7 +141,7 @@ green = playing, blue = paused). LED2 is a steady Bypass on/off indicator.
 | Layer: Pitch | Amount | Fun (modulation) | Toggle Pitch on/off | Cycle delay preset |
 | Layer: Reverb | Send | — | — | — |
 | Layer: Gain | Input gain | — | — | — |
-| Global: Tempo | BPM | Bars | Toggle metronome | — |
+| Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size | — | — | — |
 | Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |

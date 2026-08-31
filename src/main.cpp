@@ -273,6 +273,7 @@ int main(void)
     PerformanceStore::Init(); // mounts the SD card if one is present
 
     ui.Init(&hw, &display, &tempo, layers, kNumLayers);
+    ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();
     hw.StartAudio(AudioCallback);

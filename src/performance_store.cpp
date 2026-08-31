@@ -53,6 +53,10 @@ void SlotFilename(int slot, char* out, size_t out_size)
     snprintf(out, out_size, "PERF%03d.DAT", slot);
 }
 
+// Bare filename in the SD root, same convention as PERFxxx.DAT -- see
+// SavePrefs()/LoadPrefs().
+constexpr const char* kPrefsFilename = "PREFS.DAT";
+
 inline float Clampf(float v, float lo, float hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
@@ -796,6 +800,99 @@ bool ExportWav(TempoClock&  tempo,
         SetError("close", close_res);
 
     return ok && close_res == FR_OK;
+}
+
+bool SavePrefs(TempoClock&  tempo,
+              float        master_volume01,
+              bool         bypass,
+              FilterMode   master_filter_mode,
+              float        master_filter_cutoff01,
+              float        master_filter_res01,
+              float        reverb_size01)
+{
+    if(!card_ready)
+        return false;
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment in Save() above
+    FRESULT    fr = f_open(&file, kPrefsFilename, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    static FileHeader hdr;
+    hdr = FileHeader{};
+    memcpy(hdr.magic, "PREF", 4); // distinct from "OURO" -- never cross-loadable with Load()
+    hdr.version                = kFileVersion;
+    hdr.num_layers              = 0; // no layers/audio follow -- header only
+    hdr.bpm                     = tempo.GetBpm();
+    hdr.bars                    = tempo.GetBars();
+    hdr.metronome_enabled       = tempo.IsMetronomeEnabled() ? 1 : 0;
+    hdr.bypass                  = bypass ? 1 : 0;
+    hdr.metronome_vol01         = tempo.GetMetronomeVolume01();
+    hdr.master_volume01         = master_volume01;
+    hdr.master_filter_mode      = (int32_t)master_filter_mode;
+    hdr.master_filter_cutoff01  = master_filter_cutoff01;
+    hdr.master_filter_res01     = master_filter_res01;
+    hdr.reverb_size01           = reverb_size01;
+
+    UINT bw;
+    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
+    bool ok = fr == FR_OK && bw == sizeof(hdr);
+    if(!ok)
+        SetError("hdr", fr);
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK && ok)
+        SetError("close", close_res);
+
+    return ok && close_res == FR_OK;
+}
+
+bool LoadPrefs(float*      out_bpm,
+              int*        out_bars,
+              float*      out_master_volume01,
+              bool*       out_bypass,
+              FilterMode* out_master_filter_mode,
+              float*      out_master_filter_cutoff01,
+              float*      out_master_filter_res01,
+              float*      out_reverb_size01,
+              bool*       out_metronome_enabled,
+              float*      out_metronome_vol01)
+{
+    // No card, no file, or wrong shape -- all silently "nothing saved
+    // yet", not an error (see the header comment: the caller's own
+    // hardcoded defaults should just stand in every one of these cases).
+    if(!card_ready)
+        return false;
+
+    static FIL file; // see the DTCMRAM/DMA comment in Save() above
+    FRESULT    fr = f_open(&file, kPrefsFilename, FA_READ);
+    if(fr != FR_OK)
+        return false;
+
+    static FileHeader hdr;
+    hdr = FileHeader{};
+    UINT br;
+    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
+    bool ok = fr == FR_OK && br == sizeof(hdr);
+    f_close(&file);
+    if(!ok || memcmp(hdr.magic, "PREF", 4) != 0 || hdr.version != kFileVersion)
+        return false;
+
+    *out_bpm                    = hdr.bpm;
+    *out_bars                   = hdr.bars;
+    *out_master_volume01        = hdr.master_volume01;
+    *out_bypass                 = hdr.bypass != 0;
+    *out_master_filter_mode     = (FilterMode)hdr.master_filter_mode;
+    *out_master_filter_cutoff01 = hdr.master_filter_cutoff01;
+    *out_master_filter_res01    = hdr.master_filter_res01;
+    *out_reverb_size01          = hdr.reverb_size01;
+    *out_metronome_enabled      = hdr.metronome_enabled != 0;
+    *out_metronome_vol01        = hdr.metronome_vol01;
+    return true;
 }
 
 const char* GetLastError()

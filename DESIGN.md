@@ -97,7 +97,7 @@ Full control map:
 | Layer: Pitch | Amount (-12..+12 semitones, unison at center) | Fun (internal modulation amount) | Toggle Pitch on/off | Cycle delay-line preset (Fast/Med/Smooth — see below) |
 | Layer: Reverb | Send (into the shared reverb bus, see below) | — | — | — |
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
-| Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | — |
+| Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size/decay (shared bus, see below) | — | — | — |
 | Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
@@ -263,6 +263,36 @@ whenever a field is added — a save from an older firmware version is
 rejected cleanly on load (shown as a short error on the File page)
 rather than being misread, so a firmware update can mean older saves
 need re-saving under the new version.
+
+"New" (`Ui::TriggerNew()`, Button1 held 400ms on Global:File) only wipes
+each layer's recorded *audio* (`LooperLayer::Clear()`) — every global
+and per-layer setting is left exactly as it was. It's deliberately not
+the same as applying the startup default (see below); those are two
+different, independent actions.
+
+## Startup defaults
+
+Global:Tempo's Button2, held 800ms (`Ui::TriggerSaveDefaults()`), saves
+the current *global* settings only — BPM, Bars, Master Volume, Metronome
+on/off + volume, Master Filter mode/cutoff/resonance, Reverb Size, and
+Bypass — as a single small `PREFS.DAT` in the SD root. Deliberately no
+per-layer settings (volume/pan/filter/effect/pitch/reverb send) — those
+stay whatever they were, same as every other per-layer control.
+
+`PREFS.DAT` reuses `PerformanceStore`'s existing `FileHeader` struct
+as-is (same fields a full performance save already has, just written
+without any layers/audio following it) rather than a second parallel
+format, distinguished only by its own magic (`"PREF"` vs `"OURO"`) so it
+can never be cross-loaded with a real performance save by mistake.
+
+Applied once, automatically, at boot (`Ui::ApplyStartupDefaults()`,
+called from `main()` right after `Ui::Init()`) — if no `PREFS.DAT`
+exists yet (fresh SD card, or nothing's been saved), this silently
+no-ops and the firmware's own hardcoded defaults stand; not an error
+worth surfacing anywhere. It's *not* applied when starting a New
+performance from Global:File — "New" there keeps every current setting
+exactly as-is (see Save/load below), the startup default only ever
+matters at power-on.
 
 ## WAV export
 
