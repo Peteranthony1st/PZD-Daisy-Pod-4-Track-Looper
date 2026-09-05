@@ -224,18 +224,14 @@ struct LayerHeader
     float    effect_param_a01;
     float    effect_param_b01;
     float    reverb_send01; // Size is now a global FileHeader field, not per-layer
-    uint8_t  pitch_enabled;
-    float    pitch_amount01;
-    float    pitch_fun01;
-    int32_t  pitch_delay_preset;
 };
 
-// Bumped 1 -> 2 -> 3 -> 4 -> 5 as FileHeader/LayerHeader's layout
-// changed (most recently: added bypass_reverb_send01) -- Load() already
-// rejects a version mismatch cleanly (see below), so a performance
-// saved under an older version will correctly fail to load rather than
-// being misread.
-constexpr uint32_t kFileVersion = 5;
+// Bumped 1 -> 2 -> 3 -> 4 -> 5 -> 6 as FileHeader/LayerHeader's layout
+// changed (most recently: removed the Pitch feature's fields) -- Load()
+// already rejects a version mismatch cleanly (see below), so a
+// performance saved under an older version will correctly fail to load
+// rather than being misread.
+constexpr uint32_t kFileVersion = 6;
 
 } // namespace
 
@@ -404,10 +400,6 @@ bool Save(int                slot,
         lh.effect_param_a01   = layer.GetEffectParamA01();
         lh.effect_param_b01   = layer.GetEffectParamB01();
         lh.reverb_send01      = layer.GetReverbSend01();
-        lh.pitch_enabled      = layer.GetPitchEnabled() ? 1 : 0;
-        lh.pitch_amount01     = layer.GetPitchAmount01();
-        lh.pitch_fun01        = layer.GetPitchFun01();
-        lh.pitch_delay_preset = (int32_t)layer.GetPitchDelayPreset();
 
         fr = f_write(&file, &lh, sizeof(lh), &bw);
         ok = fr == FR_OK && bw == sizeof(lh);
@@ -565,10 +557,6 @@ bool Load(int          slot,
         layer.SetEffectParamA01(lh.effect_param_a01);
         layer.SetEffectParamB01(lh.effect_param_b01);
         layer.SetReverbSend01(lh.reverb_send01);
-        layer.SetPitchAmount01(lh.pitch_amount01);
-        layer.SetPitchFun01(lh.pitch_fun01);
-        layer.SetPitchDelayPreset((int)lh.pitch_delay_preset);
-        layer.SetPitchEnabled(lh.pitch_enabled != 0);
 
         size_t len = lh.record_len;
         if(len > layer.GetBufferSize())
@@ -756,7 +744,7 @@ bool ExportWav(TempoClock&  tempo,
     // this project's stack lives in DTCMRAM (128K total), nowhere near
     // enough room. Primed by pass 0 below same as the master filter.
     // Zeroed before every Init() call, same reasoning as main.cpp's
-    // fx_reverb_shared and LooperLayer::Init()'s fx_phaser/fx_pitchshift:
+    // fx_reverb_shared and LooperLayer::Init()'s fx_phaser:
     // .sdram_bss isn't zero-initialized by startup code, so this object's
     // memory is raw leftover contents the first time this runs, and
     // (being `static`) whatever a previous export call left behind on

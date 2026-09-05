@@ -48,19 +48,6 @@ const char* FilterModeName(FilterMode m)
     }
 }
 
-// See LooperLayer::SetPitchDelayPreset() -- Fast/Med/Smooth trade sync
-// latency against pitch-shift smoothness.
-const char* PitchDelayPresetName(int preset)
-{
-    switch(preset)
-    {
-        case 0: return "Fast";
-        case 1: return "Med";
-        case 2: return "Smooth";
-        default: return "?";
-    }
-}
-
 const char* EffectName(LayerEffect e)
 {
     switch(e)
@@ -401,9 +388,6 @@ void Ui::OnButton1Short()
                     k2_pickup_raw_[(size_t)KnobContext::LayerEffect]     = 0.f;
                     break;
                 }
-                case LayerPage::Pitch:
-                    Cur().SetPitchEnabled(!Cur().GetPitchEnabled());
-                    break;
                 default: break;
             }
             break;
@@ -470,12 +454,6 @@ void Ui::OnButton2Short()
 {
     if(screen_ == Screen::Home)
         bypass_ = !bypass_;
-    else if(screen_ == Screen::Layer && layer_page_ == LayerPage::Pitch)
-    {
-        int n = LooperLayer::kNumPitchDelayPresets;
-        int p = (Cur().GetPitchDelayPreset() + 1) % n;
-        Cur().SetPitchDelayPreset(p);
-    }
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
     {
         SetProjectSpeed01(0.5f); // tap = reset to 1.0x, mirrors Layer:Speed's Button1 tap
@@ -504,7 +482,6 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case LayerPage::Effect: return KnobContext::LayerEffect;
                 case LayerPage::Reverb: return KnobContext::LayerReverb;
                 case LayerPage::Gain: return KnobContext::LayerGain;
-                case LayerPage::Pitch: return KnobContext::LayerPitch;
                 default: return KnobContext::LayerStatus;
             }
         case Screen::Global:
@@ -554,10 +531,6 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             break;
         case KnobContext::LayerGain:
             k1_pickup_raw_[i] = Cur().GetInputGain01();
-            break;
-        case KnobContext::LayerPitch:
-            k1_pickup_raw_[i] = Cur().GetPitchAmount01();
-            k2_pickup_raw_[i] = Cur().GetPitchFun01();
             break;
         case KnobContext::GlobalTempo:
             // No raw01 storage for BPM/Bars (SetBpm/SetBars take the
@@ -722,12 +695,6 @@ void Ui::ApplyKnobs()
                 case LayerPage::Gain:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         Cur().SetInputGain01(k1);
-                    break;
-                case LayerPage::Pitch:
-                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
-                        Cur().SetPitchAmount01(k1);
-                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        Cur().SetPitchFun01(k2);
                     break;
                 default: break;
             }
@@ -1041,7 +1008,6 @@ void Ui::DrawLayerScreen()
         case LayerPage::Effect: page_name = "Effect"; break;
         case LayerPage::Reverb: page_name = "Reverb"; break;
         case LayerPage::Gain: page_name = "Gain"; break;
-        case LayerPage::Pitch: page_name = "Pitch"; break;
         default: break;
     }
     // Compact "N:Page" (not "Layer N - Page") specifically to leave room
@@ -1213,37 +1179,6 @@ void Ui::DrawLayerScreen()
             snprintf(gain_val, sizeof(gain_val), "%d.%dx", gain_x10 / 10, gain_x10 % 10);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Gain", gain_val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
-            break;
-        }
-        case LayerPage::Pitch:
-        {
-            // Independent of the character effect (see LooperLayer::
-            // SetPitchEnabled()'s comment) -- real Off/On toggle via
-            // button1, same idea as FilterMode::Off, so knob position
-            // never implies "off" the way it would for a bipolar
-            // -12..+12 range with no separate toggle.
-            snprintf(line1, sizeof(line1), "Pitch: %s", Cur().GetPitchEnabled() ? "On" : "Off");
-            disp_->SetCursor(0, 20);
-            WriteUpper(line1);
-
-            float semi_f = Cur().GetPitchAmount01() * 24.f - 12.f;
-            int   semis  = (int)(semi_f >= 0.f ? semi_f + 0.5f : semi_f - 0.5f);
-            char  amount_val[8], fun_val[8];
-            snprintf(amount_val, sizeof(amount_val), "%+dst", semis);
-            snprintf(fun_val, sizeof(fun_val), "%d%%", (int)(Cur().GetPitchFun01() * 100.f + 0.5f));
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amount", amount_val, fun_val, "Fun");
-
-            // Left label reflects what a tap does next, same convention
-            // as every other dynamic button label in this file. Right
-            // side shows the current delay preset (button2 cycles it,
-            // see OnButton2Short()) -- same "action:state" shape as
-            // Home's Bypass:On/Off label.
-            const char* toggle_label = Cur().GetPitchEnabled() ? "Pitch Off" : "Pitch On";
-            char        delay_label[16];
-            snprintf(delay_label, sizeof(delay_label), "Delay:%s",
-                      PitchDelayPresetName(Cur().GetPitchDelayPreset()));
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, toggle_label, "", "",
-                             delay_label);
             break;
         }
         default: break;

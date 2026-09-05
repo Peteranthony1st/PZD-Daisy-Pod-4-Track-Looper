@@ -7,17 +7,18 @@
 #include "ui.h"
 #include "performance_store.h"
 #include "audio_engine.h"
+#include "itcm.h"
 
 using namespace daisy;
 
 // Same sizing as the original Ouroboros firmware: ~33 seconds per layer
 // at 48kHz, stereo. 4 layers (dropped from the original 5) to keep the
-// per-layer SDRAM budget (Phaser + PitchShifter per layer, plus one
-// shared ReverbSc bus -- see fx_reverb_shared below) comfortable. Most
-// per-layer effect objects are a few hundred bytes and live in ordinary
-// SRAM via the LooperLayer array below -- Phaser, PitchShifter, and
-// ReverbSc are the exceptions (~75KB/~128KB/~386KB per instance), and
-// are placed in SDRAM alongside these loop buffers.
+// per-layer SDRAM budget (Phaser per layer, plus one shared ReverbSc bus
+// -- see fx_reverb_shared below) comfortable. Most per-layer effect
+// objects are a few hundred bytes and live in ordinary SRAM via the
+// LooperLayer array below -- Phaser and ReverbSc are the exceptions
+// (~75KB/~386KB per instance), and are placed in SDRAM alongside these
+// loop buffers.
 #define kBuffSize 1600000
 #define kNumLayers 4
 
@@ -33,13 +34,11 @@ TempoClock  tempo;
 LooperLayer layers[kNumLayers];
 Ui          ui;
 
-// One Phaser + one PitchShifter per layer, in SDRAM because neither is
-// small enough to live directly as a LooperLayer member in ordinary
-// SRAM. Each layer's instances are fully independent (not shared) --
-// LooperLayer::Init() takes pointers to its pair and owns calling
-// Init() on them.
-daisysp::Phaser       DSY_SDRAM_BSS fx_phaser[kNumLayers];
-daisysp::PitchShifter DSY_SDRAM_BSS fx_pitchshift[kNumLayers];
+// One Phaser per layer, in SDRAM because it's not small enough to live
+// directly as a LooperLayer member in ordinary SRAM. Each layer's
+// instance is fully independent (not shared) -- LooperLayer::Init()
+// takes a pointer to it and owns calling Init() on it.
+daisysp::Phaser DSY_SDRAM_BSS fx_phaser[kNumLayers];
 
 // ONE shared reverb bus for every layer, not one per layer -- up to 4
 // simultaneous ReverbSc instances (by far the heaviest thing in this
@@ -50,7 +49,7 @@ daisysp::PitchShifter DSY_SDRAM_BSS fx_pitchshift[kNumLayers];
 // reverb_send_out parameter) and run through this single instance once
 // per sample in AudioCallback() -- see fx_reverb_size01 below for how
 // its shared Size control works. In SDRAM for the same reason as
-// fx_phaser/fx_pitchshift above.
+// fx_phaser above.
 daisysp::ReverbSc DSY_SDRAM_BSS fx_reverb_shared;
 
 // Master-bus filter -- applied once to the final mix (layers + their
@@ -91,6 +90,7 @@ void ControlTimerCallback(void*)
         g_btn2_releases++;
 }
 
+DSY_ITCM_TEXT
 void AudioCallback(AudioHandle::InputBuffer  in,
                    AudioHandle::OutputBuffer out,
                    size_t                    size)
@@ -246,8 +246,28 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     }
 }
 
+// Linker-provided symbols from STM32H750IB_qspi_custom.lds -- .itcm_text
+// has a load address (LMA) in QSPIFLASH and a run address (VMA) in
+// ITCMRAM, same relationship .data already has between QSPIFLASH and
+// SRAM. The stock startup code's own copy-down loop only knows about
+// .data's symbols, not this new section, so nothing copies these bytes
+// into ITCM without this -- ITCM has no power-on contents of its own
+// (same "not zero/not anything in particular at boot" issue this
+// project already hit with .sdram_bss, except this is executable code,
+// not data, so the CPU would execute whatever garbage was already
+// sitting there instead of just misbehaving numerically).
+extern uint8_t _sitcm_text[];
+extern uint8_t _eitcm_text[];
+extern uint8_t _siitcm_text[];
+
 int main(void)
 {
+    // Must run before anything DSY_ITCM_TEXT-tagged is ever called --
+    // in practice that's hw.StartAudio(AudioCallback) further down, but
+    // this sits right at the top of main() for the widest possible
+    // safety margin.
+    memcpy(_sitcm_text, _siitcm_text, (size_t)(_eitcm_text - _sitcm_text));
+
     hw.Init();
     hw.SetAudioBlockSize(48);
 
@@ -255,13 +275,13 @@ int main(void)
 
     for(int i = 0; i < kNumLayers; i++)
         layers[i].Init(buffer_l[i], buffer_r[i], kBuffSize, hw.AudioSampleRate(),
-                       &fx_phaser[i], &fx_pitchshift[i]);
+                       &fx_phaser[i]);
 
     fx_master_filter_l.Init(hw.AudioSampleRate());
     fx_master_filter_r.Init(hw.AudioSampleRate());
 
     // Zeroed before Init() for the same reason LooperLayer::Init() now
-    // zeros fx_phaser/fx_pitchshift: this project's .sdram_bss objects
+    // zeros fx_phaser: this project's .sdram_bss objects
     // start out holding raw leftover SDRAM contents, not zero (libDaisy's
     // own sdram.h says as much, and the linker script/startup code
     // confirm it -- only ordinary .bss gets zero-filled at boot).

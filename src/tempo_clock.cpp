@@ -1,4 +1,5 @@
 #include "tempo_clock.h"
+#include "itcm.h"
 #include <cmath>
 
 namespace
@@ -129,6 +130,7 @@ void TempoClock::SetPhaseToPosition(float pos_samples)
     click_audible_                  = false;
 }
 
+DSY_ITCM_TEXT
 TempoClock::TempoTick TempoClock::Process(float speed)
 {
     TempoTick tick{false, false, false, false, false};
@@ -184,6 +186,7 @@ TempoClock::TempoTick TempoClock::Process(float speed)
     return tick;
 }
 
+DSY_ITCM_TEXT
 float TempoClock::RenderClick(const TempoTick& tick)
 {
     if(tick.beat || tick.count_in_beat)

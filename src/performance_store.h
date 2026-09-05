@@ -81,7 +81,7 @@ bool Load(int          slot,
           ProgressFn   on_progress = nullptr);
 
 // Renders the current in-memory performance (one full shared loop length,
-// every layer's real filter/character-effect/pitch/reverb chain applied,
+// every layer's real filter/character-effect/reverb chain applied,
 // same as live playback) to a new stereo 16-bit PCM WAV file. Two
 // independent output modes, selected by for_microdexed:
 //   false: full-quality native 48000 Hz, under "WAV/" -- general

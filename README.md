@@ -7,7 +7,7 @@ Video and looper generated WAV file below!
 A 4-layer stereo loop station firmware for the [Electrosmith Daisy
 Pod](https://daisy.audio/products/pod), with an I2C OLED
 display added for a full on-device menu — live level/waveform display,
-per-layer filter/effects/reverb/pitch, tempo-locked count-in, and SD card
+per-layer filter/effects/reverb, tempo-locked count-in, and SD card
 save/load, all controlled from the Pod's two knobs, two buttons, and
 encoder.
 
@@ -63,9 +63,6 @@ The name, general concept, and file organization are based on
   resonance
 - One character effect at a time: Drive, Bitcrush, Chorus, Tremolo,
   Phaser, AutoWah, or Flanger
-- Independent Pitch shift (±12 semitones) that can run *alongside* the
-  character effect, with 3 selectable delay presets trading sync latency
-  against pitch-shift smoothness (Fast/Med/Smooth)
 - Reverb send (each layer sends into one shared reverb — see Size below)
 - Input gain (1x–4x) for quiet sources
 
@@ -95,7 +92,7 @@ The name, general concept, and file organization are based on
 - Save and load full performances (all 4 layers' audio plus every
   setting) to an SD card, up to 99 slots
 - Export the current performance as a standard stereo WAV file — one full
-  loop, every layer's live filter/effect/pitch/reverb chain and the
+  loop, every layer's live filter/effect/reverb chain and the
   master filter applied, peak-normalized so it doesn't come out quiet.
   Two output options: full-quality native 48kHz for general use, or a
   44.1kHz-resampled copy saved straight into a `custom/` folder so the
@@ -176,7 +173,6 @@ hit Export gets baked into the file on purpose.
 | Layer: Speed | Speed | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect | — |
-| Layer: Pitch | Amount | Fun (modulation) | Toggle Pitch on/off | Cycle delay preset |
 | Layer: Reverb | Send | — | — | — |
 | Layer: Gain | Input gain | — | — | — |
 | Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
@@ -188,19 +184,49 @@ hit Export gets baked into the file on purpose.
 
 ## Building and flashing
 
+As of v1.6.0 this firmware boots via a small separate bootloader and runs
+from the Pod's external QSPI flash chip instead of internal flash, which
+was nearly full — see [DESIGN.md](DESIGN.md) for why. This changes how
+flashing works, and means a **one-time setup step** on any Pod that
+hasn't run this bootloader before.
+
+**One-time setup** (skip this if your Pod already has the bootloader —
+e.g. you've flashed v1.6.0 or later before):
+
+1. Put the Pod into DFU mode (hold the `BOOT` button, tap `RESET`, release
+   `BOOT`).
+2. Flash the bootloader itself — either:
+   - `dsy_bootloader_v6_4-intdfu-2000ms.bin`, attached to this project's
+     [Releases](../../releases), via
+     [Electrosmith's web programmer](https://flash.daisy.audio/) (no
+     toolchain needed), or
+   - from source: `cd src && make program-boot`
+
+From then on, the Pod boots straight into whatever app is on QSPI —
+normal power-on, no button-holding, just a slightly longer boot.
+
+**Flashing the looper firmware itself** (every time, including that very
+first time right after the bootloader install above):
+
+- **Easiest — SD card**: copy `main.bin` (from
+  [Releases](../../releases), or your own `src/build/main.bin`) onto the
+  root of a FAT32 SD card, insert it into the Pod, and power-cycle. The
+  bootloader notices any `.bin` file on the card and flashes it
+  automatically — no DFU window to catch, works every time.
+- **Alternative — DFU**: put the Pod into DFU mode the same way as above,
+  then either `make program-dfu` from `src/`, or drop `main.bin` onto
+  [Electrosmith's web programmer](https://flash.daisy.audio/). The
+  bootloader's own DFU window is brief (~2 seconds) once it boots, so the
+  SD card method above is generally more forgiving.
+
+**Building from source**:
+
 ```
 git clone --recurse-submodules <this repo's URL>
 cd src && make
 ```
 
-Then flash `build/main.bin` to a Pod in DFU/bootloader mode, either with
-`make program-dfu` or via Electrosmith's browser-based
-[Daisy Programmer](https://flash.daisy.audio/) — no toolchain needed for
-that route, just the `.bin` file.
-
-Prebuilt binaries are also available under
-[Releases](releases) for anyone who just wants to flash it without
-building from source.
+`build/main.bin` is what you flash via either method above.
 
 ## Thanks
 
@@ -209,7 +235,7 @@ building from source.
   design, a DIY 5-track stereo loop station for the Daisy Seed. This
   firmware follows its per-layer loop-buffer struct as a direct
   structural template, then rewrites everything else — no direct
-  hardware coupling in the DSP layer, plus filter/effects/reverb/pitch,
+  hardware coupling in the DSP layer, plus filter/effects/reverb,
   the OLED menu, and SD save/load, none of which exist in the original.
   See [DESIGN.md](DESIGN.md) for the specifics.
 - **[Robey Pointer](http://robey.lag.net/2010/01/23/tiny-monospace-font.html)**,

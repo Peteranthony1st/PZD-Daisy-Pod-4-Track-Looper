@@ -116,7 +116,6 @@ class Ui
         Effect,
         Reverb,
         Gain,
-        Pitch,
         kCount
     };
     enum class GlobalPage
@@ -144,7 +143,6 @@ class Ui
         LayerEffect,
         LayerReverb,
         LayerGain,
-        LayerPitch,
         GlobalTempo,
         GlobalFilter,
         GlobalReverb,
@@ -243,7 +241,7 @@ class Ui
     void TriggerSaveDefaults();
     // Button1 short press on Global:Export: renders one full loop of the
     // current in-memory performance (every layer's real filter/effect/
-    // pitch/reverb chain, plus the master filter) to a new WAV/EXPnnn.wav
+    // reverb chain, plus the master filter) to a new WAV/EXPnnn.wav
     // file at the Pod's native 48kHz. Simple tap, no hold-to-confirm --
     // unlike Save, this never overwrites anything, it only ever creates a
     // new numbered file.

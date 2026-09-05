@@ -10,7 +10,7 @@ structural template — the same field set (`buffer_l`/`buffer_r`/
 `record_len`/`write_idx`/`play_pos`/`speed`/`volume`/`pan`) and the same
 linear-interpolated playback loop — but removes its direct hardware
 coupling (this DSP layer takes no `Switch*`/ADC pointers at all) and adds
-everything else from scratch: per-layer filter/effect/reverb/pitch,
+everything else from scratch: per-layer filter/effect/reverb,
 tempo-locked count-in, a live waveform display, the whole OLED menu/UI
 layer, and SD card save/load, none of which exist in the original.
 
@@ -65,7 +65,7 @@ One consistent grammar everywhere:
 
 ```
 Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
-  │                                             Effect / Pitch / Reverb / Gain
+  │                                             Effect / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
   └──(long-press)──► Global ──(rotate)──► Tempo / Filter / Reverb / File /
                                              Export
@@ -94,7 +94,6 @@ Full control map:
 | Layer: Speed | Speed (0.3x-2x, deadzone-centered on 1.0x) | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
-| Layer: Pitch | Amount (-12..+12 semitones, unison at center) | Fun (internal modulation amount) | Toggle Pitch on/off | Cycle delay-line preset (Fast/Med/Smooth — see below) |
 | Layer: Reverb | Send (into the shared reverb bus, see below) | — | — | — |
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
@@ -260,11 +259,9 @@ clean material:
 
 ```
 looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
-                  effect -> Pitch shift (independent on/off, can run
-                  alongside the character effect) -> Volume/Pan ->
-                  this layer's Reverb send -> ONE shared reverb bus,
-                  Process()'d once per sample in main.cpp -> mixed to
-                  output bus
+                  effect -> Volume/Pan -> this layer's Reverb send ->
+                  ONE shared reverb bus, Process()'d once per sample in
+                  main.cpp -> mixed to output bus
 ```
 
 - **Filter**: cutoff and resonance are both live, turnable while the
@@ -279,12 +276,6 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   verified against DaisySP's actual source, not assumed) so a newly
   selected effect never starts already dialed in loud — you turn each
   knob up from 0 to bring it in.
-- **Pitch**: independent of the character effect above, not
-  mutually exclusive with it — a real on/off toggle (like `FilterMode::
-  Off`, not a knob position), so it can run alongside a character effect
-  or on its own. DaisySP's `PitchShifter` is a delay-line-based shifter
-  with real, audible processing latency that scales with its internal
-  buffer size — see the delay-preset note below.
 - **Reverb**: ONE shared `ReverbSc` bus (`main.cpp`'s `fx_reverb_shared`),
   not one per layer. Every layer's Send-scaled signal is summed into a
   shared accumulator (`LooperLayer::Process()`'s `reverb_send_out`
@@ -297,10 +288,8 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   layers at once), was enough real-time DSP cost to starve the main loop/
   TIM5 badly enough to cause actual audio glitches and OLED corruption,
   not just UI lag. Consolidating to one instance cut that worst case
-  ~4x; measured with a cycle counter, even the heaviest combination this
-  firmware can produce (all 4 layers with a character effect, one layer
-  with pitch, reverb active) uses under half the audio callback's
-  real-time budget.
+  ~4x. See *Boot process: bootloader + QSPI flash* below for the current,
+  real-hardware-measured worst-case CPU number.
 
 ### Bypass reverb send
 
@@ -321,38 +310,25 @@ monitor-mix reverb tail, never the recording path).
 
 ### SDRAM-placed effects are explicitly zeroed before use
 
-`Phaser`, `PitchShifter` (both per-layer), and `ReverbSc` (the shared bus,
-plus its counterpart in `PerformanceStore::ExportWav()`) all live in
-SDRAM — libDaisy's `sdram.h` documents, and this project's linker script/
-startup code confirm, that `.sdram_bss` is **not** zero-initialized at
-boot, unlike ordinary SRAM `.bss`. `LooperLayer::Init()` and the
-equivalent setup in `main.cpp`/`performance_store.cpp` now `memset()`
-each of these objects to zero before calling their own `Init()`. This
-isn't cosmetic: it was a real, reproducible bug — `PitchShifter::Init()`
-doesn't touch several of its own internal fields, so without this they
-started out holding raw leftover SDRAM contents, and on some boots that
-decoded as NaN/Inf. Since NaN survives a plain min/max clamp unchanged
-(NaN compares false against both bounds) and DaisySP's `ReverbSc` has no
-NaN/Inf guard anywhere in its feedback path, one bad sample from a
-pitch-enabled layer could permanently poison the shared reverb bus's
-internal state — silencing the *entire* mix, not just that layer, until
-a full power cycle. `LooperLayer::Process()` also clamps the pitch
-stage's output to a finite value directly, as a second line of defense
-against this exact failure shape regardless of cause.
-
-### Pitch delay presets
-
-`PitchShifter`'s delay-line size trades sync latency against pitch-shift
-smoothness — a smaller buffer means the pitched signal lags the actual
-loop position less, but raises the internal crossfade rate for the same
-pitch amount, which shows up as more audible warble on bigger shifts.
-Three presets, cycled with Button 2 on the Pitch page:
-
-| Preset | Delay size | Latency @48kHz |
-|---|---|---|
-| Fast (default) | ~2400 samples | ~50ms |
-| Med | ~6000 samples | ~125ms |
-| Smooth | 16384 samples (DaisySP's stock default) | ~341ms |
+`Phaser` (per-layer) and `ReverbSc` (the shared bus, plus its counterpart
+in `PerformanceStore::ExportWav()`) both live in SDRAM — libDaisy's
+`sdram.h` documents, and this project's linker script/startup code
+confirm, that `.sdram_bss` is **not** zero-initialized at boot, unlike
+ordinary SRAM `.bss`. `LooperLayer::Init()` and the equivalent setup in
+`main.cpp`/`performance_store.cpp` `memset()` each of these objects to
+zero before calling their own `Init()`. This isn't cosmetic: it was a
+real, reproducible bug, first found via the (since-removed, see *Pitch
+removal* below) `PitchShifter` effect, whose `Init()` didn't touch
+several of its own internal fields, so without zeroing first they started
+out holding raw leftover SDRAM contents, and on some boots that decoded
+as NaN/Inf. Since NaN survives a plain min/max clamp unchanged (NaN
+compares false against both bounds) and DaisySP's `ReverbSc` has no
+NaN/Inf guard anywhere in its feedback path, one bad sample could
+permanently poison the shared reverb bus's internal state — silencing the
+*entire* mix, not just that layer, until a full power cycle. The zeroing
+is kept as cheap insurance against this exact failure shape for any
+current or future SDRAM-placed effect, not just the one that first
+surfaced it.
 
 ## Save/load
 
@@ -380,7 +356,7 @@ Global:Tempo's Button2, held 800ms (`Ui::TriggerSaveDefaults()`), saves
 the current *global* settings only — BPM, Bars, Master Volume, Metronome
 on/off + volume, Master Filter mode/cutoff/resonance, Reverb Size, and
 Bypass — as a single small `PREFS.DAT` in the SD root. Deliberately no
-per-layer settings (volume/pan/filter/effect/pitch/reverb send) — those
+per-layer settings (volume/pan/filter/effect/reverb send) — those
 stay whatever they were, same as every other per-layer control.
 
 `PREFS.DAT` reuses `PerformanceStore`'s existing `FileHeader` struct
@@ -438,7 +414,7 @@ either button.
   happened to be when Export was triggered — every layer's `play_pos_` is
   snapshotted, forced to 0 for the render, then restored afterward (even
   if the render fails partway through).
-- **The real, live effects chain** — filter, character effect, pitch, and
+- **The real, live effects chain** — filter, character effect, and
   reverb per layer, plus the master filter — not a dry sum. This means
   the export calls each layer's actual `Process()` an extra time from the
   main loop (with `g_audio_suspended` held for the whole operation, same
@@ -515,16 +491,88 @@ A few things that are intentional, not bugs:
 ## Files
 
 - `main.cpp` — hardware init, audio callback, main loop
-- `looper_layer.h/.cpp` — per-layer state machine, filter/effects/pitch/
+- `looper_layer.h/.cpp` — per-layer state machine, filter/effects/
   reverb, waveform cache, audio
 - `tempo_clock.h/.cpp` — BPM/bars/metronome/count-in engine
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering
 - `font_tomthumb.h/.cpp` — the tiny proportional font used in the
   footer rows (see `README.md`'s Thanks section for credit)
-- `performance_store.h/.cpp` — SD card save/load + WAV export
+- `performance_store.h/.cpp` — SD card save/load + WAV export. On-disk
+  format is at `kFileVersion = 6` (bumped from 5 when Pitch's fields were
+  removed — see *Pitch removal* below).
 - `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio
   callback output silence without touching any layer/tempo state, so
   `PerformanceStore::Load()` (which restores layers one at a time,
   streaming each from SD) can't leave layers starting at different
   sample offsets just because the audio ISR kept running mid-restore
-- `Makefile` — source list for the build
+- `itcm.h` — `DSY_ITCM_TEXT`, a project-local macro placing tagged
+  functions in ITCM RAM — see *Boot process* below
+- `STM32H750IB_qspi_custom.lds` — this project's linker script, a copy of
+  libDaisy's own QSPI script plus the `.itcm_text` output section the
+  macro above needs
+- `Makefile` — source list for the build, `APP_TYPE`/`LDSCRIPT` overrides
+  for the bootloader/QSPI build (see below)
+
+## Boot process: bootloader + QSPI flash
+
+Internal FLASH (128KB) was nearly full, with no room for future audio
+features. As of v1.6.0 this firmware instead boots via the separate Daisy
+bootloader and executes directly from the Pod's 8MB external QSPI flash
+chip (`APP_TYPE = BOOT_QSPI` in `src/Makefile`) — genuine execute-in-place,
+not a copy-to-RAM step. The bootloader itself (a prebuilt binary,
+`libDaisy/core/dsy_bootloader_v6_4-intdfu-2000ms.bin`, installed once via
+`make program-boot`) runs first on every power-on, checks briefly for a
+pending update (a `.bin` on the SD card, or a short USB-DFU window), and
+otherwise boots straight into the QSPI-resident app — no button-holding
+for normal use, just a slightly longer boot. See `README.md`'s *Building
+and flashing* for the practical steps, including the SD-card auto-flash
+method (copy `main.bin` to the card's root, power-cycle — sidesteps the
+bootloader's brief ~2 second DFU window entirely).
+
+**Why this needed real measurement, not just flipping the flag**: QSPI
+execute-in-place is more cache-dependent than internal flash (Electrosmith's
+own stated caveat). Measured on real hardware with a DWT cycle counter at
+this firmware's worst-case DSP load (all 4 layers active, a character
+effect on one, shared reverb running), plain `BOOT_QSPI` raised the audio
+callback's worst-case timing from under 50% of budget (the original
+internal-flash build) to 69%. Rather than accept that regression, the
+real-time call graph (`AudioCallback()`, `LooperLayer::Process()`,
+`TempoClock::Process()`/`RenderClick()`, and the DSP `Process()` methods in
+the vendored `DaisySP`/`DaisySP-LGPL` submodules) is hand-placed in
+**ITCM** (a 64KB zero-contention instruction RAM every Daisy linker script
+declares but none use) via the `DSY_ITCM_TEXT` macro (`itcm.h`) and a
+custom `.itcm_text` section in `STM32H750IB_qspi_custom.lds`. This
+recovered most, but not all, of the regression (64% worst-case) — the
+remaining gap traced to `PitchShifter`'s own internal `DelayLine`/`Phasor`
+helper calls, which weren't (and, being template/inline code, couldn't
+cleanly be) pulled into the same ITCM placement.
+
+Since the Pitch feature was removed for unrelated reasons (see below) and
+took its cost with it, worst-case CPU under the current `BOOT_QSPI` +
+ITCM build measures **45%** — better than the original internal-flash
+baseline, with the QSPI chip's ~8MB now available for future features
+(the original motivation for this migration).
+
+**A genuinely new linker-level detail worth knowing if extending this**:
+the custom `.itcm_text` section has a load address (LMA) in QSPI flash but
+a run address (VMA) in ITCM RAM, the same relationship `.data` has between
+QSPI and SRAM — but the stock startup code's copy-down loop only knows
+about `.data`'s symbols, not this new section. `main()` does its own
+`memcpy()` from linker-provided `_sitcm_text`/`_eitcm_text`/`_siitcm_text`
+symbols, as the very first statement, before anything ITCM-tagged can
+possibly run.
+
+## Pitch removal
+
+The per-layer Pitch effect (±12 semitones, DaisySP's `PitchShifter`) was
+removed in v1.6.0. It turned out to be the single most expensive effect in
+the signal chain (see above) for a creative use case vari-speed already
+covers more cheaply and, in most feedback, more usefully — tape-style
+pitch/tempo change across the whole performance rather than a per-layer
+delay-line shift with its own audible latency and warble trade-offs (the
+old Fast/Med/Smooth delay presets existed specifically to manage that
+latency). Removing it recovered real CPU headroom (see above) without
+losing a capability nothing was actively relying on. `kFileVersion` bumped
+5 → 6 for `LayerHeader`'s dropped fields — a save from v1.5.0 or earlier
+fails to load cleanly under v1.6.0+ (shown as a version-mismatch error on
+the File page) rather than being misread.

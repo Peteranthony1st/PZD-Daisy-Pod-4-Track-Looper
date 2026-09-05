@@ -32,7 +32,7 @@ using namespace daisy;
 //    otherwise stack irreversibly take after take).
 //
 //  - Signal chain per layer, applied to the looped-back sample before
-//    it's mixed to the bus: Filter -> character effect -> Pitch ->
+//    it's mixed to the bus: Filter -> character effect ->
 //    volume/pan -> this layer's Send amount (SetReverbSend01()) into
 //    ONE shared reverb bus, owned and Process()'d by main.cpp -- not a
 //    per-layer ReverbSc any more. That used to mean up to 4 independent
@@ -107,23 +107,21 @@ enum class LayerEffect
 struct LooperLayer
 {
     // --- Setup -----------------------------------------------------
-    // fx_phaser/fx_pitchshift are externally-owned (must outlive this
-    // object) and must already be default-constructed but NOT yet
-    // Init()'d -- this call does that. They're pointers rather than
-    // direct members because they're too big to live in a LooperLayer
-    // array in ordinary SRAM: Phaser is ~75KB, PitchShifter ~128KB, so
-    // main.cpp places one of each per layer in SDRAM (like buffer_l/
-    // buffer_r) and hands in the pointer. Every other effect is small
-    // enough to live directly as a member below. Reverb is NOT a
-    // per-layer effect (see SetReverbSend01()'s comment) -- there's a
-    // single shared ReverbSc, owned and Process()'d by main.cpp, that
-    // every layer sends into.
-    void Init(float*             buf_l,
-              float*             buf_r,
-              size_t             buffer_size,
-              float              sample_rate,
-              daisysp::Phaser*       fx_phaser,
-              daisysp::PitchShifter* fx_pitchshift);
+    // fx_phaser is externally-owned (must outlive this object) and must
+    // already be default-constructed but NOT yet Init()'d -- this call
+    // does that. It's a pointer rather than a direct member because it's
+    // too big to live in a LooperLayer array in ordinary SRAM (~75KB),
+    // so main.cpp places one per layer in SDRAM (like buffer_l/buffer_r)
+    // and hands in the pointer. Every other effect is small enough to
+    // live directly as a member below. Reverb is NOT a per-layer effect
+    // (see SetReverbSend01()'s comment) -- there's a single shared
+    // ReverbSc, owned and Process()'d by main.cpp, that every layer
+    // sends into.
+    void Init(float*           buf_l,
+              float*           buf_r,
+              size_t           buffer_size,
+              float            sample_rate,
+              daisysp::Phaser* fx_phaser);
     void Reset(); // hard reset to Empty, clears controls to defaults
 
     // --- Transport (call from the UI layer on button edges) --------
@@ -171,9 +169,8 @@ struct LooperLayer
     float GetFilterResonance01() const { return filter_res01_; }
 
     // Switching effects resets a short fade-in (see Process()) so the
-    // new effect's cold internal state (e.g. PitchShifter's delay line
-    // starting silent) doesn't produce an audible pop/glitch on the
-    // instant of the switch.
+    // new effect's cold internal state doesn't produce an audible
+    // pop/glitch on the instant of the switch.
     void SetEffect(LayerEffect e);
     LayerEffect GetEffect() const { return effect_; }
     void SetEffectParamA01(float v); // meaning depends on `effect_`
@@ -191,31 +188,6 @@ struct LooperLayer
     // setting shared by every layer's send -- see Ui::GetReverbSize01().
     void  SetReverbSend01(float v);
     float GetReverbSend01() const { return reverb_send_; }
-
-    // Pitch shift, independent of (and can run alongside) the character
-    // effect above -- unlike SetEffect()'s mutually-exclusive slot, this
-    // is a real on/off toggle, same idea as FilterMode::Off: while
-    // disabled, the knob values don't matter, playback is untouched.
-    // Amount is 0..1 -> -12..+12 semitones, unison at the knob's center
-    // (0.5) -- see Process() for why 0 can't mean "off" for this one.
-    void  SetPitchEnabled(bool on);
-    bool  GetPitchEnabled() const { return pitch_enabled_; }
-    void  SetPitchAmount01(float v);
-    float GetPitchAmount01() const { return pitch_amount01_; }
-    void  SetPitchFun01(float v);
-    float GetPitchFun01() const { return pitch_fun01_; }
-
-    // DaisySP's PitchShifter is a time-domain shifter built on a delay
-    // line, and its default size (16384 samples, ~341ms at 48kHz) is a
-    // real, audible processing latency -- the pitched signal genuinely
-    // lags the loop position by that much, which reads as "out of sync".
-    // Smaller sizes cut that latency but raise the internal crossfade
-    // rate for the same pitch amount, which shows up as more audible
-    // warble on bigger shifts -- this is a real trade-off, not a free
-    // fix, hence 3 selectable presets rather than just picking one.
-    static constexpr int kNumPitchDelayPresets = 3; // Fast / Med / Smooth
-    void SetPitchDelayPreset(int preset); // clamped to 0..kNumPitchDelayPresets-1
-    int  GetPitchDelayPreset() const { return pitch_delay_preset_; }
 
     // Cheap 0..1 read-back for VU-style meters on the OLED.
     float GetLevel() const { return meter_; }
@@ -329,11 +301,11 @@ struct LooperLayer
     float       effect_fade_    = 1.f; // 0..1, ramps up after SetEffect() to declick
     // One instance per channel for the effects that process L/R
     // independently; Chorus is fed the left channel only and generates
-    // its own stereo spread via GetLeft()/GetRight(). Phaser and
-    // PitchShifter are also mono-in (fed a summed L+R, output to both
-    // channels) -- not for the same reason as Chorus, but because a
-    // stereo pair of either would cost too much SDRAM per layer (see
-    // fx_phaser_/fx_pitchshift_ below and Init()'s comment).
+    // its own stereo spread via GetLeft()/GetRight(). Phaser is also
+    // mono-in (fed a summed L+R, output to both channels) -- not for
+    // the same reason as Chorus, but because a stereo pair would cost
+    // too much SDRAM per layer (see fx_phaser_ below and Init()'s
+    // comment).
     daisysp::Overdrive  fx_drive_[2];
     daisysp::Decimator  fx_bitcrush_[2];
     daisysp::Chorus     fx_chorus_;
@@ -341,15 +313,8 @@ struct LooperLayer
     daisysp::Flanger    fx_flanger_[2];
     daisysp::Autowah    fx_autowah_[2];
     daisysp::Phaser*       fx_phaser_     = nullptr; // externally owned, see Init()
-    daisysp::PitchShifter* fx_pitchshift_ = nullptr; // externally owned, see Init()
 
     float reverb_send_ = 0.f; // 0 = nothing sent to the shared reverb bus
-
-    bool  pitch_enabled_  = false;
-    float pitch_amount01_ = 0.5f; // raw 0..1, save/restore; 0.5 = unison
-    float pitch_fun01_    = 0.f;  // raw 0..1, save/restore
-    float pitch_fade_     = 1.f;  // 0..1, ramps up after enabling to declick
-    int   pitch_delay_preset_ = 0; // 0=Fast (lowest latency), see SetPitchDelayPreset()
 
     float meter_ = 0.f;
     float waveform_peaks_[kWaveformCols] = {};

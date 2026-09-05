@@ -1,4 +1,5 @@
 #include "looper_layer.h"
+#include "itcm.h"
 #include <math.h>
 #include <cstring>
 
@@ -14,12 +15,11 @@ inline float Clampf(float v, float lo, float hi)
 // with main.cpp's master-bus filter.
 } // namespace
 
-void LooperLayer::Init(float*             buf_l,
-                       float*             buf_r,
-                       size_t             buffer_size,
-                       float              sample_rate,
-                       daisysp::Phaser*       fx_phaser,
-                       daisysp::PitchShifter* fx_pitchshift)
+void LooperLayer::Init(float*           buf_l,
+                       float*           buf_r,
+                       size_t           buffer_size,
+                       float            sample_rate,
+                       daisysp::Phaser* fx_phaser)
 {
     buffer_l_    = buf_l;
     buffer_r_    = buf_r;
@@ -39,33 +39,20 @@ void LooperLayer::Init(float*             buf_l,
     }
     fx_chorus_.Init(sample_rate_);
 
-    // fx_phaser/fx_pitchshift live in SDRAM (see the class comment) --
-    // libDaisy's own sdram.h documents that .sdram_bss is NOT zero-
-    // initialized by startup code (confirmed against the actual linker
-    // script/startup .s file: only ordinary .bss gets zero-filled), so
-    // these objects start out holding raw leftover SDRAM contents, not
-    // zero. That's harmless for most fields (Init()/SetX() below
-    // overwrite what they use), but DaisySP's PitchShifter::Init()
-    // itself doesn't touch several internal fields it reads on the very
-    // first Process() call (prev_phs_a_/b_, mod_a_amt_/b_, mod_coeff_,
-    // slewed_mod_, mod_, pitch_shift_) -- garbage there has a real chance
-    // of decoding as NaN/Inf, which is self-sustaining once it appears
-    // and (since every layer sends into ONE shared reverb bus) silently
-    // poisons the entire mix, permanently, until a full power cycle.
-    // Zeroing the whole object first is cheap insurance against this
-    // exact class of bug for any current or future SDRAM-placed effect,
-    // not just this one field set.
+    // fx_phaser lives in SDRAM (see the class comment) -- libDaisy's own
+    // sdram.h documents that .sdram_bss is NOT zero-initialized by
+    // startup code (confirmed against the actual linker script/startup
+    // .s file: only ordinary .bss gets zero-filled), so this object
+    // starts out holding raw leftover SDRAM contents, not zero. That's
+    // harmless once Init()/SetX() below overwrite what they use, but
+    // zeroing the whole object first is cheap insurance against any
+    // field Init() doesn't itself touch decoding as NaN/Inf, which is
+    // self-sustaining once it appears and (since every layer sends into
+    // ONE shared reverb bus) silently poisons the entire mix,
+    // permanently, until a full power cycle.
     memset(fx_phaser, 0, sizeof(*fx_phaser));
-    memset(fx_pitchshift, 0, sizeof(*fx_pitchshift));
     fx_phaser_ = fx_phaser;
     fx_phaser_->Init(sample_rate_);
-    fx_pitchshift_ = fx_pitchshift;
-    fx_pitchshift_->Init(sample_rate_);
-    // Init() leaves it at DaisySP's own default (16384 samples, ~341ms
-    // latency) -- apply this layer's actual starting preset (defaults to
-    // Fast, the lowest-latency option) instead of leaving that in place
-    // until the user happens to cycle it.
-    SetPitchDelayPreset(pitch_delay_preset_);
 
     Reset();
 }
@@ -210,9 +197,7 @@ void LooperLayer::SetEffect(LayerEffect e)
         // default), which for something like Drive can be surprisingly
         // loud before you've touched a knob. Verified against the actual
         // DaisySP source (not just guessed from the label names) that
-        // param=0 is a real clean/off state for every remaining effect
-        // here -- Pitch was the one exception, which is why it's no
-        // longer in this enum at all (see SetPitchEnabled()).
+        // param=0 is a real clean/off state for every effect here.
         effect_param_a_ = 0.f;
         effect_param_b_ = 0.f;
     }
@@ -227,54 +212,6 @@ void LooperLayer::SetEffectParamA01(float v)
 void LooperLayer::SetEffectParamB01(float v)
 {
     effect_param_b_ = Clampf(v, 0.f, 1.f);
-}
-
-void LooperLayer::SetPitchEnabled(bool on)
-{
-    if(on && !pitch_enabled_)
-        pitch_fade_ = 0.f; // ramp up in Process(), same idea as effect_fade_
-    pitch_enabled_ = on;
-}
-
-void LooperLayer::SetPitchAmount01(float v)
-{
-    pitch_amount01_ = Clampf(v, 0.f, 1.f);
-}
-
-void LooperLayer::SetPitchFun01(float v)
-{
-    pitch_fun01_ = Clampf(v, 0.f, 1.f);
-}
-
-void LooperLayer::SetPitchDelayPreset(int preset)
-{
-    if(preset < 0)
-        preset = 0;
-    if(preset >= kNumPitchDelayPresets)
-        preset = kNumPitchDelayPresets - 1;
-    pitch_delay_preset_ = preset;
-
-    // Fast/Med computed in ms against this layer's real sample rate, not
-    // a hardcoded 48kHz assumption. Smooth passes a large-but-in-range
-    // sample count (100000, safely inside uint32_t) rather than deriving
-    // one from an even larger ms value -- that overflowed the cast to
-    // uint32_t (undefined behavior, not a safe clamp). DaisySP's own
-    // SetDelSize() clamps anything past its actual buffer size (16384
-    // samples) down to that max, so this reliably lands on the exact
-    // original default without this file needing to know that constant.
-    uint32_t samples;
-    if(preset == 2)
-        samples = 100000u;
-    else
-    {
-        const float kPresetMs[2] = {50.f, 125.f};
-        samples = (uint32_t)(kPresetMs[preset] * 0.001f * sample_rate_);
-    }
-    fx_pitchshift_->SetDelSize(samples);
-
-    // Changing the delay line size while this is actively processing can
-    // pop -- same declick treatment as enabling it in the first place.
-    pitch_fade_ = 0.f;
 }
 
 void LooperLayer::SetReverbSend01(float v)
@@ -315,6 +252,7 @@ void LooperLayer::RestoreRecordedLength(size_t len)
 
 // --- Effects chain --------------------------------------------------------
 
+DSY_ITCM_TEXT
 void LooperLayer::ProcessEffectsChain(float dry_l, float dry_r, float& out_l, float& out_r)
 {
     switch(effect_)
@@ -394,6 +332,7 @@ void LooperLayer::ProcessEffectsChain(float dry_l, float dry_r, float& out_l, fl
 
 // --- Audio ------------------------------------------------------------
 
+DSY_ITCM_TEXT
 void LooperLayer::Process(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           AudioHandle::OutputBuffer reverb_send_out,
@@ -614,46 +553,6 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 }
                 fx_l *= effect_fade_;
                 fx_r *= effect_fade_;
-
-                // Pitch shift: independent of (and applied after) the
-                // character effect above -- see SetPitchEnabled()'s
-                // comment for why this isn't in ProcessEffectsChain's
-                // switch. Own declick fade, same technique as effect_fade_.
-                if(pitch_enabled_)
-                {
-                    float mono = (fx_l + fx_r) * 0.5f;
-                    fx_pitchshift_->SetTransposition(pitch_amount01_ * 24.f - 12.f);
-                    fx_pitchshift_->SetFun(pitch_fun01_);
-                    float wet = fx_pitchshift_->Process(mono);
-                    // Safety net: a NaN/Inf here (e.g. from a DaisySP edge
-                    // case, or any future SDRAM-placed effect that isn't
-                    // fully self-initializing) would otherwise sail
-                    // straight through Clampf() unchanged -- NaN compares
-                    // false against both bounds in IEEE-754, so a plain
-                    // min/max clamp doesn't catch it -- and flow into the
-                    // shared reverb bus below, permanently poisoning its
-                    // internal feedback state and silencing the entire
-                    // mix until a power cycle. One branch, only on this
-                    // path, to make that failure mode structurally
-                    // impossible regardless of cause.
-                    if(!isfinite(wet))
-                        wet = 0.f;
-                    // DaisySP's PitchShifter crossfades two overlapping
-                    // delay-line reads internally and isn't guaranteed to
-                    // stay at unity gain doing it -- its output can come
-                    // out noticeably louder than the input. Tightened from
-                    // an earlier 0.6x/+-1.2 safety margin (which still let
-                    // clipping-range peaks through) to stay inside normal
-                    // unity range instead of past it.
-                    wet = Clampf(wet * 0.5f, -1.f, 1.f);
-                    if(pitch_fade_ < 1.f)
-                    {
-                        pitch_fade_ += 1.f / (0.008f * sample_rate_);
-                        if(pitch_fade_ > 1.f)
-                            pitch_fade_ = 1.f;
-                    }
-                    fx_l = fx_r = wet * pitch_fade_;
-                }
 
                 out[0][i] += fx_l * volume_ * panL;
                 out[1][i] += fx_r * volume_ * panR;
