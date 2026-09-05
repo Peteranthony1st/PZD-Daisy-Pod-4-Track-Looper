@@ -3,6 +3,7 @@
 #include "audio_engine.h"
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <math.h>
 
 using namespace daisy;
@@ -215,7 +216,11 @@ void Ui::HandleEncoder(const UiControlEvents& events)
     int32_t inc = events.encoder_delta;
     if(inc != 0)
     {
-        if(screen_ == Screen::Home)
+        if(scrub_mode_active_ && screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
+        {
+            ScrubBy(inc);
+        }
+        else if(screen_ == Screen::Home)
         {
             cursor_layer_ = ((cursor_layer_ + inc) % num_layers_ + num_layers_) % num_layers_;
         }
@@ -274,6 +279,14 @@ void Ui::HandleEncoder(const UiControlEvents& events)
         }
         encoder_long_fired_ = false;
     }
+
+    // Scrub mode is a Global:Speed-only, always-transient toggle -- clear
+    // it unconditionally the instant we're not there any more (long-press
+    // to Home above is the only current exit path, but this isn't tied to
+    // that one call site specifically so it can't be left silently stuck
+    // on by any future navigation change).
+    if(!(screen_ == Screen::Global && global_page_ == GlobalPage::Speed))
+        scrub_mode_active_ = false;
 }
 
 void Ui::HandleButton1(const UiControlEvents& events)
@@ -403,6 +416,8 @@ void Ui::OnButton1Short()
                 int m = ((int)master_filter_mode_ + 1) % n;
                 master_filter_mode_ = (FilterMode)m;
             }
+            else if(global_page_ == GlobalPage::Speed)
+                scrub_mode_active_ = !scrub_mode_active_;
             else if(global_page_ == GlobalPage::File)
             {
                 // No card: this hand-wired socket has no card-detect pin
@@ -461,6 +476,14 @@ void Ui::OnButton2Short()
         int p = (Cur().GetPitchDelayPreset() + 1) % n;
         Cur().SetPitchDelayPreset(p);
     }
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
+    {
+        SetProjectSpeed01(0.5f); // tap = reset to 1.0x, mirrors Layer:Speed's Button1 tap
+        // Re-arm pickup so the reset actually sticks, same reasoning as
+        // Layer:Speed's own reset above.
+        k1_pickup_engaged_[(size_t)KnobContext::GlobalSpeed] = false;
+        k1_pickup_raw_[(size_t)KnobContext::GlobalSpeed]     = 0.5f;
+    }
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Export)
         TriggerExportMicroDexed();
     // All other screens: Button2 is unused (Status page's Button2 is
@@ -490,6 +513,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Tempo: return KnobContext::GlobalTempo;
                 case GlobalPage::Filter: return KnobContext::GlobalFilter;
                 case GlobalPage::Reverb: return KnobContext::GlobalReverb;
+                case GlobalPage::Speed: return KnobContext::GlobalSpeed;
                 case GlobalPage::File: return KnobContext::GlobalFile;
                 case GlobalPage::Export: return KnobContext::GlobalExport;
                 default: return KnobContext::GlobalTempo;
@@ -554,6 +578,9 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             k1_pickup_raw_[i] = reverb_size01_;
             k2_pickup_raw_[i] = bypass_reverb_send01_;
             break;
+        case KnobContext::GlobalSpeed:
+            k1_pickup_raw_[i] = project_speed01_;
+            break;
         case KnobContext::GlobalFile: break; // browses a list directly, no pickup used
         case KnobContext::GlobalExport: break; // no continuous knob values, Button1 triggers it
         default: break;
@@ -571,6 +598,53 @@ bool Ui::KnobPickUp(float raw, float& stored_raw, bool& engaged)
     }
     stored_raw = raw;
     return true;
+}
+
+void Ui::SetProjectSpeed01(float v)
+{
+    project_speed01_ = Clampf(v, 0.f, 1.f);
+    project_speed_   = SpeedCurve01(project_speed01_);
+}
+
+void Ui::ScrubBy(int32_t inc)
+{
+    // ~50ms @48kHz per encoder detent at rest -- tune by feel.
+    constexpr float kScrubSamplesPerClick = 2400.f;
+
+    // Turn-speed acceleration: ticks arriving close together (a fast
+    // spin) scrub much further per click than slow, deliberate ones --
+    // otherwise covering real distance means a lot of turning. 150ms
+    // between ticks or slower stays at the base 1x/~50ms-per-click feel;
+    // under ~19ms between ticks (fast spin) ramps up to the 8x cap
+    // (~400ms per click). Both constants are starting guesses, tune by
+    // feel on real hardware.
+    uint32_t now  = System::GetNow();
+    uint32_t dt   = now - last_scrub_tick_ms_;
+    last_scrub_tick_ms_ = now;
+    float accel = dt > 0 ? Clampf(150.f / (float)dt, 1.f, 8.f) : 8.f;
+
+    float delta = (float)inc * kScrubSamplesPerClick * accel;
+    int   rep   = -1; // lowest-indexed non-empty layer, same one DrawSpeedScreen()
+                       // reads for the playhead -- also used to re-sync
+                       // TempoClock's phase below, since without that the
+                       // metronome/beat indicator/bar-start would just keep
+                       // free-running from wherever they already were,
+                       // completely disconnected from where scrub moved
+                       // the audio to (see TempoClock::SetPhaseToPosition()).
+    for(int i = 0; i < num_layers_; i++)
+    {
+        if(!layers_[i].HasContent())
+            continue;
+        if(rep < 0)
+            rep = i;
+        float len = (float)layers_[i].GetRecordedLength();
+        float pos = layers_[i].GetPlayPosRaw() + delta;
+        while(pos >= len) pos -= len;
+        while(pos < 0.f) pos += len;
+        layers_[i].SetPlayPosRaw(pos);
+        if(i == rep)
+            tempo_->SetPhaseToPosition(pos);
+    }
 }
 
 void Ui::ApplyKnobs()
@@ -681,6 +755,11 @@ void Ui::ApplyKnobs()
                 if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                     bypass_reverb_send01_ = Clampf(k2, 0.f, 1.f);
             }
+            else if(global_page_ == GlobalPage::Speed)
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    SetProjectSpeed01(k1);
+            }
             else if(global_page_ == GlobalPage::File)
             {
                 // Knob1 browses the list of existing saved slots (the
@@ -739,6 +818,18 @@ void Ui::Draw()
         case Screen::Global: DrawGlobalScreen(); break;
     }
     disp_->Update();
+}
+
+void Ui::WriteUpper(const char* text)
+{
+    char   buf[64];
+    size_t n = strlen(text);
+    if(n >= sizeof(buf))
+        n = sizeof(buf) - 1;
+    for(size_t i = 0; i < n; i++)
+        buf[i] = (char)toupper((unsigned char)text[i]);
+    buf[n] = '\0';
+    disp_->WriteString(buf, Font_6x8, true);
 }
 
 void Ui::DrawControlRow(int         row_y,
@@ -804,7 +895,7 @@ void Ui::DrawBeatIndicator(int x, int y, int dot_size)
         char label[6];
         snprintf(label, sizeof(label), "B%d", tempo_->GetBarInLoop() + 1);
         disp_->SetCursor(x, y);
-        disp_->WriteString(label, Font_6x8, true);
+        WriteUpper(label);
     }
     int dots_x = x + 3 * 6 + 3; // 3 reserved chars @ Font_6x8 + a small gap
 
@@ -863,7 +954,7 @@ void Ui::DrawHome()
         char label[8];
         snprintf(label, sizeof(label), "%d%s", i + 1, StateGlyph(layers_[i].GetState()));
         disp_->SetCursor(x0 + 4, top + 8);
-        disp_->WriteString(label, Font_6x8, true);
+        WriteUpper(label);
     }
 
     // Master Volume/Metronome Volume shown live from their actual
@@ -898,6 +989,46 @@ void Ui::DrawHome()
     DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, rec_label, "", "", byp_label);
 }
 
+// Downsampled peak-bar waveform + optional moving playhead tick, shared
+// by Layer:Status (one layer's own peaks/position) and Global:Speed (a
+// composite max across all 4 layers -- see DrawSpeedScreen()). Centered
+// in the full gap between the title divider (y9) and the footer divider
+// (kFooterDividerY), 1px bar + 1px gap. Auto-scaled to the loudest of the
+// 63 cached buckets, so quiet input still uses the full height instead of
+// reading as "barely there" -- cheap to do here (63 floats, ~30Hz redraw)
+// versus the buffer itself (up to 1.6M raw samples), which is exactly why
+// the cache exists in the first place.
+void Ui::DrawWaveform(const float* peaks, bool draw_playhead, float playhead_pos01)
+{
+    float max_peak = 0.f;
+    for(int col = 0; col < LooperLayer::kWaveformCols; col++)
+        if(peaks[col] > max_peak)
+            max_peak = peaks[col];
+    float scale = max_peak > 0.001f ? 1.f / max_peak : 0.f;
+
+    const int kBandTop    = 14;
+    const int kBandBottom = 44;
+    const int center_y    = (kBandTop + kBandBottom) / 2;
+    const int half_h      = (kBandBottom - kBandTop) / 2;
+    for(int col = 0; col < LooperLayer::kWaveformCols; col++)
+    {
+        int x = 1 + col * 2;
+        int h = (int)(Clampf(peaks[col] * scale, 0.f, 1.f) * half_h + 0.5f);
+        if(h <= 0)
+            disp_->DrawPixel(x, center_y, true);
+        else
+            disp_->DrawLine(x, center_y - h, x, center_y + h, true);
+    }
+    if(draw_playhead)
+    {
+        int col = (int)(playhead_pos01 * LooperLayer::kWaveformCols);
+        if(col >= LooperLayer::kWaveformCols)
+            col = LooperLayer::kWaveformCols - 1;
+        int px = 1 + col * 2;
+        disp_->DrawLine(px, 10, px, 11, true);
+    }
+}
+
 void Ui::DrawLayerScreen()
 {
     char title[32];
@@ -917,7 +1048,7 @@ void Ui::DrawLayerScreen()
     // for the beat indicator on the same row -- see DrawBeatIndicator().
     snprintf(title, sizeof(title), "%d:%s", cursor_layer_ + 1, page_name);
     disp_->SetCursor(0, 0);
-    disp_->WriteString(title, Font_6x8, true);
+    WriteUpper(title);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
     disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
@@ -939,7 +1070,7 @@ void Ui::DrawLayerScreen()
                 const char* msg   = "Hold to clear...";
                 int         msg_w = (int)strlen(msg) * 6; // Font_6x8
                 disp_->SetCursor((disp_->Width() - msg_w) / 2, 16);
-                disp_->WriteString(msg, Font_6x8, true);
+                WriteUpper(msg);
                 disp_->DrawRect(0, 28, disp_->Width() - 1, 42, true, false);
                 if(w > 0)
                     disp_->DrawRect(1, 29, w, 41, true, true);
@@ -951,46 +1082,11 @@ void Ui::DrawLayerScreen()
                 // replacing the old meter bar -- and the state heading
                 // that used to live here is gone too, since the button
                 // row's label below is state-dependent and says it
-                // instead. Centered in the full gap between the title
-                // divider (y9) and the footer divider (kFooterDividerY),
-                // now that hold-to-clear has its own space above instead
-                // of sharing this one. 1px bar + 1px gap.
-                //
-                // Auto-scaled to the loudest bucket currently in the
-                // cache, so quiet input still uses the full height
-                // instead of reading as "barely there" -- cheap to do
-                // here (63 cached floats, ~30Hz redraw) versus the
-                // buffer itself (up to 1.6M raw samples), which is
-                // exactly why the cache exists in the first place.
-                const float* peaks = Cur().GetWaveformPeaks();
-                float        max_peak = 0.f;
-                for(int col = 0; col < LooperLayer::kWaveformCols; col++)
-                    if(peaks[col] > max_peak)
-                        max_peak = peaks[col];
-                float scale = max_peak > 0.001f ? 1.f / max_peak : 0.f;
-
-                const int kBandTop    = 14;
-                const int kBandBottom = 44;
-                const int center_y    = (kBandTop + kBandBottom) / 2;
-                const int half_h      = (kBandBottom - kBandTop) / 2;
-                for(int col = 0; col < LooperLayer::kWaveformCols; col++)
-                {
-                    int x = 1 + col * 2;
-                    int h = (int)(Clampf(peaks[col] * scale, 0.f, 1.f) * half_h + 0.5f);
-                    if(h <= 0)
-                        disp_->DrawPixel(x, center_y, true);
-                    else
-                        disp_->DrawLine(x, center_y - h, x, center_y + h, true);
-                }
-                if(st == LayerState::Playing || st == LayerState::Paused
-                   || st == LayerState::Overdubbing)
-                {
-                    int col = (int)(Cur().GetPlayPos01() * LooperLayer::kWaveformCols);
-                    if(col >= LooperLayer::kWaveformCols)
-                        col = LooperLayer::kWaveformCols - 1;
-                    int px = 1 + col * 2;
-                    disp_->DrawLine(px, 10, px, 11, true);
-                }
+                // instead. See DrawWaveform() (shared with Global:Speed's
+                // composite view) for the actual drawing/auto-scaling.
+                bool draw_ph = (st == LayerState::Playing || st == LayerState::Paused
+                                || st == LayerState::Overdubbing);
+                DrawWaveform(Cur().GetWaveformPeaks(), draw_ph, Cur().GetPlayPos01());
             }
 
             // Actual values, not the pickup-tracking array -- see the
@@ -1033,7 +1129,7 @@ void Ui::DrawLayerScreen()
             snprintf(line1, sizeof(line1), "Speed: %d.%02dx", speed_x100 / 100,
                       speed_x100 % 100);
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             char speed_val[10];
             snprintf(speed_val, sizeof(speed_val), "%d.%02dx", speed_x100 / 100,
@@ -1048,7 +1144,7 @@ void Ui::DrawLayerScreen()
         {
             snprintf(line1, sizeof(line1), "Mode: %s", FilterModeName(Cur().GetFilterMode()));
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             // Actual values, not the pickup-tracking array -- see the
             // comment on DrawHome()'s equivalent Vol readout.
@@ -1065,7 +1161,7 @@ void Ui::DrawLayerScreen()
         {
             snprintf(line1, sizeof(line1), "FX: %s", EffectName(Cur().GetEffect()));
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             // EffectParamA/BLabel() return "-" for a knob this effect
             // doesn't use (e.g. Drive ignores ParamB) -- treat that as
@@ -1096,7 +1192,7 @@ void Ui::DrawLayerScreen()
             snprintf(line1, sizeof(line1), "Send: %d%%",
                       (int)(Cur().GetReverbSend01() * 100.f + 0.5f));
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             char send_val[8];
             snprintf(send_val, sizeof(send_val), "%d%%",
@@ -1111,7 +1207,7 @@ void Ui::DrawLayerScreen()
             int gain_x10 = (int)(Cur().GetInputGain() * 10.f + 0.5f);
             snprintf(line1, sizeof(line1), "Gain: %d.%dx", gain_x10 / 10, gain_x10 % 10);
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             char gain_val[8];
             snprintf(gain_val, sizeof(gain_val), "%d.%dx", gain_x10 / 10, gain_x10 % 10);
@@ -1128,7 +1224,7 @@ void Ui::DrawLayerScreen()
             // -12..+12 range with no separate toggle.
             snprintf(line1, sizeof(line1), "Pitch: %s", Cur().GetPitchEnabled() ? "On" : "Off");
             disp_->SetCursor(0, 20);
-            disp_->WriteString(line1, Font_6x8, true);
+            WriteUpper(line1);
 
             float semi_f = Cur().GetPitchAmount01() * 24.f - 12.f;
             int   semis  = (int)(semi_f >= 0.f ? semi_f + 0.5f : semi_f - 0.5f);
@@ -1166,6 +1262,11 @@ void Ui::DrawGlobalScreen()
         DrawExportScreen();
         return;
     }
+    if(global_page_ == GlobalPage::Speed)
+    {
+        DrawSpeedScreen();
+        return;
+    }
 
     // Compact form (not "Global Settings") for the same reason as the
     // Layer screen's title -- leaves room for the beat indicator on the
@@ -1176,7 +1277,7 @@ void Ui::DrawGlobalScreen()
     else if(global_page_ == GlobalPage::Reverb)
         title = "Global:Reverb";
     disp_->SetCursor(0, 0);
-    disp_->WriteString(title, Font_6x8, true);
+    WriteUpper(title);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
     disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
@@ -1192,7 +1293,7 @@ void Ui::DrawGlobalScreen()
             float held = pod_->button2.TimeHeldMs();
             int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
             disp_->SetCursor(0, 20);
-            disp_->WriteString("Hold: Default...", Font_6x8, true);
+            WriteUpper("Hold: Default...");
             disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
             if(w > 0)
                 disp_->DrawRect(1, 31, w, 33, true, true);
@@ -1214,13 +1315,13 @@ void Ui::DrawGlobalScreen()
         snprintf(line2, sizeof(line2), "Metro: %s",
                   tempo_->IsMetronomeEnabled() ? "On" : "Off");
         disp_->SetCursor(0, 12);
-        disp_->WriteString(line1, Font_6x8, true);
+        WriteUpper(line1);
         // Font_6x8 is fixed-width (6px/char), so right-aligning is a
         // plain strlen() * 6 -- same trick DrawExportScreen() uses.
         disp_->SetCursor(disp_->Width() - 6 * (int)strlen(bars_line), 12);
-        disp_->WriteString(bars_line, Font_6x8, true);
+        WriteUpper(bars_line);
         disp_->SetCursor(0, 24);
-        disp_->WriteString(line2, Font_6x8, true);
+        WriteUpper(line2);
         // Same row either way -- the "save as default" result (if any)
         // is a direct response to something the user just did, so it
         // takes priority over the locked hint on the rare chance both
@@ -1228,12 +1329,12 @@ void Ui::DrawGlobalScreen()
         if(tempo_status_[0] != '\0')
         {
             disp_->SetCursor(0, 36);
-            disp_->WriteString(tempo_status_, Font_6x8, true);
+            WriteUpper(tempo_status_);
         }
         else if(tempo_->IsLocked())
         {
             disp_->SetCursor(0, 36);
-            disp_->WriteString("Clear layers first", Font_6x8, true);
+            WriteUpper("Clear layers first");
         }
 
         char bpm_val[8], bars_val[8];
@@ -1249,7 +1350,7 @@ void Ui::DrawGlobalScreen()
     {
         snprintf(line1, sizeof(line1), "Mode: %s", FilterModeName(master_filter_mode_));
         disp_->SetCursor(0, 16);
-        disp_->WriteString(line1, Font_6x8, true);
+        WriteUpper(line1);
 
         // Actual values, not the pickup-tracking array -- see the
         // comment on DrawHome()'s equivalent Vol readout.
@@ -1278,14 +1379,14 @@ void Ui::DrawGlobalScreen()
 void Ui::DrawFileScreen()
 {
     disp_->SetCursor(0, 0);
-    disp_->WriteString("Global:File", Font_6x8, true);
+    WriteUpper("Global:File");
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
     disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
     if(!PerformanceStore::IsCardPresent())
     {
         disp_->SetCursor(0, 20);
-        disp_->WriteString("No SD card", Font_6x8, true);
+        WriteUpper("No SD card");
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
         return;
@@ -1302,7 +1403,7 @@ void Ui::DrawFileScreen()
         float held = pod_->button1.TimeHeldMs();
         int   w    = (int)(Clampf(held / 400.f, 0.f, 1.f) * (disp_->Width() - 2));
         disp_->SetCursor(0, 20);
-        disp_->WriteString("Hold: New...", Font_6x8, true);
+        WriteUpper("Hold: New...");
         disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
         if(w > 0)
             disp_->DrawRect(1, 31, w, 33, true, true);
@@ -1312,7 +1413,7 @@ void Ui::DrawFileScreen()
         float held = pod_->button2.TimeHeldMs();
         int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
         disp_->SetCursor(0, 20);
-        disp_->WriteString("Hold: Load...", Font_6x8, true);
+        WriteUpper("Hold: Load...");
         disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
         if(w > 0)
             disp_->DrawRect(1, 31, w, 33, true, true);
@@ -1321,24 +1422,24 @@ void Ui::DrawFileScreen()
     {
         char line1[32], line2[32];
         if(loaded_slot_ >= 0)
-            snprintf(line1, sizeof(line1), "Now: %d - Performance", loaded_slot_);
+            snprintf(line1, sizeof(line1), "Now: %d - Perf", loaded_slot_);
         else
             snprintf(line1, sizeof(line1), "Now: (unsaved)");
         disp_->SetCursor(0, 14);
-        disp_->WriteString(line1, Font_6x8, true);
+        WriteUpper(line1);
 
         if(file_slot_count_ > 0)
-            snprintf(line2, sizeof(line2), "Load: %d - Performance",
+            snprintf(line2, sizeof(line2), "Load: %d - Perf",
                       file_slots_[file_cursor_]);
         else
             snprintf(line2, sizeof(line2), "Load: (no saves)");
         disp_->SetCursor(0, 26);
-        disp_->WriteString(line2, Font_6x8, true);
+        WriteUpper(line2);
 
         if(file_status_[0] != '\0')
         {
             disp_->SetCursor(0, 36);
-            disp_->WriteString(file_status_, Font_6x8, true);
+            WriteUpper(file_status_);
         }
     }
 
@@ -1363,7 +1464,7 @@ void Ui::DrawFileScreen()
 void Ui::DrawExportScreen()
 {
     disp_->SetCursor(0, 0);
-    disp_->WriteString("Global:Export", Font_6x8, true);
+    WriteUpper("Global:Export");
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
     disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
@@ -1377,7 +1478,7 @@ void Ui::DrawExportScreen()
                            : "No SD card";
     int x = (disp_->Width() - 6 * (int)strlen(msg)) / 2;
     disp_->SetCursor(x < 0 ? 0 : x, 24);
-    disp_->WriteString(msg, Font_6x8, true);
+    WriteUpper(msg);
 
     if(!PerformanceStore::IsCardPresent())
     {
@@ -1391,6 +1492,54 @@ void Ui::DrawExportScreen()
     // so a plain tap is safe.
     DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
     DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "STUDIO 48K", "", "", "CD 44.1K");
+}
+
+void Ui::DrawSpeedScreen()
+{
+    disp_->SetCursor(0, 0);
+    WriteUpper("Global:Speed");
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    // Composite waveform (max across all 4 layers' own caches, not just
+    // the cursor layer) -- matches vari-speed/scrub's whole premise that
+    // everything on the shared loop moves together, one tape. Playhead
+    // comes from the lowest-indexed non-empty layer's own position --
+    // there's no separate tracked "shared position" (each layer's
+    // play_pos_ is independent state, kept roughly in sync only by
+    // sharing record_len_ and starting at 0), and scrub nudges already
+    // write directly into that same layer's play_pos_ (see ScrubBy()), so
+    // this reflects live scrub movement automatically with no special
+    // casing here.
+    float composite_peaks[LooperLayer::kWaveformCols];
+    for(int col = 0; col < LooperLayer::kWaveformCols; col++)
+    {
+        float m = 0.f;
+        for(int L = 0; L < num_layers_; L++)
+        {
+            const float* p = layers_[L].GetWaveformPeaks();
+            if(p[col] > m)
+                m = p[col];
+        }
+        composite_peaks[col] = m;
+    }
+    int rep = -1;
+    for(int L = 0; L < num_layers_; L++)
+    {
+        if(layers_[L].HasContent())
+        {
+            rep = L;
+            break;
+        }
+    }
+    DrawWaveform(composite_peaks, rep >= 0, rep >= 0 ? layers_[rep].GetPlayPos01() : 0.f);
+
+    char speed_val[10];
+    int  speed_x100 = (int)(project_speed_ * 100.f + 0.5f);
+    snprintf(speed_val, sizeof(speed_val), "%d.%02dx", speed_x100 / 100, speed_x100 % 100);
+    DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Speed", speed_val, "", "");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                     scrub_mode_active_ ? "Scrub:On" : "Scrub:Off", "", "", "Reset");
 }
 
 void Ui::RefreshFileSlots()
@@ -1436,7 +1585,7 @@ void Ui::TriggerNew()
     for(int i = 0; i < num_layers_; i++)
         layers_[i].Clear();
     loaded_slot_ = -1; // next Save lands in a new slot, not over the old one
-    snprintf(file_status_, sizeof(file_status_), "New performance");
+    snprintf(file_status_, sizeof(file_status_), "New perf");
 }
 
 void Ui::TriggerLoad()
@@ -1463,6 +1612,13 @@ void Ui::TriggerLoad()
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
     g_audio_suspended     = false; // every layer + tempo phase is consistent now
+
+    // Project vari-speed is a live-performance control, not part of a
+    // saved performance (same rule as master volume) -- always back to
+    // 1.0x after a Load, same as at boot, regardless of success/failure.
+    project_speed01_   = 0.5f;
+    project_speed_     = 1.f;
+    scrub_mode_active_ = false;
 
     if(ok)
     {
@@ -1503,7 +1659,7 @@ void Ui::TriggerExport()
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
                                             reverb_size01_, /*for_microdexed=*/false,
-                                            &Ui::OnSaveLoadProgress);
+                                            project_speed_, &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;
@@ -1525,7 +1681,7 @@ void Ui::TriggerExportMicroDexed()
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
                                             reverb_size01_, /*for_microdexed=*/true,
-                                            &Ui::OnSaveLoadProgress);
+                                            project_speed_, &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;
@@ -1553,11 +1709,12 @@ void Ui::OnSaveLoadProgress(float progress01)
     OneBitGraphicsDisplay* d = g_progress_disp;
     d->Fill(false);
     d->SetCursor(0, 14);
-    // Font_7x10, not the footer's usual Font_6x8 -- an 8-row-tall font
-    // only has room for a 1-pixel descender, which reads as a clipped
-    // "g" in "Working..." at this size no matter how it's positioned;
-    // this font's extra 2 rows actually give it a real tail.
-    d->WriteString("Working...", Font_7x10, true);
+    // Font_7x10, not the footer's usual Font_6x8 -- bigger, more visible
+    // for a modal progress overlay. Uppercase like everything else drawn
+    // with Font_6x8 (see Ui::WriteUpper()) -- this one's Font_7x10 and a
+    // literal, not routed through that helper, so it's just spelled
+    // uppercase directly here instead.
+    d->WriteString("WORKING...", Font_7x10, true);
     int w = (int)(Clampf(progress01, 0.f, 1.f) * (d->Width() - 2));
     d->DrawRect(0, 32, d->Width() - 1, 40, true, false);
     if(w > 0)

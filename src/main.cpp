@@ -114,6 +114,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         return;
     }
 
+    // Block-rate: tape-style multiplier on top of every layer's own Speed
+    // and the tempo clock's own tick rate -- see Ui::GetProjectSpeed(),
+    // TempoClock::Process(), LooperLayer::Process(). Read here, before
+    // the loops below, since both need it.
+    const float project_speed = ui.GetProjectSpeed();
+
     for(size_t i = 0; i < size; i++)
     {
         out[0][i] = 0.f;
@@ -121,7 +127,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         reverb_send_l[i] = 0.f;
         reverb_send_r[i] = 0.f;
 
-        ticks[i] = tempo.Process();
+        ticks[i] = tempo.Process(project_speed);
         click[i] = tempo.RenderClick(ticks[i]);
     }
 
@@ -130,7 +136,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // the actual shared ReverbSc runs once per sample further down).
     float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
     for(int L = 0; L < kNumLayers; L++)
-        layers[L].Process(in, out, reverb_send_ptrs, size, ticks, tempo);
+        layers[L].Process(in, out, reverb_send_ptrs, size, ticks, tempo, project_speed);
 
     const float mv           = ui.GetMasterVolume();
     const bool  byp          = ui.IsBypassed();

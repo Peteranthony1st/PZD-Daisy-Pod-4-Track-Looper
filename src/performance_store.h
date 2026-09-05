@@ -96,12 +96,19 @@ bool Load(int          slot,
 // Each mode has its own independent EXPnnn numbering sequence.
 // Master volume and the metronome click are deliberately NOT included
 // (see performance_store.cpp); the master filter and the shared reverb
-// bus (reverb_size01 -- see Ui::GetReverbSize01()) both are. Blocking,
-// like Save()/Load() -- call from main()'s loop, not the audio callback,
-// and with g_audio_suspended held true for the whole call (see
-// Ui::TriggerExport()) since this drives extra LooperLayer::Process()
-// calls from outside the real ISR. Refuses to run while any layer is
-// Recording or ArmedCountIn, or if nothing has been recorded yet.
+// bus (reverb_size01 -- see Ui::GetReverbSize01()) both are. project_speed
+// is the live vari-speed multiplier (see Ui::GetProjectSpeed()) -- unlike
+// master volume, this one IS captured into the export as-is, on purpose:
+// vari-speed is something a user dials in deliberately as part of a
+// performance (e.g. the classic "record fast, play back normal" tape
+// trick), not an incidental monitor-level knob position, so baking in
+// whatever it's currently set to when Export is pressed is the wanted
+// behavior, not a leak of live-only state. Blocking, like Save()/Load()
+// -- call from main()'s loop, not the audio callback, and with
+// g_audio_suspended held true for the whole call (see Ui::TriggerExport())
+// since this drives extra LooperLayer::Process() calls from outside the
+// real ISR. Refuses to run while any layer is Recording or ArmedCountIn,
+// or if nothing has been recorded yet.
 bool ExportWav(TempoClock&  tempo,
                LooperLayer* layers,
                int          num_layers,
@@ -110,6 +117,7 @@ bool ExportWav(TempoClock&  tempo,
                float        master_filter_res01,
                float        reverb_size01,
                bool         for_microdexed,
+               float        project_speed,
                ProgressFn   on_progress = nullptr);
 
 // User-settable startup defaults -- every *global* setting, deliberately

@@ -97,11 +97,43 @@ void TempoClock::ResetPhase()
     click_audible_                  = false;
 }
 
-TempoClock::TempoTick TempoClock::Process()
+void TempoClock::SetPhaseToPosition(float pos_samples)
+{
+    float spb = SamplesPerBeat();
+    if(spb <= 0.f)
+        return;
+
+    int total_beats = kBeatsPerBar * bars_;
+    int beat_idx     = (int)(pos_samples / spb);
+    if(beat_idx < 0)
+        beat_idx = 0;
+    if(beat_idx >= total_beats)
+        beat_idx = total_beats - 1;
+
+    phase_samples_ = (double)(pos_samples - (float)beat_idx * spb);
+    if(phase_samples_ < 0.0)
+        phase_samples_ = 0.0;
+
+    int beat_in_bar_audible = beat_idx % kBeatsPerBar;
+    int bar_in_loop_audible = beat_idx / kBeatsPerBar;
+    // Raw counters run one step ahead of what's audible -- see
+    // ResetPhase()'s comment for why.
+    beat_in_bar_ = (beat_in_bar_audible + 1) % kBeatsPerBar;
+    bar_in_loop_ = (bar_in_loop_audible + 1) % bars_;
+
+    count_state_                    = CountState::Idle;
+    count_in_beats_remaining_       = 0;
+    record_pending_after_count_in_  = false;
+    click_env_                      = 0.f;
+    click_phase_                    = 0.f;
+    click_audible_                  = false;
+}
+
+TempoClock::TempoTick TempoClock::Process(float speed)
 {
     TempoTick tick{false, false, false, false, false};
 
-    phase_samples_ += 1.0;
+    phase_samples_ += (double)speed;
     const float spb = SamplesPerBeat();
     if(phase_samples_ >= spb)
     {

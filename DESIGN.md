@@ -100,6 +100,7 @@ Full control map:
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
+| Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Toggle scrub mode (see below) | Reset to 1.0x |
 | Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
 | Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
 
@@ -159,6 +160,89 @@ truth:
   practice.
 - Changing BPM only affects *future* recordings once unlocked; it does
   not retroactively time-stretch anything already captured.
+
+## Vari-speed and scrub
+
+Global:Speed's Knob 1 is a project-wide tape-machine-style speed control
+— `SpeedCurve01()` (`looper_layer.h`, shared with `LooperLayer::SetSpeed01()`
+so the two controls feel identical), applied as a second multiplier on
+top of whatever each layer's own Speed already is. This is genuine
+vari-speed (pitch and tempo move together), not time-stretching — the
+project explicitly doesn't attempt pitch-independent tempo change (see
+Known limitations).
+
+**Playback**: `LooperLayer::Process()`'s per-sample position advance
+(`play_pos_ += speed_ * project_speed`) is the only change needed for
+existing content to speed up/slow down correctly.
+
+**Tempo/metronome**: `TempoClock::Process(float speed)` scales its own
+phase accumulator the same way (`phase_samples_ += speed`), so the
+metronome click, on-screen beat indicator, and bar boundaries all track
+the *actual* audible tempo instead of the originally-locked one — without
+this, the click would audibly drift out of sync with a sped-up/slowed-down
+loop within a few bars.
+
+**Recording/overdubbing while vari-speed isn't 1.0** is the correctness-
+sensitive part: since every layer shares one fixed-length loop buffer,
+newly captured audio has to land in the same native (1x) coordinate space
+every other layer already lives in, or it wouldn't stay in sync with
+everything else once vari-speed returns to 1.0x. Real input still arrives
+1-per-real-sample regardless of `project_speed`, so both the fresh-Recording
+write path and the Overdubbing write path now track a fractional native-
+space write cursor that advances by `project_speed` per real sample
+(mirroring `play_pos_`'s own advance) and linearly interpolate between the
+current and previous real input sample whenever a step needs to fill more
+than one native slot (`project_speed > 1`, upsampling) or skip some
+(`project_speed < 1`, decimation, same "no anti-alias filter"
+simplification the existing playback read path already accepts). This is
+also a deliberate creative surface, not just a compatibility fix: record
+something while sped up, and it comes back lower and slower once you
+return to 1.0x — the classic tape vari-speed trick — because what got
+captured is honestly in the same coordinate space as everything else, at
+whatever relative pitch you performed it against.
+
+**Scrub**: Button 1 on Global:Speed toggles `scrub_mode_active_`, which
+`HandleEncoder()` checks *before* its normal page-cycling logic — while
+it's on, encoder rotation calls `Ui::ScrubBy()` instead of moving between
+Global's sub-pages. `ScrubBy()` nudges every non-empty layer's `play_pos_`
+by the same raw-sample amount via `SetPlayPosRaw()` (the same accessor
+`PerformanceStore::ExportWav()`'s snapshot/restore already proven safe for
+direct position manipulation), with **turn-speed acceleration**: it
+tracks the time between consecutive scrub ticks (`daisy::System::GetNow()`)
+and scales the per-click distance up when ticks arrive close together (a
+fast spin), from a base ~50ms of audio per click up to an 8x cap
+(~400ms/click) for fast turns — slow, deliberate turns stay fine-grained.
+Scrubbing also calls `TempoClock::SetPhaseToPosition()` (using the same
+lowest-indexed non-empty layer the composite waveform's playhead reads)
+so the metronome/beat indicator/bar-start jump to match wherever scrub
+moved the audio, instead of continuing to free-run from wherever they
+already were — without this, scrubbing back would leave the audio and
+the metronome permanently out of sync by however far you scrubbed.
+Scrub mode auto-clears the instant you leave Global:Speed (including via
+the normal long-press-to-Home), so the encoder can never get stuck
+scrubbing somewhere it shouldn't.
+
+Global:Speed's display is a composite waveform (per-column max across all
+4 layers' existing `waveform_peaks_` caches, not just one layer) with a
+single shared playhead — reusing the same drawing routine Layer:Status
+uses for its own single-layer view (`Ui::DrawWaveform()`), just fed a
+synthesized peaks array and a different position source.
+
+**Persistence**: vari-speed is a live-performance control like Master
+Volume — it always resets to 1.0x on boot and after `Load()`, and is
+never written into a saved performance (no `FileHeader`/version changes
+at all for this feature). Unlike Master Volume, though, it's *not*
+excluded from `ExportWav()` — whatever it's set to when Export is
+pressed gets rendered into the file on purpose, since vari-speed is
+something dialed in as a deliberate part of a performance, not an
+incidental monitor-level knob position. This does mean an export's frame
+count depends on `project_speed` too: `ExportWav()` computes a
+`render_len` (`total_samples / project_speed`, i.e. how many render ticks
+complete one full pass at that speed) and drives everything -- the render
+loop, the WAV header's `data_size`, and (for the MicroDexed/CD path) the
+`Resampler48to44_1` frame count -- from that instead of the raw native
+loop length, so a sped-up export is correctly shorter and a slowed-down
+one correctly longer.
 
 ## Overdubbing
 
@@ -370,7 +454,10 @@ either button.
   *is* included (it's a real mix-shaping tool), via a fresh local `Svf`
   rather than main.cpp's live one, since a filter's only state is
   short-term signal history — primed with a throwaway first pass over the
-  loop before the real render so it isn't starting cold.
+  loop before the real render so it isn't starting cold. Project
+  vari-speed is the one live-performance control treated the *opposite*
+  way from master volume: it's deliberately baked into the export as-is
+  (see *Vari-speed and scrub* above) rather than excluded.
 - **Peak-normalized, not just clamped.** That same throwaway first pass
   doubles as a peak scan (it computes the exact same signal the real pass
   will write, so this is free); the real pass then applies a flat makeup

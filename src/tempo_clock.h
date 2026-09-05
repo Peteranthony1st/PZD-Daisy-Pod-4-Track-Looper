@@ -22,7 +22,7 @@
 //
 //   for (size_t i = 0; i < size; i++)
 //   {
-//       TempoTick tick = tempo.Process();
+//       TempoTick tick = tempo.Process(project_speed);
 //       float     click = tempo.RenderClick(tick);
 //       for (auto& layer : layers) layer.ProcessSample(i, tick, ...);
 //       out[0][i] += click; out[1][i] += click;
@@ -115,9 +115,27 @@ class TempoClock
     // the newly loaded audio's downbeat.
     void ResetPhase();
 
+    // Generalizes ResetPhase() to an arbitrary position within the loop
+    // (in native samples -- same coordinate space GetLoopLengthSamples()
+    // and every layer's play_pos_/record_len_ already live in), rather
+    // than always position 0. For Ui::ScrubBy(): scrubbing jumps every
+    // layer's play_pos_ directly, and without this the metronome/beat
+    // indicator would just keep free-running from wherever they already
+    // were, completely disconnected from where scrub moved the audio to.
+    // Same "raw counters run one step ahead of what's audible" convention
+    // as ResetPhase() (see its comment) -- clears any in-progress count-in
+    // too, since scrubbing only ever applies to already-playing layers.
+    void SetPhaseToPosition(float pos_samples);
+
     // Advances the master clock by one sample and returns what happened.
-    // Call this exactly once per sample, for the whole engine.
-    TempoTick Process();
+    // Call this exactly once per sample, for the whole engine. `speed` is
+    // a tape-style multiplier on the phase advance itself (1.0 = normal;
+    // see Ui::GetProjectSpeed()) -- scaling it here, not just in
+    // LooperLayer's own playback, is what keeps the metronome click and
+    // on-screen beat indicator honest about the actual audible tempo
+    // instead of the original locked one. No internal clamping -- same
+    // trust level LooperLayer::Process() already gives its own speed_.
+    TempoTick Process(float speed);
 
     // Renders the current sample of the metronome/count-in click. Call
     // this once per sample (every sample, not just on ticks -- it needs

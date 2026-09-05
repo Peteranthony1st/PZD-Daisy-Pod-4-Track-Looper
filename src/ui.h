@@ -95,6 +95,11 @@ class Ui
     // LooperLayer::SetInputGain01(), the same control used at actual
     // record time).
     float GetBypassGain() const { return layers_[cursor_layer_].GetInputGain(); }
+    // Block-rate: tape-style multiplier applied on top of every layer's
+    // own Speed and TempoClock's own tick rate -- see main.cpp's
+    // AudioCallback(), TempoClock::Process(), LooperLayer::Process().
+    // 1.0 (default) = normal.
+    float GetProjectSpeed() const { return project_speed_; }
 
   private:
     enum class Screen
@@ -119,6 +124,7 @@ class Ui
         Tempo,
         Filter,
         Reverb,
+        Speed,
         File,
         Export,
         kCount
@@ -142,6 +148,7 @@ class Ui
         GlobalTempo,
         GlobalFilter,
         GlobalReverb,
+        GlobalSpeed,
         GlobalFile,
         GlobalExport,
         kCount
@@ -165,6 +172,10 @@ class Ui
     // *to* -- same idea as a Pocket Operator's knob catch behavior.
     // Returns true if the caller should apply `raw` this tick.
     static bool KnobPickUp(float raw, float& stored_raw, bool& engaged);
+    // Shared by Global:Speed's knob path (ApplyKnobs()) and its Button2
+    // reset-to-1.0x -- two call sites, unlike most other global knobs
+    // which only ever get set from one place.
+    void SetProjectSpeed01(float v);
     // Seeds k1_pickup_raw_/k2_pickup_raw_[ctx] with this context's actual
     // current value(s) (e.g. Cur().GetFilterCutoff01() for LayerFilter),
     // called right where ApplyKnobs() re-arms `engaged` on a context
@@ -190,6 +201,17 @@ class Ui
     void DrawGlobalScreen();
     void DrawFileScreen();
     void DrawExportScreen();
+    void DrawSpeedScreen();
+    // Downsampled peak-bar waveform + optional moving playhead, shared by
+    // Layer:Status (one layer's own GetWaveformPeaks()/GetPlayPos01()) and
+    // Global:Speed (a composite max across all 4 layers) so the drawing
+    // code exists exactly once.
+    void DrawWaveform(const float* peaks, bool draw_playhead, float playhead_pos01);
+    // Encoder rotation while Global:Speed's scrub mode is on (see
+    // scrub_mode_active_) -- nudges every non-empty layer's play_pos_ by
+    // the same raw-sample amount, keeping them all pointing at the same
+    // shared timeline position, like scratching a physical tape loop.
+    void ScrubBy(int32_t inc);
 
     // --- SD save/load (Global:File page) -----------------------------
     // Refreshes file_slots_/file_slot_count_ from the card -- called
@@ -250,6 +272,14 @@ class Ui
     // gap (1px blank, the line, 1px blank) -- so this takes the already-
     // resolved y-coordinate rather than deriving one from row_y, which
     // would get the second case wrong. See the k*Y constants below.
+    // Every Font_6x8 label/value/status string on screen goes through
+    // this instead of disp_->WriteString() directly, so it all renders
+    // uppercase -- non-letters (digits, ':', '.', '%', ...) pass through
+    // toupper() unchanged. Tom Thumb (the footer legend) is untouched --
+    // it goes straight through DrawControlRow()/TomThumbDrawText(), never
+    // this. Truncates past 63 chars (fine -- nothing drawn on this
+    // 128px-wide display is remotely that long).
+    void WriteUpper(const char* text);
     void DrawControlRow(int         row_y,
                          bool       square_icon,
                          int        divider_y,
@@ -319,6 +349,15 @@ class Ui
 
     float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
     float bypass_reverb_send01_ = 0.f; // see GetBypassReverbSend01()
+
+    // Global:Speed -- live-performance controls, deliberately NEVER
+    // persisted (Save/Load/PREFS.DAT) -- same treatment as master volume.
+    // 0.5f defaults to exactly 1.0x via SpeedCurve01()'s dead zone, so no
+    // extra Init()-time recompute is needed the way master_volume_ needs.
+    float project_speed01_   = 0.5f; // raw 0..1
+    float project_speed_     = 1.f;  // actual multiplier, read every audio block
+    bool  scrub_mode_active_ = false; // Global:Speed only -- see HandleEncoder()
+    uint32_t last_scrub_tick_ms_ = 0; // for ScrubBy()'s turn-speed acceleration
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
 

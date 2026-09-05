@@ -618,6 +618,7 @@ bool ExportWav(TempoClock&  tempo,
               float        master_filter_res01,
               float        reverb_size01,
               bool         for_microdexed,
+              float        project_speed,
               ProgressFn   on_progress)
 {
     if(!card_ready)
@@ -676,15 +677,26 @@ bool ExportWav(TempoClock&  tempo,
     // sample_rate/total_samples stay at the true native rate -- they
     // drive mfilt_l/r.Init(), export_reverb.Init(), and nyquist_guard
     // below, all of which must keep running at the Pod's real 48kHz
-    // regardless of export mode (only the final written samples get
-    // resampled, see the write loop below). out_sample_rate/out_frames
-    // are the separate, WAV-header/output-facing values.
+    // regardless of export mode or vari-speed (only the read position and
+    // the final written samples are affected by either -- see below).
+    // render_len is the number of per-sample render ticks needed for one
+    // full pass through the loop AT project_speed (unlike master volume,
+    // vari-speed IS captured into exports, on purpose -- see this
+    // function's header comment): at project_speed>1 a full pass
+    // completes in fewer real-time-domain ticks (faster, shorter, higher
+    // pitched), at <1 it takes more (slower, longer, lower). out_frames
+    // is what actually goes in the WAV header/gets written -- render_len
+    // for the Studio path, or that same count further resampled to
+    // 44.1kHz for the CD path.
     const uint32_t sample_rate     = (uint32_t)tempo.GetSampleRate();
     const size_t   total_samples   = tempo.GetLoopLengthSamples();
+    const size_t   render_len      = project_speed > 0.0001f
+                                          ? (size_t)((float)total_samples / project_speed + 0.5f)
+                                          : total_samples;
     const uint32_t out_sample_rate = for_microdexed ? 44100u : sample_rate;
     const uint32_t out_frames      = for_microdexed
-                                          ? Resampler48to44_1::OutputFrames(total_samples)
-                                          : (uint32_t)total_samples;
+                                          ? Resampler48to44_1::OutputFrames(render_len)
+                                          : (uint32_t)render_len;
     const uint32_t data_size       = out_frames * 2 * (uint32_t)sizeof(int16_t);
 
     static WavHeader hdr;
@@ -806,7 +818,7 @@ bool ExportWav(TempoClock&  tempo,
         for(int i = 0; i < n_snap; i++)
             layers[i].SetPlayPosRaw(0.f);
 
-        size_t remaining = total_samples;
+        size_t remaining = render_len;
         while(remaining > 0 && ok)
         {
             UINT n      = (UINT)(remaining < kChunkSamples ? remaining : kChunkSamples);
@@ -825,7 +837,8 @@ bool ExportWav(TempoClock&  tempo,
             float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
 
             for(int L = 0; L < num_layers; L++)
-                layers[L].Process(in_ptrs, out_ptrs, reverb_send_ptrs, n, dummy_ticks, tempo);
+                layers[L].Process(in_ptrs, out_ptrs, reverb_send_ptrs, n, dummy_ticks, tempo,
+                                    project_speed);
 
             for(UINT i = 0; i < n; i++)
             {
@@ -901,8 +914,8 @@ bool ExportWav(TempoClock&  tempo,
             remaining -= n;
             if(on_progress)
             {
-                size_t done  = (size_t)pass * total_samples + (total_samples - remaining);
-                size_t total = total_samples * 2;
+                size_t done  = (size_t)pass * render_len + (render_len - remaining);
+                size_t total = render_len * 2;
                 on_progress((float)done / (float)total);
             }
         }

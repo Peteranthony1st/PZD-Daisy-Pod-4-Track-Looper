@@ -80,6 +80,16 @@ The name, general concept, and file organization are based on
 - Startup defaults — save your usual BPM/Bars/Volume/Metro/Filter/Reverb
   size/Bypass as what the pedal boots into, so powering on lands exactly
   where you like it instead of the factory defaults
+- Vari-speed — a project-wide tape-style speed control (0.3x–2x, same
+  feel as per-layer Speed) layered on top of everything already
+  recorded, changing pitch and tempo together — the metronome and beat
+  indicator track it live. Recording or overdubbing while it's off 1.0x
+  captures correctly in sync with everything else, so it's genuinely
+  usable as a performance/recording tool, not just a monitor toy
+- Scrub — toggle Button 1 on Global:Speed to repurpose the encoder as a
+  tape-scratch control over the shared playback position across every
+  layer at once, with a composite waveform + moving playhead to scrub
+  against. Fast turns cover more ground than slow, deliberate ones
 
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
@@ -90,7 +100,9 @@ The name, general concept, and file organization are based on
   Two output options: full-quality native 48kHz for general use, or a
   44.1kHz-resampled copy saved straight into a `custom/` folder so the
   same SD card can go directly into a MicroDexed Touch's second card
-  slot and be picked up as a sample with no copying needed
+  slot and be picked up as a sample with no copying needed. Whatever
+  vari-speed is currently dialed in gets baked into the export on
+  purpose, so you can capture a deliberate vari-speed effect to a file
 
 ## How to use it
 
@@ -136,6 +148,25 @@ firmware's own defaults. This only covers global settings, never
 per-layer ones, and it's separate from "New" on Global:File, which keeps
 every current setting exactly as-is and only clears recorded audio.
 
+**Vari-speed and scrub** — Global:Speed's Knob 1 is a tape-machine-style
+speed control for the whole project, not just one layer: dead-zone
+centered on 1.0x, sweeping down to 0.3x or up to 2x changes pitch and
+tempo together, and the metronome/beat indicator move with it so
+everything stays honest about what's actually audible. While scrubbing
+(Button 1 toggles it), the encoder temporarily stops cycling Global pages
+and instead scratches the shared playback position across every layer at
+once, against a composite waveform of everything currently recorded —
+navigate away or long-press to Home and the encoder goes right back to
+normal. Recording or overdubbing while vari-speed is off 1.0x captures
+correctly (returning to 1.0x afterward won't throw anything out of sync),
+which also makes it a genuine creative tool — record something while
+sped up, and it comes back lower and slower once you return to normal
+speed, the classic tape trick. Button 2 resets straight back to 1.0x.
+Vari-speed is a live-performance control like Master Volume — it always
+starts at 1.0x on boot and after loading a save, and it's *not* excluded
+from WAV export the way Master Volume is: whatever it's set to when you
+hit Export gets baked into the file on purpose.
+
 **Control reference**
 
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
@@ -151,6 +182,7 @@ every current setting exactly as-is and only clears recorded audio.
 | Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size | Bypass reverb send | — | — |
+| Global: Speed | Vari-speed | — | Toggle scrub mode | Reset to 1.0x |
 | Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |
 | Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
 

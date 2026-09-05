@@ -69,6 +69,28 @@ enum class FilterMode
 constexpr float kFilterMinHz = 20.f;
 constexpr float kFilterMaxHz = 9000.f;
 
+// Shared dead-zone-centered speed curve (0.3x..2.0x, exactly 1.0x at
+// knob-center) -- used by both LooperLayer::SetSpeed01() (per-layer
+// Speed) and Ui's project-wide vari-speed knob (Global:Speed), so the
+// two controls feel identical and can never drift onto different
+// constants. Public for the same reason kFilterMinHz/kFilterMaxHz are.
+inline float SpeedCurve01(float v01)
+{
+    const float center    = 0.5f;
+    const float dead_zone = 0.09f;
+    if(v01 < center - dead_zone)
+    {
+        float tt = v01 / (center - dead_zone);
+        return 0.3f + tt * (1.f - 0.3f);
+    }
+    if(v01 > center + dead_zone)
+    {
+        float tt = (v01 - (center + dead_zone)) / (1.f - (center + dead_zone));
+        return 1.f + tt * (2.f - 1.f);
+    }
+    return 1.f;
+}
+
 enum class LayerEffect
 {
     Off,
@@ -247,12 +269,18 @@ struct LooperLayer
     // shared ReverbSc over the sum of every layer's contribution once
     // per sample, after this loop, and mixes the wet result into out[]
     // itself (see AudioCallback()).
+    // project_speed is the block-rate tape-style multiplier from
+    // Ui::GetProjectSpeed() (see main.cpp's AudioCallback()) -- applied
+    // on top of this layer's own speed_ for playback, and used to keep
+    // fresh recording/overdub writes in the same native-tempo coordinate
+    // space as everything else (see Process()'s .cpp comments).
     void Process(AudioHandle::InputBuffer  in,
                  AudioHandle::OutputBuffer out,
                  AudioHandle::OutputBuffer reverb_send_out,
                  size_t                    size,
                  const TempoClock::TempoTick* ticks,
-                 TempoClock&                  tempo);
+                 TempoClock&                  tempo,
+                 float                        project_speed);
 
   private:
     void ProcessEffectsChain(float dry_l, float dry_r, float& out_l, float& out_r);
@@ -273,6 +301,17 @@ struct LooperLayer
 
     float speed_    = 1.f;
     float speed01_  = 0.5f; // raw 0..1 last passed to SetSpeed01(), for save/restore
+
+    // Vari-speed-aware record/overdub write path state -- see Process()'s
+    // Recording/Overdubbing branches. record_write_phase_ is the
+    // fractional native-space write cursor while Recording (meaningless
+    // otherwise); prev_input_sample_l_/r_ is the last real input sample
+    // captured, shared by Recording and Overdubbing since they never run
+    // simultaneously, used to linearly interpolate whenever project_speed
+    // isn't exactly 1.0.
+    float record_write_phase_  = 0.f;
+    float prev_input_sample_l_ = 0.f;
+    float prev_input_sample_r_ = 0.f;
     float volume_   = 1.f;
     float volume01_ = 1.f;  // raw 0..1 last passed to SetVolume01(), for save/restore
     float pan_      = 0.5f;

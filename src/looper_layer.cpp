@@ -78,6 +78,9 @@ void LooperLayer::Reset()
     target_len_        = 0;
     play_pos_          = 0.f;
     meter_             = 0.f;
+    record_write_phase_  = 0.f;
+    prev_input_sample_l_ = 0.f;
+    prev_input_sample_r_ = 0.f;
     for(int i = 0; i < kWaveformCols; i++)
         waveform_peaks_[i] = 0.f;
 }
@@ -89,6 +92,9 @@ void LooperLayer::Clear()
     record_len_ = 0;
     play_pos_   = 0.f;
     meter_      = 0.f;
+    record_write_phase_  = 0.f;
+    prev_input_sample_l_ = 0.f;
+    prev_input_sample_r_ = 0.f;
     for(int i = 0; i < kWaveformCols; i++)
         waveform_peaks_[i] = 0.f;
 }
@@ -129,6 +135,11 @@ void LooperLayer::OnRecordButtonLongPress(TempoClock& tempo)
         case LayerState::Playing:
         case LayerState::Paused:
             state_ = LayerState::Overdubbing;
+            // Fresh interpolation state -- don't blend the first sample
+            // of this overdub against whatever was captured the last
+            // time this layer recorded or overdubbed.
+            prev_input_sample_l_ = 0.f;
+            prev_input_sample_r_ = 0.f;
             break;
         default: break;
     }
@@ -164,22 +175,7 @@ void LooperLayer::SetSpeed01(float v)
     if(state_ == LayerState::Recording || state_ == LayerState::ArmedCountIn)
         return;
     speed01_ = Clampf(v, 0.f, 1.f);
-    const float center    = 0.5f;
-    const float dead_zone = 0.09f;
-    if(v < center - dead_zone)
-    {
-        float tt = v / (center - dead_zone);
-        speed_   = 0.3f + tt * (1.f - 0.3f);
-    }
-    else if(v > center + dead_zone)
-    {
-        float tt = (v - (center + dead_zone)) / (1.f - (center + dead_zone));
-        speed_   = 1.f + tt * (2.f - 1.f);
-    }
-    else
-    {
-        speed_ = 1.f;
-    }
+    speed_   = SpeedCurve01(speed01_);
 }
 
 void LooperLayer::SetFilterCutoff01(float v)
@@ -403,7 +399,8 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer reverb_send_out,
                           size_t                    size,
                           const TempoClock::TempoTick* ticks,
-                          TempoClock&                  tempo)
+                          TempoClock&                  tempo,
+                          float                        project_speed)
 {
     const float panL = 1.f - pan_;
     const float panR = pan_;
@@ -425,6 +422,15 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                     target_len_ = buffer_size_; // don't record past SDRAM allocation
                 for(int c = 0; c < kWaveformCols; c++)
                     waveform_peaks_[c] = 0.f;
+                // Seeded at -project_speed, not 0 -- this makes the very
+                // first native slot (idx==0) always land at interpolation
+                // weight t==1 (i.e. exactly the first real sample
+                // captured) regardless of project_speed's value, so this
+                // scheme degenerates to the original plain write_idx_++
+                // behavior at project_speed==1.0. See the write loop below.
+                record_write_phase_  = -project_speed;
+                prev_input_sample_l_ = 0.f;
+                prev_input_sample_r_ = 0.f;
             }
         }
 
@@ -439,28 +445,52 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             // quiet source.
             float sample_l = Clampf(mic_in * input_gain_, -1.5f, 1.5f);
             float sample_r = Clampf(guitar_in * input_gain_, -1.5f, 1.5f);
+            meter_ = fabsf(sample_l) * 0.3f + meter_ * 0.7f;
 
-            if(write_idx_ < buffer_size_)
+            // Vari-speed-aware write: real input arrives 1-per-real-sample
+            // regardless of project_speed, but target_len_ (native-space)
+            // never changes, so the write cursor must advance through
+            // native space by project_speed per real sample -- exactly
+            // mirroring play_pos_'s own advance below. At project_speed>1
+            // one real sample can fill more than one native slot (upsample
+            // via linear interpolation between this and the previous real
+            // sample); at project_speed<1 several real samples pass before
+            // crossing into a new native slot (decimation -- same "no
+            // anti-alias filter" simplification the playback read path
+            // below already accepts, just mirrored to the write side).
+            // Degenerates to the original plain write_idx_++ at
+            // project_speed==1.0 (first_idx==last_idx every step, t always
+            // 1, one slot per real sample).
+            float old_phase = record_write_phase_;
+            float new_phase = old_phase + project_speed;
+            int   first_idx = (int)floorf(old_phase) + 1;
+            int   last_idx  = (int)floorf(new_phase);
+            if(last_idx >= (int)target_len_)
+                last_idx = (int)target_len_ - 1;
+
+            for(int idx = first_idx; idx <= last_idx; idx++)
             {
-                buffer_l_[write_idx_] = sample_l;
-                buffer_r_[write_idx_] = sample_r;
-                // Waveform cache: which of kWaveformCols buckets this
-                // sample falls into is known up front since target_len_
-                // was fixed the moment recording started -- one division
-                // per sample, negligible on this hardware (Cortex-M7 has
-                // a single-digit-cycle hardware integer divider).
+                if(idx < 0)
+                    continue; // pre-roll from the -project_speed seed
+                float t = (idx - old_phase) / project_speed; // 0..1 across [prev, this]
+                float l = prev_input_sample_l_ + t * (sample_l - prev_input_sample_l_);
+                float r = prev_input_sample_r_ + t * (sample_r - prev_input_sample_r_);
+                buffer_l_[idx] = l;
+                buffer_r_[idx] = r;
                 if(target_len_ > 0)
                 {
-                    int bucket = (int)(write_idx_ * (size_t)kWaveformCols / target_len_);
+                    int bucket = (int)((size_t)idx * (size_t)kWaveformCols / target_len_);
                     if(bucket >= kWaveformCols)
                         bucket = kWaveformCols - 1;
-                    float a = fabsf(sample_l);
+                    float a = fabsf(l);
                     if(a > waveform_peaks_[bucket])
                         waveform_peaks_[bucket] = a;
                 }
-                write_idx_++;
+                write_idx_ = (size_t)idx + 1;
             }
-            meter_ = fabsf(sample_l) * 0.3f + meter_ * 0.7f;
+            record_write_phase_  = new_phase;
+            prev_input_sample_l_ = sample_l;
+            prev_input_sample_r_ = sample_r;
 
             if(write_idx_ >= target_len_)
             {
@@ -476,26 +506,43 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             float sample_l = mic_in * input_gain_;
             float sample_r = guitar_in * input_gain_;
 
-            int idx0 = (int)play_pos_;
-            buffer_l_[idx0] = Clampf(buffer_l_[idx0] + sample_l, -1.5f, 1.5f);
-            buffer_r_[idx0] = Clampf(buffer_r_[idx0] + sample_r, -1.5f, 1.5f);
+            // Same vari-speed-aware interpolated write as Recording above,
+            // keyed off play_pos_ (already shared with the playback read
+            // a few lines below) instead of a separate cursor -- wraps
+            // instead of stopping at a target, and adds instead of
+            // replacing. old_pos/new_pos are local previews only; the one
+            // real play_pos_ mutation+wraparound still happens exactly
+            // once, unchanged, in the shared advance block below.
+            float effective_speed = speed_ * project_speed;
+            float old_pos = play_pos_;
+            float new_pos = old_pos + effective_speed;
+            int   reclen    = (int)record_len_;
+            int   first_idx = (int)floorf(old_pos) + 1;
+            int   last_idx  = (int)floorf(new_pos);
 
-            // Waveform cache: keyed off the buffer position actually
-            // touched (idx0), against record_len_ (fixed, known) rather
-            // than target_len_. Only ever raises a bucket's cached peak
-            // -- known simplification, not a full rescan -- since this
-            // reflects what got summed in, not what the sum's magnitude
-            // ends up being (which could in principle be lower if phases
-            // partly cancel); peak-hold is a normal look for this kind of
-            // display and self-corrects on the next full re-record.
+            for(int idx = first_idx; idx <= last_idx; idx++)
             {
-                int bucket = (int)((size_t)idx0 * (size_t)kWaveformCols / record_len_);
+                int wrapped = idx % reclen; // a step can span the loop
+                                             // boundary at high combined
+                                             // speed on a short layer
+                float t = (idx - old_pos) / effective_speed;
+                float add_l = prev_input_sample_l_ + t * (sample_l - prev_input_sample_l_);
+                float add_r = prev_input_sample_r_ + t * (sample_r - prev_input_sample_r_);
+                buffer_l_[wrapped] = Clampf(buffer_l_[wrapped] + add_l, -1.5f, 1.5f);
+                buffer_r_[wrapped] = Clampf(buffer_r_[wrapped] + add_r, -1.5f, 1.5f);
+
+                // Waveform cache: same peak-hold simplification as before,
+                // just now potentially touching more than one bucket per
+                // real sample.
+                int bucket = (int)((size_t)wrapped * (size_t)kWaveformCols / record_len_);
                 if(bucket >= kWaveformCols)
                     bucket = kWaveformCols - 1;
-                float a = fabsf(buffer_l_[idx0]);
+                float a = fabsf(buffer_l_[wrapped]);
                 if(a > waveform_peaks_[bucket])
                     waveform_peaks_[bucket] = a;
             }
+            prev_input_sample_l_ = sample_l;
+            prev_input_sample_r_ = sample_r;
         }
 
         if((state_ == LayerState::Playing || state_ == LayerState::Overdubbing
@@ -629,7 +676,7 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 meter_ *= 0.9f;
             }
 
-            play_pos_ += speed_;
+            play_pos_ += speed_ * project_speed;
             while(play_pos_ >= (float)record_len_)
                 play_pos_ -= (float)record_len_;
             while(play_pos_ < 0.f)
