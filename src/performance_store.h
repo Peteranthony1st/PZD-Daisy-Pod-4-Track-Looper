@@ -3,6 +3,8 @@
 #include <cstdint>
 #include "tempo_clock.h"
 #include "looper_layer.h"
+#include "pad_synth.h"
+#include "granular_engine.h"
 
 // SD card save/load for a whole "performance" (all layers' audio plus
 // tempo/global/per-layer settings) as one flat binary file per slot.
@@ -65,6 +67,7 @@ bool Save(int                slot,
           float              master_filter_res01,
           float              reverb_size01,
           float              bypass_reverb_send01,
+          const PadSynth::PadPresetData& pad_preset,
           ProgressFn         on_progress = nullptr);
 
 bool Load(int          slot,
@@ -78,7 +81,63 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
           float*       out_bypass_reverb_send01,
+          PadSynth::PadPresetData* out_pad_preset,
           ProgressFn   on_progress = nullptr);
+
+// Pad synth presets: parameters only, no audio -- a real snapshot (via
+// PadSynth::CapturePreset()/ApplyPreset()), not a reference to whatever
+// performance it originally came from, so a later Save/Load of a
+// DIFFERENT performance can never invalidate an already-saved preset.
+// Numbered 1..kMaxPadPresets; 1..PadSynth::kNumFactoryPresets are the
+// permanently read-only, firmware-embedded factory presets (see
+// PadSynth::GetFactoryPreset()) -- LoadPadPreset() serves those directly
+// without touching the card, and SavePadPreset()/NextFreePadPresetSlot()
+// never target them. User saves start right after that range.
+constexpr int kMaxPadPresets = 99;
+
+bool SavePadPreset(int slot, const PadSynth::PadPresetData& preset);
+bool LoadPadPreset(int slot, PadSynth::PadPresetData* out_preset);
+// Lists existing USER slots only (ascending) -- factory presets are
+// always available and aren't part of this scan. Same shape as
+// ListSlots().
+int  ListPadPresets(int* out_numbers, int max_out);
+// Lowest free USER slot, or -1 if the whole range is full/no card.
+int  NextFreePadPresetSlot();
+
+// Grains (GranularEngine) presets: parameters AND the captured audio
+// itself (unlike Pad presets above, which are parameters only) -- a
+// Grains preset IS a specific captured sound plus how it's being played
+// back, so loading one needs to restore both. No factory range (there's
+// no hand-tuned-patch equivalent for a captured sample), so every slot
+// 1..kMaxGranularPresets is a normal user save. Numbered/found the same
+// way as PadPreset's own user range.
+constexpr int kMaxGranularPresets = 99;
+
+// audio_l/audio_r: whatever GranularEngine::GetSourceL()/R() currently
+// point at; audio_len: GetSourceLen(). Blocking (chunked SD write, same
+// kChunkSamples streaming as Save()'s own layer audio) -- call from the
+// main loop with a progress callback, same rule as Save()/Load()/
+// ExportWav() above, not the audio ISR.
+bool SaveGranularPreset(int                                       slot,
+                        const GranularEngine::GranularPresetData& preset,
+                        const float*                              audio_l,
+                        const float*                              audio_r,
+                        size_t                                    audio_len,
+                        ProgressFn                                on_progress = nullptr);
+// out_audio_l/r must have room for at least audio_capacity samples each
+// -- the file's own audio_len is clamped to that before reading, same
+// "never write past what the caller actually owns" reasoning as every
+// other buffer-filling call in this project. *out_audio_len is set to
+// however many samples were actually read.
+bool LoadGranularPreset(int                                  slot,
+                        GranularEngine::GranularPresetData* out_preset,
+                        float*                               out_audio_l,
+                        float*                               out_audio_r,
+                        size_t                                audio_capacity,
+                        size_t*                               out_audio_len,
+                        ProgressFn                            on_progress = nullptr);
+int  ListGranularPresets(int* out_numbers, int max_out);
+int  NextFreeGranularPresetSlot();
 
 // Renders the current in-memory performance (one full shared loop length,
 // every layer's real filter/character-effect/reverb chain applied,

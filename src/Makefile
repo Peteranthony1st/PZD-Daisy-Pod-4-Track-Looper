@@ -1,6 +1,6 @@
 TARGET = main
 
-CPP_SOURCES = main.cpp looper_layer.cpp tempo_clock.cpp ui.cpp performance_store.cpp font_tomthumb.cpp
+CPP_SOURCES = main.cpp looper_layer.cpp tempo_clock.cpp ui.cpp performance_store.cpp font_tomthumb.cpp pad_synth.cpp granular_engine.cpp
 
 LIBDAISY_DIR = libDaisy
 DAISYSP_DIR = DaisySP

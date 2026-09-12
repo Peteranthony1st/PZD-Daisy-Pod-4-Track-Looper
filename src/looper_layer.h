@@ -137,6 +137,12 @@ struct LooperLayer
     // Wipes this layer back to Empty. UI is responsible for requiring a
     // deliberate hold-to-confirm gesture before calling this.
     void Clear();
+    // Global pause/resume (Ui::TogglePauseAll(), Global screen's encoder
+    // click) -- only acts on the Playing<->Paused pair, same as a tap of
+    // this layer's own record button; a no-op for every other state
+    // (Empty/Recording/ArmedCountIn/Overdubbing) so it's safe to call on
+    // every layer regardless of what each one is currently doing.
+    void SetPaused(bool paused);
 
     LayerState GetState() const { return state_; }
     bool       HasContent() const { return record_len_ > 0; }

@@ -1,0 +1,328 @@
+#pragma once
+#include <cstdint>
+#include <cstddef>
+#include "daisysp.h"
+#include "looper_layer.h" // FilterMode, kFilterMinHz/kFilterMaxHz
+
+// A monophonic granular voice -- deliberately much simpler than this
+// project's earlier 8-voice granular engine (shelved on the `granular`
+// git branch): one held note at a time, no oscillator layer (PadSynth
+// covers that role now), and TWO overlapping-grain layers sharing the
+// same Size/Fill/Gap scheduling instead of one polyphonic grain cloud
+// plus a separate, thinner "scan grain":
+//
+//   - Grain layer: reads from a fixed Position anchor.
+//   - Scan layer: reads from a continuously-sweeping anchor (bounces
+//     between ScanStart/ScanEnd at a speed/direction set by Scan).
+//
+// Both layers are the SAME GrainCluster mechanism (see below) -- the old
+// engine's Scan was a single retriggered grain on its own timer, and even
+// after several rounds of tuning it stayed thinner/choppier than the main
+// grain cloud, because one voice retriggering periodically is inherently
+// less smooth than several overlapping ones. Giving Scan the identical
+// multi-slot scheduling the Grain layer already uses fixes that by
+// construction rather than by tuning constants further.
+//
+// Does NOT own the captured buffer -- SetSource() just points at whatever
+// buffer currently holds a capture (SDRAM, owned by main.cpp), same
+// convention the old engine used.
+class GranularEngine
+{
+  public:
+    void Init(float sample_rate);
+
+    // len == 0 means "nothing captured yet" -- NoteOn() is a no-op then.
+    // Silences both grain clusters outright (a grain's position was
+    // computed against the OLD src_len_, and a shorter new capture could
+    // otherwise leave it out of bounds) -- same reasoning the old engine's
+    // SetSource() used.
+    void SetSource(const float* buf_l, const float* buf_r, size_t len);
+    bool   HasSource() const { return src_len_ > 0; }
+    size_t GetSourceLen() const { return src_len_; }
+
+    // Monophonic: a NoteOn always retriggers the single voice (last-note
+    // priority), no legato/portamento. NoteOff() only releases if it
+    // matches the currently-held note, so releasing an old note after a
+    // new one has already retriggered doesn't cut the new one short.
+    void NoteOn(uint8_t note, uint8_t velocity);
+    void NoteOff(uint8_t note);
+    bool IsNoteActive() const { return held_note_ >= 0; }
+
+    // --- Size/Fill/Gap -- shared by BOTH the Grain and Scan layers
+    // (they're reading the same kind of grains, just from different
+    // anchors) ------------------------------------------------------
+    void  SetSize01(float v01);
+    float GetSize01() const { return size01_; }
+    // Quantized to [0, kGrainsPerVoice] active slots per cluster -- 0 is
+    // silence (no grains scheduled at all), matching the old engine's
+    // GrainCount convention, just renamed to the reference device's
+    // "Fill" vocabulary.
+    void  SetFill01(float v01);
+    float GetFill01() const { return (float)fill_count_ / (float)kGrainsPerVoice; }
+    int   GetFill() const { return fill_count_; }
+    // 0 = grains packed with no gap (hop = grain length / Fill), 1 =
+    // maximally sparse (real silence between them) -- old engine's
+    // Density01, renamed AND polarity-flipped (Density 1.0 was "packed",
+    // this project's own reference device labels the sparse end "Gap"
+    // going up, not down).
+    void  SetGap01(float v01);
+    float GetGap01() const { return gap01_; }
+
+    // --- Position (Grain layer's fixed anchor) -----------------------
+    void  SetPosition01(float v01);
+    float GetPosition01() const { return position01_; }
+
+    // --- Scan (Scan layer's sweep) -- same dead-zone-centered
+    // bidirectional curve the old engine used: center (0.5, default) is
+    // off, above/below picks which end it heads toward first, speed
+    // proportional to distance from center. ---------------------------
+    void  SetScan01(float v01);
+    float GetScan01() const { return scan01_; }
+    void  SetScanStart01(float v01);
+    float GetScanStart01() const { return scan_start01_; }
+    void  SetScanEnd01(float v01);
+    float GetScanEnd01() const { return scan_end01_; }
+
+    // --- Tune / Map to Note -- both restored from the old engine
+    // unchanged: Tune is a fixed per-grain pitch offset independent of
+    // note, Map to Note additionally tracks the held note's own pitch
+    // (12-TET against middle C) on top of Tune. ------------------------
+    void  SetGrainTuneSemitones01(float v01); // quantized to whole semitones, +-24
+    float GetGrainTuneSemitones01() const;
+    int   GetGrainTuneSemitones() const { return grain_tune_semitones_; }
+    void  SetGrainFollowsNote(bool on) { grain_follows_note_ = on; }
+    bool  GetGrainFollowsNote() const { return grain_follows_note_; }
+
+    // --- Direction (per-grain read direction; Spray dropped this
+    // redesign -- was a source of real jitter bugs in the old engine) --
+    enum class Direction
+    {
+        Forward,
+        Reverse,
+        Random
+    };
+    void      SetDirection01(float v01); // quantized to the 3 states above
+    Direction GetDirection() const { return direction_; }
+    float     GetDirection01() const;
+
+    // --- Note-level ADSR -- shapes the whole voice's loudness across a
+    // held note, layered ON TOP of (not instead of) the fixed per-grain
+    // Hann window below (that only prevents clicks within a grain, it
+    // has no swell-in/tail-off of its own). Same curved-seconds
+    // convention as PadSynth's own ADSR. -------------------------------
+    void  SetAttack01(float v01);
+    float GetAttack01() const { return attack01_; }
+    float GetAttackSeconds() const;
+    void  SetDecay01(float v01);
+    float GetDecay01() const { return decay01_; }
+    float GetDecaySeconds() const;
+    void  SetSustain01(float v01);
+    float GetSustain01() const { return sustain01_; }
+    void  SetRelease01(float v01);
+    float GetRelease01() const { return release01_; }
+    float GetReleaseSeconds() const;
+
+    // --- Bus filter (post-mix, same shape as PadSynth's own) ----------
+    void       SetFilterMode(FilterMode m) { filter_mode_ = m; }
+    FilterMode GetFilterMode() const { return filter_mode_; }
+    void       SetFilterCutoff01(float v01) { filter_cutoff01_ = v01; }
+    float      GetFilterCutoff01() const { return filter_cutoff01_; }
+    void       SetFilterResonance01(float v01) { filter_res01_ = v01; }
+    float      GetFilterResonance01() const { return filter_res01_; }
+
+    // --- Grain/Scan mixer -- independent level for each layer before
+    // they sum, so Scan can be blended in under the main texture (or
+    // soloed, or muted) rather than always at a fixed ratio. -----------
+    void  SetGrainVolume01(float v01) { grain_volume01_ = v01; }
+    float GetGrainVolume01() const { return grain_volume01_; }
+    void  SetScanVolume01(float v01) { scan_volume01_ = v01; }
+    float GetScanVolume01() const { return scan_volume01_; }
+
+    // --- Overall output level -- applied AFTER the Grain/Scan mix above,
+    // a separate control from it (this is "how loud is Grains in the
+    // master mix", not "how loud is Scan relative to Grain"). Needed for
+    // the Global Mixer page, which controls Pad's and Grains' levels
+    // side by side the same way PadSynth::SetOutputLevel01() already
+    // does for Pad. -----------------------------------------------------
+    void  SetOutputLevel01(float v01);
+    float GetOutputLevel01() const { return output_level01_; }
+
+    // --- Reverb send -- was previously an unconditional full send (no
+    // control at all); now a real continuous knob, reachable from both
+    // this engine's own Mix page and Global:Mixer -- same underlying
+    // value either way (this field), so changing it in one place updates
+    // the other with no extra sync needed, same as PadSynth's own
+    // reverb send.
+    void  SetReverbSend01(float v01) { reverb_send01_ = v01; }
+    float GetReverbSend01() const { return reverb_send01_; }
+
+    // Renders `size` samples, WRITES into out_l/out_r (see PadSynth's own
+    // Process() doc comment for why -- main.cpp needs this exact signal
+    // for more than one consumer). ADDS into reverb_send_l/r (already
+    // zeroed by the caller for this block, same convention every other
+    // reverb-send contributor in main.cpp uses).
+    void Process(size_t      size,
+                 float*      out_l,
+                 float*      out_r,
+                 float*      reverb_send_l,
+                 float*      reverb_send_r);
+
+    // --- Visuals ---------------------------------------------------
+    // Live anchor position (0..1 across the source), for the grain-marker
+    // display -- the Grain layer's is fixed (== Position) while a note
+    // isn't sweeping anything; the Scan layer's moves every block.
+    float GetGrainAnchor01() const;
+    float GetScanAnchor01() const;
+    // Same "cached once in SetSource(), cheap to redraw from" convention
+    // as LooperLayer::GetWaveformPeaks() -- the whole-sample display
+    // needs the FULL buffer's peaks, unlike the old engine's zoomed-window
+    // view which only ever needed a small slice.
+    static constexpr int kWaveformCols = 63;
+    const float* GetWaveformPeaks() const { return waveform_peaks_; }
+
+    // Read-only access to whatever SetSource() currently points at --
+    // needed so a preset save can write the actual captured audio out
+    // (this engine doesn't own that buffer, see SetSource()'s own doc
+    // comment, so it can't save it itself).
+    const float* GetSourceL() const { return src_l_; }
+    const float* GetSourceR() const { return src_r_; }
+
+    // Flat snapshot of every knob-adjustable setting above (NOT the
+    // captured audio itself -- that's saved/loaded separately, see
+    // PerformanceStore::SaveGranularPreset()/LoadGranularPreset()), same
+    // "one place that knows how to capture/restore the whole instrument's
+    // state" idiom as PadSynth::PadPresetData.
+    struct GranularPresetData
+    {
+        float   size01            = 0.4f;
+        float   fill01            = 0.667f; // matches the class's own default fill_count_=2
+        float   gap01             = 0.1f;
+        float   position01        = 0.f;
+        float   scan01            = 0.5f; // center = off
+        float   scan_start01      = 0.f;
+        float   scan_end01        = 1.f;
+        float   grain_tune01      = 0.5f; // 0 semitones
+        bool    grain_follows_note = false;
+        float   direction01       = 0.1667f; // Forward
+        float   attack01          = 0.3f;
+        float   decay01           = 0.3f;
+        float   sustain01         = 0.8f;
+        float   release01         = 0.4f;
+        int32_t filter_mode       = (int32_t)FilterMode::Off;
+        float   filter_cutoff01   = 1.f;
+        float   filter_res01      = 0.f;
+        float   grain_volume01    = 0.8f;
+        float   scan_volume01     = 0.5f;
+    };
+    void               ApplyPreset(const GranularPresetData& p);
+    GranularPresetData CapturePreset() const;
+
+  private:
+    // 3-way overlap is the standard granular-synthesis compromise for a
+    // smooth, click-free texture at any grain size -- same constant/
+    // reasoning the old engine used, just no longer multiplied by a
+    // voice count (this is the whole engine's grain budget now, not one
+    // voice's out of kMaxVoices).
+    static constexpr int kGrainsPerVoice = 3;
+
+    struct Grain
+    {
+        bool  active    = false;
+        float phase     = 0.f; // 0..1 through the grain's own Hann window
+        float phase_inc = 0.f;
+        float read_pos  = 0.f; // absolute sample index into src_l_/src_r_
+        float read_inc  = 1.f; // signed -- direction + pitch combined
+        float gain      = 1.f;
+    };
+
+    // One of these per layer (Grain, Scan) -- identical mechanism, only
+    // the anchor each one is triggered against differs (see Process()).
+    struct GrainCluster
+    {
+        Grain grains[kGrainsPerVoice];
+        // Steal-safe hand-off, same convention as the old engine's
+        // Voice::release_grain -- a grain overwritten mid-envelope fades
+        // out here instead of an audible instant cut. One release slot
+        // PER grain slot (not just one shared slot) so ChokeGranularNote()
+        // can fade out every simultaneously-active grain independently
+        // when a new note interrupts a still-held one, not just whichever
+        // single grain happens to be getting stolen at that instant.
+        Grain release_grains[kGrainsPerVoice];
+        float release_fades[kGrainsPerVoice] = {};
+        float next_grain_countdown           = 0.f;
+    };
+
+    void  TriggerGrainInCluster(GrainCluster& c, float read_pos, float read_inc, float gain);
+    void  RenderGrain(Grain& g, float extra_gain, float& out_l, float& out_r) const;
+    // Sums a cluster's active grains + its release-fade grains into L/R,
+    // advancing/deactivating each as it goes.
+    void  RenderCluster(GrainCluster& c, float overlap_gain, float& out_l, float& out_r);
+    // Moves every currently-active grain in a cluster into its own
+    // release-fade slot (silencing the cluster's live grains without an
+    // audible click) -- called from NoteOn() when a genuinely different
+    // note interrupts one that's still sounding, so fast chord-like
+    // playing doesn't stack overlapping grain bursts from several notes
+    // at once (monophonic in more than just pitch-tracking).
+    void  ChokeCluster(GrainCluster& c);
+    float ComputeHopSamples() const; // shared by both clusters (same Size/Fill/Gap)
+    float ReadHann(float phase01) const;
+    float ResolveDirectionSign();
+
+    const float* src_l_   = nullptr;
+    const float* src_r_   = nullptr;
+    size_t       src_len_ = 0;
+    float        sample_rate_ = 48000.f;
+
+    int   held_note_ = -1;
+    float note_rate_ = 1.f; // 2^((note-60)/12), read live if grain_follows_note_
+    float note_gain_ = 1.f; // sqrt(velocity/127) taper, same as the old engine
+
+    GrainCluster grain_cluster_;
+    GrainCluster scan_cluster_;
+
+    float size01_     = 0.4f;
+    int   fill_count_ = 2;
+    float gap01_      = 0.1f;
+    static constexpr float kMinGrainMs      = 1.f;
+    static constexpr float kMaxGrainMs      = 500.f;
+    static constexpr float kMaxSparseFactor = 6.f; // same as the old engine's Density range
+
+    float position01_ = 0.f;
+
+    float scan01_              = 0.5f; // center = off
+    float scan_speed_          = 0.f;
+    float scan_initial_sign_   = 1.f;
+    float scan_start01_        = 0.f;
+    float scan_end01_          = 1.f;
+    float scan_position_samples_ = 0.f;
+    float scan_direction_sign_   = 1.f;
+    static constexpr float kMaxScanFractionPerSecond = 1.f;
+
+    int   grain_tune_semitones_ = 0;
+    float grain_tune_rate_      = 1.f; // 2^(semitones/12)
+    bool  grain_follows_note_   = false;
+
+    Direction direction_ = Direction::Forward;
+    uint32_t  rng_state_ = 0x9E3779B9u; // xorshift32 seed, same as the old engine
+
+    daisysp::Adsr adsr_;
+    float attack01_ = 0.3f, decay01_ = 0.3f, sustain01_ = 0.8f, release01_ = 0.4f;
+    static constexpr float kMinAdsrSeconds = 0.005f;
+    static constexpr float kMaxAdsrSeconds = 3.f;
+
+    daisysp::Svf filter_l_, filter_r_;
+    FilterMode   filter_mode_     = FilterMode::Off;
+    float        filter_cutoff01_ = 1.f;
+    float        filter_res01_    = 0.f;
+
+    float grain_volume01_  = 0.8f;
+    float scan_volume01_   = 0.5f;
+    float output_level01_  = 0.8f;
+    float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
+    float reverb_send01_   = 0.f; // was an unconditional full send before this existed
+
+    static constexpr int kHannTableSize = 256;
+    float hann_table_[kHannTableSize];
+
+    float waveform_peaks_[kWaveformCols] = {};
+};

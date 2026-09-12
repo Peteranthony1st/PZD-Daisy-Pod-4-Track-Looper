@@ -109,6 +109,14 @@ void LooperLayer::OnRecordButtonPressed(TempoClock& tempo)
     }
 }
 
+void LooperLayer::SetPaused(bool paused)
+{
+    if(paused && state_ == LayerState::Playing)
+        state_ = LayerState::Paused;
+    else if(!paused && state_ == LayerState::Paused)
+        state_ = LayerState::Playing;
+}
+
 void LooperLayer::OnRecordButtonLongPress(TempoClock& tempo)
 {
     switch(state_)
