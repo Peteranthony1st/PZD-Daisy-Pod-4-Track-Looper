@@ -50,6 +50,13 @@ void GranularEngine::SetOutputLevel01(float v01)
     output_level_ = powf(output_level01_, 2.5f) * 1.4f;
 }
 
+void GranularEngine::SetPan01(float v01)
+{
+    pan01_      = Clampf(v01, 0.f, 1.f);
+    pan_l_gain_ = 1.f - pan01_;
+    pan_r_gain_ = pan01_;
+}
+
 void GranularEngine::SetSource(const float* buf_l, const float* buf_r, size_t len)
 {
     src_l_   = buf_l;
@@ -212,7 +219,17 @@ void GranularEngine::SetGrainTuneSemitones01(float v01)
 
 float GranularEngine::GetGrainTuneSemitones01() const
 {
-    return ((float)(grain_tune_semitones_ + 24) + 0.5f) / 48.f;
+    // SetGrainTuneSemitones01() rounds v01*48 to the nearest integer
+    // before subtracting 24, so the 01 range that maps to a given
+    // semitone S is [(S+23.5)/48, (S+24.5)/48) -- this must return a
+    // value strictly inside that bucket, i.e. its center (S+24)/48, not
+    // its exclusive upper edge. An earlier version added another +0.5
+    // here (on top of the setter's own rounding), landing exactly on
+    // that upper edge -- Capture/Save round-tripping this straight back
+    // through the setter (see CapturePreset()/ApplyPreset()) then always
+    // rounded up into the NEXT semitone, so a saved-and-reloaded Grains
+    // preset always came back a semitone sharp.
+    return (float)(grain_tune_semitones_ + 24) / 48.f;
 }
 
 void GranularEngine::SetDirection01(float v01)
@@ -387,7 +404,16 @@ void GranularEngine::RenderGrain(Grain& g, float extra_gain, float& out_l, float
         idx0 = (int)src_len_ - 1;
         frac = 0.f;
     }
-    int   idx1 = idx0 + 1 < (int)src_len_ ? idx0 + 1 : 0;
+    // Clamp, don't wrap, at the buffer's last sample -- src_l_/src_r_
+    // isn't guaranteed to be a seamless loop (a captured loop layer
+    // usually is, by construction, but an imported one-shot sample
+    // almost never is), so interpolating straight from the last sample
+    // back to sample 0 here would fabricate a real discontinuity right
+    // in the middle of a grain's read, past the Hann window's own
+    // fade-out at the grain's actual start/end -- audible as a click,
+    // worse the more of the buffer a grain (or Scan, sweeping its
+    // anchor close to both ends) reads through.
+    int   idx1 = idx0 + 1 < (int)src_len_ ? idx0 + 1 : idx0;
     float l    = src_l_[idx0] * (1.f - frac) + src_l_[idx1] * frac;
     float r    = src_r_[idx0] * (1.f - frac) + src_r_[idx1] * frac;
     float env  = ReadHann(g.phase);
@@ -396,12 +422,15 @@ void GranularEngine::RenderGrain(Grain& g, float extra_gain, float& out_l, float
     out_r = r * env * g.gain * extra_gain;
 
     g.read_pos += g.read_inc;
-    if(g.read_pos >= (float)src_len_ || g.read_pos < 0.f)
-    {
-        g.read_pos = fmodf(g.read_pos, (float)src_len_);
-        if(g.read_pos < 0.f)
-            g.read_pos += (float)src_len_;
-    }
+    // Same clamp-not-wrap reasoning as idx1 above, for the grain's
+    // ongoing read position -- a grain that runs past either end just
+    // holds at that edge (silent-ish anyway, this close to the buffer
+    // boundary and to the grain's own natural end) instead of jumping to
+    // the opposite end of a buffer that was never meant to loop.
+    if(g.read_pos >= (float)src_len_)
+        g.read_pos = (float)src_len_ - 1.f;
+    else if(g.read_pos < 0.f)
+        g.read_pos = 0.f;
     g.phase += g.phase_inc;
     if(g.phase >= 1.f)
         g.active = false;
@@ -581,8 +610,8 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
             }
         }
 
-        fl *= output_level_;
-        fr *= output_level_;
+        fl *= output_level_ * pan_l_gain_;
+        fr *= output_level_ * pan_r_gain_;
 
         out_l[i] = fl;
         out_r[i] = fr;

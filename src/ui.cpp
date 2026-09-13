@@ -149,7 +149,9 @@ void Ui::Init(daisy::DaisyPod*              pod,
               float*                        granular_capture_buf_r,
               size_t                        granular_capture_capacity,
               volatile bool*                granular_capturing,
-              volatile size_t*              granular_capture_write_pos)
+              volatile size_t*              granular_capture_write_pos,
+              const float*                  master_scope_buf,
+              size_t                        master_scope_capacity)
 {
     pod_        = pod;
     disp_       = display;
@@ -167,6 +169,8 @@ void Ui::Init(daisy::DaisyPod*              pod,
     granular_capture_capacity_  = granular_capture_capacity;
     granular_capturing_         = granular_capturing;
     granular_capture_write_pos_ = granular_capture_write_pos;
+    master_scope_buf_      = master_scope_buf;
+    master_scope_capacity_ = master_scope_capacity;
 
     // Same curve ApplyKnobs() uses for knob1 on Home, applied once here
     // so master_volume_ actually matches master_volume01_'s starting
@@ -174,6 +178,9 @@ void Ui::Init(daisy::DaisyPod*              pod,
     master_volume_ = powf(master_volume01_, 2.5f) * 1.43f;
     if(master_volume_ < 0.f)
         master_volume_ = 0.f;
+    // Same reasoning as master_volume_ just above, for Screen::Mixer's
+    // own Bypass channel volume.
+    SetBypassMixVolume01(bypass_mix_volume01_);
 
     // screen_ and last_knob_context_ both default to Home, so the
     // context-change check in ApplyKnobs() that normally calls this
@@ -219,6 +226,14 @@ void Ui::ApplyStartupDefaults()
     // its own comment above) -- re-seed now that the real starting
     // values are in place, same reasoning, same fix.
     SyncPickupTargets(KnobContext::Home);
+}
+
+void Ui::SetBypassMixVolume01(float v01)
+{
+    bypass_mix_volume01_ = Clampf(v01, 0.f, 1.f);
+    bypass_mix_volume_   = powf(bypass_mix_volume01_, 2.5f) * 1.4f;
+    if(bypass_mix_volume_ < 0.f)
+        bypass_mix_volume_ = 0.f;
 }
 
 void Ui::Update(const UiControlEvents& events)
@@ -285,7 +300,10 @@ void Ui::HandleEncoder(const UiControlEvents& events)
                 file_slots_dirty_ = true; // re-scan the card on entry
             if(new_page == GlobalPage::Export && global_page_ != GlobalPage::Export)
                 export_status_[0] = '\0'; // clear any stale result on entry
-            global_page_ = new_page;
+            if(new_page == GlobalPage::SdMgmt && global_page_ != GlobalPage::SdMgmt)
+                sd_mgmt_in_folder_ = false; // always start back at folder-select on entry
+            global_page_    = new_page;
+            save_load_mode_ = SaveLoadMode::Idle; // leaving/entering any page resets this
         }
         else if(screen_ == Screen::Pad)
         {
@@ -295,6 +313,7 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             if(new_pad_page == PadParamPage::Preset && pad_param_page_ != PadParamPage::Preset)
                 pad_preset_slots_dirty_ = true; // re-scan the card on entry
             pad_param_page_ = new_pad_page;
+            save_load_mode_ = SaveLoadMode::Idle; // same reset as Global:File above
         }
         else if(screen_ == Screen::Granular)
         {
@@ -305,6 +324,30 @@ void Ui::HandleEncoder(const UiControlEvents& events)
                && granular_param_page_ != GranularParamPage::Preset)
                 granular_preset_slots_dirty_ = true; // re-scan the card on entry
             granular_param_page_ = new_granular_page;
+            save_load_mode_      = SaveLoadMode::Idle; // same reset as Global:File above
+        }
+        else if(screen_ == Screen::Mixer)
+        {
+            int n            = kNumMixerPositions;
+            int new_position = ((mixer_position_ + inc) % n + n) % n;
+            if(new_position != mixer_position_)
+            {
+                mixer_position_ = new_position;
+                // Same reset/reseed CurrentKnobContext()'s own change
+                // would normally trigger automatically in ApplyKnobs()
+                // (see MixerVolPan/MixerReverb/MixerMaster's own comment
+                // for why this needs doing explicitly here instead) --
+                // without this, turning past a channel whose knob context
+                // enum doesn't itself change (any of the 7 non-Master
+                // channels) would leave the knobs pointing at the OLD
+                // channel's cached pickup values instead of the new one's.
+                KnobContext ctx        = CurrentKnobContext();
+                size_t      ctx_index  = (size_t)ctx;
+                k1_pickup_engaged_[ctx_index] = false;
+                k2_pickup_engaged_[ctx_index] = false;
+                SyncPickupTargets(ctx);
+                last_knob_context_ = ctx;
+            }
         }
     }
 
@@ -367,10 +410,30 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             // so this page's click can't accidentally trigger a second,
             // different "stop the loop" mechanism.
         }
+        else if(!encoder_long_fired_ && screen_ == Screen::Global
+                && global_page_ == GlobalPage::Mixer)
+        {
+            // Global:Mixer is an entry point into Screen::Mixer, same
+            // convention Global:Pad/Global:Granular's own click uses.
+            screen_ = Screen::Mixer;
+        }
         else if(!encoder_long_fired_ && screen_ == Screen::Global)
         {
             TogglePauseAll();
         }
+        else if(!encoder_long_fired_
+                && (screen_ == Screen::Pad || screen_ == Screen::Granular))
+        {
+            // Same mute-all-loop-layers click as every Global page's own
+            // (TogglePauseAll()) -- Pad/Granular have no click-to-drill-in
+            // of their own (that's the encoder's job from Global instead),
+            // so there's nothing else useful for their click to do either.
+            TogglePauseAll();
+        }
+        // Screen::Mixer: rotate already picks the stop (see
+        // HandleEncoder()'s own rotate handling above, including the
+        // Scope stop) -- click is unused here, same as every other
+        // Pad/Granular-style screen.
         encoder_long_fired_ = false;
     }
 
@@ -434,49 +497,122 @@ void Ui::HandleButton2(const UiControlEvents& events)
             button2_long_fired_ = false;
         }
     }
-    else if(screen_ == Screen::Global && global_page_ == GlobalPage::File)
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::SdMgmt
+            && sd_mgmt_in_folder_)
     {
-        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_
-           && file_slot_count_ > 0)
+        // Longer hold than every other confirm gesture here (see
+        // kSdMgmtDeleteHoldMs's own comment) -- delete has no undo.
+        if(b.Pressed() && b.TimeHeldMs() > kSdMgmtDeleteHoldMs && !button2_long_fired_)
         {
             button2_long_fired_ = true;
-            TriggerLoad();
+            TriggerSdMgmtDelete();
         }
         if(events.btn2_released)
         {
-            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && file_slot_count_ > 0)
+            if(!button2_long_fired_ && events.btn2_held_ms > kSdMgmtDeleteHoldMs)
+                TriggerSdMgmtDelete();
+            button2_long_fired_ = false;
+        }
+    }
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::File)
+    {
+        // Button2 confirms whichever of the two revealed states is
+        // active -- Save (ChoosingSave) or Load (BrowsingLoad) -- so
+        // Button1's own tap is free to always mean "Back" once inside
+        // either one (see OnButton1Short()), same as SD MGMT's own
+        // Back/Hold=Duplicate split.
+        bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+        // BrowsingLoad only has something to confirm once either "New" is
+        // picked at the top-level chooser or the numbered list has been
+        // drilled into (see ApplyKnobs()'s own BrowsingLoad handling and
+        // load_new_selected_/load_browsing_files_'s own comment) -- at
+        // the chooser with "Files" picked there's no specific target yet,
+        // so a hold there does nothing.
+        bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
+                                 && (load_browsing_files_ || load_new_selected_);
+        bool can_confirm      = can_confirm_save || can_confirm_load;
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
+        {
+            button2_long_fired_ = true;
+            if(can_confirm_save)
+                TriggerSave(save_as_new_);
+            else
                 TriggerLoad();
-            else if(!button2_long_fired_)
+            save_load_mode_ = SaveLoadMode::Idle;
+        }
+        if(events.btn2_released)
+        {
+            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && can_confirm)
             {
-                // Short tap: explicit "save as new", alongside Button1's
-                // own short-tap "smart save" -- see TriggerSave()'s
-                // force_new doc comment for why this needs no
-                // hold-to-confirm (never overwrites/destroys anything).
+                if(can_confirm_save)
+                    TriggerSave(save_as_new_);
+                else
+                    TriggerLoad();
+                save_load_mode_ = SaveLoadMode::Idle;
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
+            {
+                // Short tap from Idle only: reveal the file list to
+                // browse (Button2's own label becomes "Hold=Load" to
+                // commit). While already in ChoosingSave/BrowsingLoad, a
+                // short tap here does nothing new -- only the hold above
+                // commits, and Button1's tap is "Back".
                 if(!PerformanceStore::IsCardPresent())
                     PerformanceStore::Remount();
                 else
-                    TriggerSave(/*force_new=*/true);
+                {
+                    save_load_mode_     = SaveLoadMode::BrowsingLoad;
+                    load_new_selected_  = false;
+                    load_browsing_files_ = false;
+                }
             }
             button2_long_fired_ = false;
         }
     }
     else if(screen_ == Screen::Pad && pad_param_page_ == PadParamPage::Preset)
     {
-        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_)
+        // Button2 confirms whichever of Save/Load is revealed -- see
+        // Global:File's own Button2 handling for the shared SaveLoadMode
+        // this mirrors.
+        bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+        // BrowsingLoad only has something to confirm once either "New" is
+        // picked at the top-level chooser or the numbered list has been
+        // drilled into (see Global:File's own can_confirm_load comment).
+        bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
+                                 && (load_browsing_files_ || load_new_selected_);
+        bool can_confirm      = can_confirm_save || can_confirm_load;
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
         {
             button2_long_fired_ = true;
-            TriggerLoadPadPreset();
+            if(can_confirm_save)
+                TriggerSavePadPreset(save_as_new_);
+            else
+                TriggerLoadPadPreset();
+            save_load_mode_ = SaveLoadMode::Idle;
         }
         if(events.btn2_released)
         {
-            if(!button2_long_fired_ && events.btn2_held_ms > 800.f)
-                TriggerLoadPadPreset();
-            else if(!button2_long_fired_)
+            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && can_confirm)
             {
+                if(can_confirm_save)
+                    TriggerSavePadPreset(save_as_new_);
+                else
+                    TriggerLoadPadPreset();
+                save_load_mode_ = SaveLoadMode::Idle;
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
+            {
+                // Short tap from Idle only: reveal the preset list to
+                // browse (Button2's own label becomes "Hold=Load" to
+                // commit).
                 if(!PerformanceStore::IsCardPresent())
                     PerformanceStore::Remount();
                 else
-                    TriggerSavePadPreset(/*force_new=*/true);
+                {
+                    save_load_mode_      = SaveLoadMode::BrowsingLoad;
+                    load_new_selected_   = false;
+                    load_browsing_files_ = false;
+                }
             }
             button2_long_fired_ = false;
         }
@@ -497,6 +633,24 @@ void Ui::HandleButton2(const UiControlEvents& events)
             {
                 if(!button2_long_fired_ && events.btn2_held_ms > 800.f)
                     TriggerGranularCaptureFromLayer();
+                button2_long_fired_ = false;
+            }
+        }
+        else if(granular_capture_source_ == -2)
+        {
+            // Import -- same hold-to-confirm-then-fire-once gesture as
+            // From Layer above (a real SD read + decode, not instant, but
+            // still a single fire-once action, not a live-recording
+            // gesture like Direct Record below).
+            if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_)
+            {
+                button2_long_fired_ = true;
+                TriggerGranularImport();
+            }
+            if(events.btn2_released)
+            {
+                if(!button2_long_fired_ && events.btn2_held_ms > 800.f)
+                    TriggerGranularImport();
                 button2_long_fired_ = false;
             }
         }
@@ -529,21 +683,47 @@ void Ui::HandleButton2(const UiControlEvents& events)
     }
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Preset)
     {
-        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_)
+        // Button2 confirms whichever of Save/Load is revealed -- see
+        // Global:File's own Button2 handling for the shared SaveLoadMode
+        // this mirrors.
+        bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+        // BrowsingLoad only has something to confirm once either "New" is
+        // picked at the top-level chooser or the numbered list has been
+        // drilled into (see Global:File's own can_confirm_load comment).
+        bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
+                                 && (load_browsing_files_ || load_new_selected_);
+        bool can_confirm      = can_confirm_save || can_confirm_load;
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
         {
             button2_long_fired_ = true;
-            TriggerLoadGranularPreset();
+            if(can_confirm_save)
+                TriggerSaveGranularPreset(save_as_new_);
+            else
+                TriggerLoadGranularPreset();
+            save_load_mode_ = SaveLoadMode::Idle;
         }
         if(events.btn2_released)
         {
-            if(!button2_long_fired_ && events.btn2_held_ms > 800.f)
-                TriggerLoadGranularPreset();
-            else if(!button2_long_fired_)
+            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && can_confirm)
             {
+                if(can_confirm_save)
+                    TriggerSaveGranularPreset(save_as_new_);
+                else
+                    TriggerLoadGranularPreset();
+                save_load_mode_ = SaveLoadMode::Idle;
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
+            {
+                // Short tap from Idle only: reveal the preset list to
+                // browse.
                 if(!PerformanceStore::IsCardPresent())
                     PerformanceStore::Remount();
                 else
-                    TriggerSaveGranularPreset(/*force_new=*/true);
+                {
+                    save_load_mode_      = SaveLoadMode::BrowsingLoad;
+                    load_new_selected_   = false;
+                    load_browsing_files_ = false;
+                }
             }
             button2_long_fired_ = false;
         }
@@ -635,18 +815,49 @@ void Ui::OnButton1Short()
                 scrub_mode_active_ = !scrub_mode_active_;
             else if(global_page_ == GlobalPage::File)
             {
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                {
+                    // Back out of the numbered file list to the Files/New
+                    // chooser (see load_browsing_files_'s own comment).
+                    load_browsing_files_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
+                {
+                    // "Files" is highlighted at the chooser -- drill into
+                    // the numbered list (Knob1 now scrolls it directly,
+                    // see ApplyKnobs()).
+                    load_browsing_files_ = true;
+                }
+                else if(save_load_mode_ != SaveLoadMode::Idle)
+                {
+                    // Back -- covers ChoosingSave, and the Load chooser
+                    // with "New" highlighted (nothing further to drill
+                    // into there). Button2 owns confirming whichever of
+                    // Save/Load is currently revealed (see
+                    // HandleButton2()), so Button1's tap here is
+                    // otherwise always just a way out, same as SD MGMT's
+                    // own Back.
+                    save_load_mode_ = SaveLoadMode::Idle;
+                }
                 // No card: this hand-wired socket has no card-detect pin
                 // (see PerformanceStore::Remount()'s doc comment), so a
                 // card swapped out and back in needs an explicit re-mount
                 // attempt -- repurpose Button1 for that instead of Save
                 // while there's nothing to save to anyway.
-                if(!PerformanceStore::IsCardPresent())
+                else if(!PerformanceStore::IsCardPresent())
                 {
                     PerformanceStore::Remount();
                     file_slots_dirty_ = true; // re-scan once actually mounted
                 }
                 else
-                    TriggerSave();
+                {
+                    // Reveal the Overwrite/Save New choice -- Button2's
+                    // hold now confirms it (see HandleButton2()).
+                    // Default to whichever's actually available:
+                    // Overwrite only makes sense if something's loaded.
+                    save_load_mode_ = SaveLoadMode::ChoosingSave;
+                    save_as_new_    = loaded_slot_ < 0;
+                }
             }
             else if(global_page_ == GlobalPage::Export)
             {
@@ -660,6 +871,7 @@ void Ui::OnButton1Short()
             else if(global_page_ == GlobalPage::Granular)
                 granular_enabled_ = !granular_enabled_;
             else if(global_page_ == GlobalPage::Looper)
+            {
                 looper_enabled_ = !looper_enabled_;
                 // Switching off resets the shared tempo clock's own
                 // phase (bar/beat position, count-in state, click
@@ -671,8 +883,35 @@ void Ui::OnButton1Short()
                 // happened to be.
                 if(!looper_enabled_ && tempo_)
                     tempo_->ResetPhase();
-            else if(global_page_ == GlobalPage::Mixer)
-                global_mixer_target_reverb_ = false; // knobs -> Output Level
+            }
+            else if(global_page_ == GlobalPage::SdMgmt)
+            {
+                if(!sd_mgmt_in_folder_)
+                {
+                    // Drill into the highlighted folder -- force a fresh
+                    // scan (same "re-scan on entry" idiom as Global:File)
+                    // since files may have changed since the last visit.
+                    sd_mgmt_in_folder_ = true;
+                    sd_mgmt_cursor_    = 0;
+                    sd_mgmt_status_[0] = '\0';
+                    switch(sd_mgmt_folder_)
+                    {
+                        case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
+                        case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+                        case SdMgmtFolder::GranularPresets:
+                            granular_preset_slots_dirty_ = true;
+                            break;
+                        default: break;
+                    }
+                }
+                else
+                {
+                    // Back up to folder-select -- Button1's hold means
+                    // Duplicate once already browsing files (see
+                    // OnButton1Long()), so its tap is free to mean this.
+                    sd_mgmt_in_folder_ = false;
+                }
+            }
             break;
         case Screen::Pad:
             if(pad_param_page_ == PadParamPage::ADSR)
@@ -694,10 +933,34 @@ void Ui::OnButton1Short()
             }
             else if(pad_param_page_ == PadParamPage::Preset)
             {
-                if(!PerformanceStore::IsCardPresent())
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                {
+                    // Back out of the numbered list to the Files/New
+                    // chooser -- see Global:File's own comment.
+                    load_browsing_files_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
+                {
+                    // "Files" is highlighted -- drill into the numbered
+                    // list (Knob1 now scrolls it directly).
+                    load_browsing_files_ = true;
+                }
+                else if(save_load_mode_ != SaveLoadMode::Idle)
+                {
+                    // Back -- Button2 confirms Save/Load (see
+                    // HandleButton2()), so this tap always just returns
+                    // to the page's own idle state, same as Global:File.
+                    save_load_mode_ = SaveLoadMode::Idle;
+                }
+                else if(!PerformanceStore::IsCardPresent())
                     PerformanceStore::Remount();
                 else
-                    TriggerSavePadPreset(false);
+                {
+                    // Reveal the Overwrite/Save New choice -- Button2's
+                    // hold now confirms it (see HandleButton2()).
+                    save_load_mode_ = SaveLoadMode::ChoosingSave;
+                    save_as_new_    = pad_loaded_preset_slot_ <= PadSynth::kNumFactoryPresets;
+                }
             }
             break;
         case Screen::Granular:
@@ -719,19 +982,51 @@ void Ui::OnButton1Short()
             else if(granular_param_page_ == GranularParamPage::Capture)
             {
                 // Cycles Direct Record -> Layer 1 -> ... -> Layer
-                // num_layers_ -> Direct Record.
+                // num_layers_ -> Import -> Direct Record. The final
+                // Import(-2) -> Direct(-1) step happens for free on the
+                // NEXT tap via plain integer ++ -- only the "just past
+                // the last layer" transition needs an explicit redirect.
                 granular_capture_source_++;
                 if(granular_capture_source_ >= num_layers_)
-                    granular_capture_source_ = -1;
+                    granular_capture_source_ = -2;
+                if(granular_capture_source_ == -2)
+                    granular_import_files_dirty_ = true; // re-scan IMPORT/ on entry
                 granular_capture_status_[0] = '\0'; // stale result from the other source
             }
             else if(granular_param_page_ == GranularParamPage::Preset)
             {
-                if(!PerformanceStore::IsCardPresent())
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                {
+                    // Back out of the numbered list to the Files/New
+                    // chooser -- see Global:File's own comment.
+                    load_browsing_files_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
+                {
+                    // "Files" is highlighted -- drill into the numbered
+                    // list (Knob1 now scrolls it directly).
+                    load_browsing_files_ = true;
+                }
+                else if(save_load_mode_ != SaveLoadMode::Idle)
+                {
+                    // Back -- Button2 confirms Save/Load (see
+                    // HandleButton2()), so this tap always just returns
+                    // to the page's own idle state, same as Global:File.
+                    save_load_mode_ = SaveLoadMode::Idle;
+                }
+                else if(!PerformanceStore::IsCardPresent())
                     PerformanceStore::Remount();
                 else
-                    TriggerSaveGranularPreset();
+                {
+                    // Reveal the Overwrite/Save New choice -- Button2's
+                    // hold now confirms it (see HandleButton2()).
+                    save_load_mode_ = SaveLoadMode::ChoosingSave;
+                    save_as_new_    = granular_loaded_preset_slot_ <= 0;
+                }
             }
+            break;
+        case Screen::Mixer:
+            mixer_target_reverb_ = false; // knobs -> Volume+Pan (ignored on Master)
             break;
     }
 }
@@ -739,15 +1034,18 @@ void Ui::OnButton1Short()
 void Ui::OnButton1Long()
 {
     // Long-press is only meaningful on the transport (arm to record /
-    // start overdub) and, on Global:File, as the hold-to-confirm gesture
-    // for starting a new performance -- everywhere else a long hold does
-    // nothing extra.
+    // start overdub) and SD MGMT's own hold-to-duplicate -- File/Pad
+    // Preset/Grains Preset don't use Button1's hold for anything any
+    // more (New is reachable from the Load browse list's own trailing
+    // "New" entry instead, see TriggerLoad()/TriggerNewPadPreset()/
+    // TriggerNewGranularPreset()), so a long hold there does nothing.
     if(screen_ == Screen::Home)
         layers_[cursor_layer_].OnRecordButtonLongPress(*tempo_);
     else if(screen_ == Screen::Layer && layer_page_ == LayerPage::Status)
         Cur().OnRecordButtonLongPress(*tempo_);
-    else if(screen_ == Screen::Global && global_page_ == GlobalPage::File)
-        TriggerNew();
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::SdMgmt
+            && sd_mgmt_in_folder_)
+        TriggerSdMgmtDuplicate();
 }
 
 void Ui::OnButton1Release()
@@ -780,8 +1078,8 @@ void Ui::OnButton2Short()
         granular_adsr_target_sr_ = true; // knobs -> Sustain/Release
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Mix)
         granular_mix_target_reverb_ = true; // knobs -> Reverb Send
-    else if(screen_ == Screen::Global && global_page_ == GlobalPage::Mixer)
-        global_mixer_target_reverb_ = true; // knobs -> Reverb Send
+    else if(screen_ == Screen::Mixer)
+        mixer_target_reverb_ = true; // knobs -> Reverb Send (ignored on Master)
     // File's and Pad Preset's short-tap behavior (Save As New) is
     // handled directly in HandleButton2() instead, alongside their own
     // hold-to-Load logic -- see there. All other screens: Button2 is
@@ -817,15 +1115,15 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Pad: return KnobContext::GlobalPad;
                 case GlobalPage::Granular: return KnobContext::GlobalGranular;
                 case GlobalPage::Looper: return KnobContext::GlobalLooper;
-                case GlobalPage::Mixer:
-                    return global_mixer_target_reverb_ ? KnobContext::GlobalMixerReverb
-                                                          : KnobContext::GlobalMixer;
+                case GlobalPage::Mixer: return KnobContext::GlobalMixer;
+                case GlobalPage::SdMgmt: return KnobContext::GlobalSdMgmt;
                 default: return KnobContext::GlobalTempo;
             }
         case Screen::Pad:
             switch(pad_param_page_)
             {
                 case PadParamPage::Tone: return KnobContext::PadTone;
+                case PadParamPage::Tune: return KnobContext::PadTune;
                 case PadParamPage::ADSR:
                     return pad_adsr_target_sr_ ? KnobContext::PadEnvSR : KnobContext::PadEnvAD;
                 case PadParamPage::Chorus: return KnobContext::PadChorus;
@@ -857,6 +1155,12 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GranularParamPage::Preset: return KnobContext::GranularPreset;
                 default: return KnobContext::GranularGrainSizeFill;
             }
+        case Screen::Mixer:
+            if(mixer_position_ >= kNumMixerChannels) // Scope stop
+                return KnobContext::MixerNoKnobs;
+            if(mixer_position_ == kNumMixerChannels - 1) // Master
+                return KnobContext::MixerMaster;
+            return mixer_target_reverb_ ? KnobContext::MixerReverb : KnobContext::MixerVolPan;
     }
     return KnobContext::Home;
 }
@@ -921,20 +1225,18 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalPad: break; // entry point only -- see Screen::Pad instead
         case KnobContext::GlobalGranular: break; // entry point only -- see Screen::Granular instead
         case KnobContext::GlobalLooper: break; // no continuous knobs, Button1 toggle only
-        case KnobContext::GlobalMixer:
-            k1_pickup_raw_[i] = pad_synth_ ? pad_synth_->GetOutputLevel01() : 0.f;
-            k2_pickup_raw_[i] = granular_ ? granular_->GetOutputLevel01() : 0.f;
-            break;
-        case KnobContext::GlobalMixerReverb:
-            k1_pickup_raw_[i] = pad_synth_ ? pad_synth_->GetReverbSend01() : 0.f;
-            k2_pickup_raw_[i] = granular_ ? granular_->GetReverbSend01() : 0.f;
-            break;
+        case KnobContext::GlobalMixer: break; // entry point only -- see Screen::Mixer instead
+        case KnobContext::GlobalSdMgmt: break; // browses a list directly, no pickup used
         case KnobContext::PadTone:
             if(pad_synth_)
             {
                 k1_pickup_raw_[i] = pad_synth_->GetRegistration01();
                 k2_pickup_raw_[i] = pad_synth_->GetOscGain01();
             }
+            break;
+        case KnobContext::PadTune:
+            if(pad_synth_)
+                k1_pickup_raw_[i] = pad_synth_->GetTuneSemitones01();
             break;
         case KnobContext::PadEnvAD:
             if(pad_synth_)
@@ -1043,13 +1345,25 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             k2_pickup_raw_[i] = granular_trim_end01_;
             break;
         case KnobContext::GranularPreset: break; // browses a list directly, no pickup used
+        case KnobContext::MixerVolPan:
+            k1_pickup_raw_[i] = MixerGetVolume01(mixer_position_);
+            k2_pickup_raw_[i] = MixerGetPan01(mixer_position_);
+            break;
+        case KnobContext::MixerReverb:
+            k1_pickup_raw_[i] = MixerGetSend01(mixer_position_);
+            break;
+        case KnobContext::MixerMaster:
+            k1_pickup_raw_[i] = master_volume01_;
+            k2_pickup_raw_[i] = reverb_size01_;
+            break;
+        case KnobContext::MixerNoKnobs: break; // Scope stop -- no continuous knobs
         default: break;
     }
 }
 
 bool Ui::KnobPickUp(float raw, float& stored_raw, bool& engaged)
 {
-    constexpr float kKnobPickupEpsilon = 0.02f;
+    constexpr float kKnobPickupEpsilon = 0.04f;
     if(!engaged)
     {
         if(fabsf(raw - stored_raw) > kKnobPickupEpsilon)
@@ -1237,33 +1551,66 @@ void Ui::ApplyKnobs()
             }
             else if(global_page_ == GlobalPage::File)
             {
-                // Knob1 browses the list of existing saved slots (the
-                // Load target) -- discretized, not a pickup-tracked
-                // continuous value, since it's selecting one of a small
-                // number of list items rather than dialing a parameter.
-                if(file_slot_count_ > 0)
+                if(save_load_mode_ == SaveLoadMode::ChoosingSave)
                 {
-                    int idx = (int)(Clampf(k1, 0.f, 1.f) * file_slot_count_);
-                    if(idx >= file_slot_count_)
-                        idx = file_slot_count_ - 1;
-                    file_cursor_ = idx;
+                    // Overwrite is only a real option once something's
+                    // actually loaded -- otherwise force Save New so
+                    // Knob1 can't land on a choice that doesn't exist.
+                    save_as_new_ = loaded_slot_ < 0 ? true : k1 >= 0.5f;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad)
+                {
+                    if(!load_browsing_files_)
+                    {
+                        // Top-level chooser (mirrors ChoosingSave's own
+                        // Overwrite/Save New pick above) -- forced to New
+                        // when there's nothing to browse, same "can't
+                        // select what doesn't exist" reasoning.
+                        load_new_selected_ = file_slot_count_ == 0 ? true : k1 >= 0.5f;
+                    }
+                    else if(file_slot_count_ > 0)
+                    {
+                        // Drilled into the numbered list (Button1's own
+                        // tap, see OnButton1Short()) -- discretized
+                        // browse, not pickup-tracked, same idiom as
+                        // every other list-browse knob in this project.
+                        int idx = (int)(Clampf(k1, 0.f, 1.f) * file_slot_count_);
+                        if(idx >= file_slot_count_)
+                            idx = file_slot_count_ - 1;
+                        file_cursor_ = idx;
+                    }
                 }
             }
-            else if(global_page_ == GlobalPage::Mixer)
+            // (GlobalPage::Mixer has no knobs of its own any more -- entry
+            // point only, same as GlobalPage::Pad/Granular; see
+            // Screen::Mixer for the real editing surface. No branch
+            // needed for it here.)
+            else if(global_page_ == GlobalPage::SdMgmt)
             {
-                if(!global_mixer_target_reverb_)
+                if(!sd_mgmt_in_folder_)
                 {
-                    if(pad_synth_ && KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
-                        pad_synth_->SetOutputLevel01(k1);
-                    if(granular_ && KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        granular_->SetOutputLevel01(k2);
+                    // Knob1 picks which folder -- discretized among the 3
+                    // categories, same idiom as every other list-browse
+                    // knob in this project.
+                    int n   = (int)SdMgmtFolder::kCount;
+                    int idx = (int)(Clampf(k1, 0.f, 1.f) * n);
+                    if(idx >= n)
+                        idx = n - 1;
+                    sd_mgmt_folder_ = (SdMgmtFolder)idx;
                 }
                 else
                 {
-                    if(pad_synth_ && KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
-                        pad_synth_->SetReverbSend01(k1);
-                    if(granular_ && KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        granular_->SetReverbSend01(k2);
+                    int count = 0;
+                    SdMgmtSlots(&count);
+                    if(count > 0)
+                    {
+                        int idx = (int)(Clampf(k1, 0.f, 1.f) * count);
+                        if(idx >= count)
+                            idx = count - 1;
+                        if(idx != sd_mgmt_cursor_)
+                            sd_mgmt_status_[0] = '\0';
+                        sd_mgmt_cursor_ = idx;
+                    }
                 }
             }
             break;
@@ -1278,6 +1625,10 @@ void Ui::ApplyKnobs()
                         pad_synth_->SetRegistration01(k1);
                     if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                         pad_synth_->SetOscGain01(k2);
+                    break;
+                case PadParamPage::Tune:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        pad_synth_->SetTuneSemitones01(k1);
                     break;
                 case PadParamPage::ADSR:
                     if(!pad_adsr_target_sr_)
@@ -1322,14 +1673,33 @@ void Ui::ApplyKnobs()
                 case PadParamPage::ModAssign: break; // no knobs, Button1 cycles it
                 case PadParamPage::Preset:
                 {
-                    // Knob1 browses the whole list directly (factory
-                    // presets first, then user slots) -- discretized, not
-                    // pickup-tracked, same idiom as Global:File's
-                    // file_cursor_.
-                    int total = PadSynth::kNumFactoryPresets + pad_preset_user_slot_count_;
-                    if(total > 0)
+                    if(save_load_mode_ == SaveLoadMode::ChoosingSave)
                     {
-                        int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        // Overwrite is only a real option once a real
+                        // user slot (not a factory one) is loaded.
+                        save_as_new_ = pad_loaded_preset_slot_ <= PadSynth::kNumFactoryPresets
+                                           ? true
+                                           : k1 >= 0.5f;
+                        break;
+                    }
+                    if(save_load_mode_ != SaveLoadMode::BrowsingLoad)
+                        break;
+                    if(!load_browsing_files_)
+                    {
+                        // Top-level chooser (mirrors ChoosingSave's own
+                        // Overwrite/Save New pick above) -- factory
+                        // presets always exist, so "Files" is always a
+                        // real option here.
+                        load_new_selected_ = k1 >= 0.5f;
+                        break;
+                    }
+                    // Drilled into the numbered list (Button1's own tap,
+                    // see OnButton1Short()) -- browses factory presets
+                    // first, then user slots, discretized/not
+                    // pickup-tracked, same idiom as Global:File's own.
+                    {
+                        int total = PadSynth::kNumFactoryPresets + pad_preset_user_slot_count_;
+                        int idx   = (int)(Clampf(k1, 0.f, 1.f) * total);
                         if(idx >= total)
                             idx = total - 1;
                         // Browsing again -- clear the last save/load
@@ -1414,6 +1784,27 @@ void Ui::ApplyKnobs()
                             granular_->SetReverbSend01(k1);
                     }
                     break;
+                case GranularParamPage::Capture:
+                {
+                    // Only meaningful in Import mode -- Direct Record and
+                    // From Layer have no continuous knob use here. Same
+                    // discretized "browse a list directly" idiom as
+                    // Preset's own knob below, no pickup tracking.
+                    if(granular_capture_source_ == -2)
+                    {
+                        int total = granular_import_file_count_;
+                        if(total > 0)
+                        {
+                            int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                            if(idx >= total)
+                                idx = total - 1;
+                            if(idx != granular_import_cursor_)
+                                granular_capture_status_[0] = '\0';
+                            granular_import_cursor_ = idx;
+                        }
+                    }
+                    break;
+                }
                 case GranularParamPage::Trim:
                 {
                     bool changed = false;
@@ -1433,14 +1824,32 @@ void Ui::ApplyKnobs()
                 }
                 case GranularParamPage::Preset:
                 {
-                    // Knob1 browses existing saves directly -- discretized,
-                    // not pickup-tracked, same idiom as Global:File's own
+                    if(save_load_mode_ == SaveLoadMode::ChoosingSave)
+                    {
+                        save_as_new_ = granular_loaded_preset_slot_ <= 0 ? true : k1 >= 0.5f;
+                        break;
+                    }
+                    if(save_load_mode_ != SaveLoadMode::BrowsingLoad)
+                        break;
+                    if(!load_browsing_files_)
+                    {
+                        // Top-level chooser (mirrors ChoosingSave's own
+                        // Overwrite/Save New pick above) -- forced to New
+                        // when there's nothing to browse, same "can't
+                        // select what doesn't exist" reasoning.
+                        load_new_selected_
+                            = granular_preset_user_slot_count_ == 0 ? true : k1 >= 0.5f;
+                        break;
+                    }
+                    // Drilled into the numbered list (Button1's own tap,
+                    // see OnButton1Short()) -- discretized browse, not
+                    // pickup-tracked, same idiom as Global:File's own
                     // file_cursor_ (no factory range here to fold in,
                     // unlike Pad Preset's PadPresetCursorToSlot()).
-                    int total = granular_preset_user_slot_count_;
-                    if(total > 0)
+                    if(granular_preset_user_slot_count_ > 0)
                     {
-                        int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        int total = granular_preset_user_slot_count_;
+                        int idx   = (int)(Clampf(k1, 0.f, 1.f) * total);
                         if(idx >= total)
                             idx = total - 1;
                         if(idx != granular_preset_cursor_)
@@ -1452,6 +1861,37 @@ void Ui::ApplyKnobs()
                 default: break;
             }
             break;
+        case Screen::Mixer:
+        {
+            int ch = mixer_position_;
+            if(ch >= kNumMixerChannels) // Scope stop -- no continuous knobs
+                break;
+            if(ch == kNumMixerChannels - 1) // Master: Volume + Reverb Size, no toggle
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                {
+                    master_volume01_ = Clampf(k1, 0.f, 1.f);
+                    master_volume_   = powf(master_volume01_, 2.5f) * 1.43f;
+                    if(master_volume_ < 0.f)
+                        master_volume_ = 0.f;
+                }
+                if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    reverb_size01_ = Clampf(k2, 0.f, 1.f);
+            }
+            else if(!mixer_target_reverb_)
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    MixerSetVolume01(ch, k1);
+                if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    MixerSetPan01(ch, k2);
+            }
+            else
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    MixerSetSend01(ch, k1);
+            }
+            break;
+        }
     }
 }
 
@@ -1495,24 +1935,7 @@ void Ui::Draw()
         case Screen::Global: DrawGlobalScreen(); break;
         case Screen::Pad: DrawPadScreen(); break;
         case Screen::Granular: DrawGranularScreen(); break;
-    }
-    // TEMPORARY -- CPU diagnostic overlay (see SetDiagCpuPercent()'s doc
-    // comment). Drawn last, on top of whatever the screen above just
-    // drew, with an opaque background so it's always legible regardless
-    // of what's underneath -- top-right corner, may cosmetically cover
-    // the last beat-indicator dot on screens that use one there. Part of
-    // the same Draw()/Update() pass as everything else, so it persists
-    // exactly as long as any other on-screen content instead of getting
-    // wiped by the next regular redraw a few ms later.
-    if(diag_cpu_percent_ >= 0)
-    {
-        char diag[8];
-        snprintf(diag, sizeof(diag), "%d%%", diag_cpu_percent_);
-        int w = (int)strlen(diag) * 6; // Font_6x8
-        int x = disp_->Width() - w;
-        disp_->DrawRect(x, 0, disp_->Width() - 1, 7, false, true);
-        disp_->SetCursor(x, 0);
-        disp_->WriteString(diag, Font_6x8, true);
+        case Screen::Mixer: DrawMixerScreen(); break;
     }
     disp_->Update();
 }
@@ -1972,6 +2395,11 @@ void Ui::DrawGlobalScreen()
         DrawFileScreen();
         return;
     }
+    if(global_page_ == GlobalPage::SdMgmt)
+    {
+        DrawSdMgmtScreen();
+        return;
+    }
     if(global_page_ == GlobalPage::Export)
     {
         DrawExportScreen();
@@ -1988,13 +2416,13 @@ void Ui::DrawGlobalScreen()
         // IsPadEnabled()'s doc comment for why this was pulled forward
         // from the original plan's Stage 4).
         disp_->SetCursor(0, 0);
-        WriteUpper("Global:Plaits");
+        WriteUpper("Global:Pad");
         DrawBeatIndicator(disp_->Width() - 41, 0, 3);
         disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
         disp_->SetCursor(0, 20);
         WriteUpper(pad_enabled_ ? "Enabled" : "Disabled");
         disp_->SetCursor(0, 30);
-        WriteUpper("Click to open Plaits");
+        WriteUpper("Click to open Pad");
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Toggle On/Off", "", "", "");
         return;
@@ -2031,58 +2459,28 @@ void Ui::DrawGlobalScreen()
     }
     if(global_page_ == GlobalPage::Mixer)
     {
-        // All four values always shown (same "graph shows everything,
-        // buttons only change what the knobs reach" idiom as Pad's own
-        // ADSR page and Grains' Mix page) -- Output Level and Reverb
-        // Send for both engines, grouped by parameter so the active pair
-        // (Button1=Level, Button2=Reverb) reads as two adjacent bars.
-        // Same underlying pad_synth_/granular_ values as each engine's
-        // own Mix page, so changing it here updates there too.
+        // Entry point only, same treatment as Global:Pad/Granular -- an
+        // at-a-glance summary (same 8-channel grid used elsewhere, see
+        // DrawMixerOverviewGrid()) plus a hint that clicking drops into
+        // the real editing surface, drawn as real content in the body
+        // (not disguised as a Button1/Button2 footer label -- this is
+        // about the ENCODER, and DrawControlRow's row grammar specifically
+        // means "this label describes the button next to it"). No knobs
+        // of its own any more.
         disp_->SetCursor(0, 0);
         WriteUpper("Global:Mixer");
         DrawBeatIndicator(disp_->Width() - 41, 0, 3);
         disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
 
-        const char* mix_labels[4] = {"P.Level", "G.Level", "P.Reverb", "G.Reverb"};
-        float       mix_vals01[4] = {pad_synth_ ? pad_synth_->GetOutputLevel01() : 0.f,
-                                      granular_ ? granular_->GetOutputLevel01() : 0.f,
-                                      pad_synth_ ? pad_synth_->GetReverbSend01() : 0.f,
-                                      granular_ ? granular_->GetReverbSend01() : 0.f};
-        char        mix_values[4][8];
-        for(int i = 0; i < 4; i++)
-            snprintf(mix_values[i], sizeof(mix_values[i]), "%d%%",
-                      (int)(mix_vals01[i] * 100.f + 0.5f));
-
-        const int kMixLabelBaseline = 15;
-        const int kMixValueBaseline = 21;
-        const int kMixColWidth      = disp_->Width() / 4;
-        const int kBarWidth = 26, kBarHeight = 6, kBarTop = 25;
-        for(int i = 0; i < 4; i++)
+        DrawMixerOverviewGrid(15);
         {
-            int center_x = kMixColWidth * i + kMixColWidth / 2;
-            int lw       = TomThumbAdvanceWidth(mix_labels[i]);
-            TomThumbDrawText(disp_, center_x - lw / 2, kMixLabelBaseline, mix_labels[i], true);
-            int vw = TomThumbAdvanceWidth(mix_values[i]);
-            TomThumbDrawText(disp_, center_x - vw / 2, kMixValueBaseline, mix_values[i], true);
-
-            int bar_x0 = center_x - kBarWidth / 2;
-            int bar_x1 = bar_x0 + kBarWidth - 1;
-            disp_->DrawRect(bar_x0, kBarTop, bar_x1, kBarTop + kBarHeight - 1, true, false);
-            int fill_w = (int)(Clampf(mix_vals01[i], 0.f, 1.f) * (float)(kBarWidth - 2) + 0.5f);
-            if(fill_w > 0)
-                disp_->DrawRect(bar_x0 + 1, kBarTop + 1, bar_x0 + fill_w, kBarTop + kBarHeight - 2,
-                                  true, true);
+            const char* hint = "PUSH ENC TO ENTER";
+            int         hw   = TomThumbAdvanceWidth(hint);
+            TomThumbDrawText(disp_, (disp_->Width() - hw) / 2, 44, hint, true);
         }
 
-        if(!global_mixer_target_reverb_)
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Plaits", mix_values[0],
-                             mix_values[1], "Grains");
-        else
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Plaits", mix_values[2],
-                             mix_values[3], "Grains");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
-                         global_mixer_target_reverb_ ? "Level" : "Level*", "", "",
-                         global_mixer_target_reverb_ ? "Reverb*" : "Reverb");
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
         return;
     }
 
@@ -2203,8 +2601,12 @@ void Ui::DrawFileScreen()
 
     if(!PerformanceStore::IsCardPresent())
     {
-        disp_->SetCursor(0, 20);
-        WriteUpper("No SD card");
+        // Centered the same way Global:Export's own "No SD card" is --
+        // see its own comment for the exact math.
+        const char* msg = "No SD card";
+        int         x   = (disp_->Width() - 6 * (int)strlen(msg)) / 2;
+        disp_->SetCursor(x < 0 ? 0 : x, 24);
+        WriteUpper(msg);
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
         return;
@@ -2215,71 +2617,209 @@ void Ui::DrawFileScreen()
 
     // Whichever button is actually held wins the space (hold-to-confirm
     // progress, same idea as the Status page's Clear); otherwise this
-    // area shows the current/browse-target slots and the last result.
-    if(pod_->button1.Pressed())
+    // area shows whichever of Idle/ChoosingSave/BrowsingLoad is active
+    // (see SaveLoadMode's own comment).
+    bool choosing_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+    bool browsing_load = save_load_mode_ == SaveLoadMode::BrowsingLoad;
+    // Load's own top-level chooser (Files/New, mirrors ChoosingSave's own
+    // Overwrite/Save New) -- see load_new_selected_/load_browsing_files_'s
+    // own comment in ui.h.
+    bool load_chooser  = browsing_load && !load_browsing_files_;
+    bool can_hold_load = browsing_load && (load_browsing_files_ || load_new_selected_);
+    // Button1 has no hold action any more -- its tap means "Save" (Idle),
+    // "drill into the file list" (Load chooser with Files highlighted),
+    // or "Back" (everywhere else revealed, see OnButton1Short()). Button2
+    // confirms Save and Load (see HandleButton2()) once there's something
+    // specific to confirm.
+    if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
     {
-        float held = pod_->button1.TimeHeldMs();
-        int   w    = (int)(Clampf(held / 400.f, 0.f, 1.f) * (disp_->Width() - 2));
+        float       held     = pod_->button2.TimeHeldMs();
+        int         w        = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+        const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
         disp_->SetCursor(0, 20);
-        WriteUpper("Hold: New...");
+        WriteUpper(hold_msg);
         disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
         if(w > 0)
             disp_->DrawRect(1, 31, w, 33, true, true);
     }
-    else if(pod_->button2.Pressed() && file_slot_count_ > 0)
+    else if(choosing_save)
     {
-        float held = pod_->button2.TimeHeldMs();
-        int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+        // Overwrite only shown as a real option once something's loaded
+        // -- Knob1's own ApplyKnobs() handling already forces Save New
+        // when it isn't, this just reflects that on screen too.
+        bool can_overwrite = loaded_slot_ >= 0;
+        char line1[24], line2[16];
+        snprintf(line1, sizeof(line1), "%c Overwrite%s", !save_as_new_ ? '>' : ' ',
+                  can_overwrite ? "" : " (n/a)");
+        snprintf(line2, sizeof(line2), "%c Save New", save_as_new_ ? '>' : ' ');
+        disp_->SetCursor(0, 16);
+        WriteUpper(line1);
+        disp_->SetCursor(0, 28);
+        WriteUpper(line2);
+    }
+    else if(load_chooser)
+    {
+        // Same shape as ChoosingSave's own Overwrite/Save New -- Files
+        // only a real option once something's actually saved, same
+        // "can't select what doesn't exist" reasoning as Overwrite's own.
+        char line1[24], line2[16];
+        snprintf(line1, sizeof(line1), "%c Files%s", !load_new_selected_ ? '>' : ' ',
+                  file_slot_count_ > 0 ? "" : " (n/a)");
+        snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
+        disp_->SetCursor(0, 16);
+        WriteUpper(line1);
+        disp_->SetCursor(0, 28);
+        WriteUpper(line2);
+    }
+    else if(browsing_load)
+    {
+        // Drilled into the numbered list (load_browsing_files_ == true).
+        char line2[32];
+        snprintf(line2, sizeof(line2), "Load: %d - Perf", file_slots_[file_cursor_]);
         disp_->SetCursor(0, 20);
-        WriteUpper("Hold: Load...");
-        disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
-        if(w > 0)
-            disp_->DrawRect(1, 31, w, 33, true, true);
+        WriteUpper(line2);
     }
     else
     {
-        char line1[32], line2[32];
+        char line1[32];
         if(loaded_slot_ >= 0)
             snprintf(line1, sizeof(line1), "Now: %d - Perf", loaded_slot_);
         else
             snprintf(line1, sizeof(line1), "Now: (unsaved)");
-        disp_->SetCursor(0, 14);
+        disp_->SetCursor(0, 20);
         WriteUpper(line1);
-
-        if(file_slot_count_ > 0)
-            snprintf(line2, sizeof(line2), "Load: %d - Perf",
-                      file_slots_[file_cursor_]);
-        else
-            snprintf(line2, sizeof(line2), "Load: (no saves)");
-        disp_->SetCursor(0, 26);
-        WriteUpper(line2);
 
         if(file_status_[0] != '\0')
         {
-            disp_->SetCursor(0, 36);
+            disp_->SetCursor(0, 32);
             WriteUpper(file_status_);
         }
     }
 
-    // Knob1 browses a discrete list of slots (not a live 0..1 parameter)
-    // -- show the slot number it's currently on, same index shown in the
-    // "Load: N - Performance" line above. Empty when there's nothing to
-    // browse (no saves yet), same "nothing if it does nothing" rule as an
-    // idle knob elsewhere. Button1's label spells out its hold behaviour
-    // explicitly; Button2's doesn't repeat "Load" as a tap meaning since
-    // it doesn't have one here (see Global:Tempo's Button2 for where
-    // that idle-tap slot went instead) -- the "Hold: New.../Hold:
-    // Load..." progress-bar overlay (shown once you actually hold either
-    // one) is still the fallback discovery path either way.
-    char load_val[8] = "";
-    if(file_slot_count_ > 0)
-        snprintf(load_val, sizeof(load_val), "%d", file_slots_[file_cursor_]);
-    DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Load", load_val, "", "");
-    // "Copy", not "New" -- Button1's own Hold=New already means something
-    // different (wipes the performance); this just saves an additional,
-    // separate slot without touching what's currently loaded.
-    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save/Hold=New", "", "",
-                     "Copy/Hold=Load");
+    const char* b1_label;
+    if(save_load_mode_ == SaveLoadMode::Idle)
+        b1_label = "Save";
+    else if(load_chooser && !load_new_selected_)
+        b1_label = "Select"; // drills into the numbered list
+    else
+        b1_label = "Back";
+    const char* b2_label;
+    if(save_load_mode_ == SaveLoadMode::Idle)
+        b2_label = "Load";
+    else if(choosing_save)
+        b2_label = "Hold=Save";
+    else if(can_hold_load)
+        b2_label = "Hold=Load";
+    else
+        b2_label = ""; // Load chooser with Files highlighted -- nothing to confirm yet
+
+    DrawControlRow(kFooterRow1Y, false, kFooterDividerY,
+                     (choosing_save || browsing_load) ? "Scroll" : "", "", "", "");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, b1_label, "", "", b2_label);
+}
+
+const char* Ui::SdMgmtFolderName(SdMgmtFolder f)
+{
+    switch(f)
+    {
+        case SdMgmtFolder::Performances: return "Performances";
+        case SdMgmtFolder::PadPresets: return "Pad Presets";
+        case SdMgmtFolder::GranularPresets: return "Grains Presets";
+        default: return "?";
+    }
+}
+
+void Ui::DrawSdMgmtScreen()
+{
+    disp_->SetCursor(0, 0);
+    WriteUpper("Global:SD Mgmt");
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    if(!PerformanceStore::IsCardPresent())
+    {
+        // Centered the same way Global:File/Export's own "No SD card" is.
+        const char* msg = "No SD card";
+        int         x   = (disp_->Width() - 6 * (int)strlen(msg)) / 2;
+        disp_->SetCursor(x < 0 ? 0 : x, 24);
+        WriteUpper(msg);
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
+        return;
+    }
+
+    // Whichever button is actually held wins the space, same hold-to-
+    // confirm-progress idiom as every other destructive/blocking action.
+    if(pod_->button1.Pressed() && sd_mgmt_in_folder_)
+    {
+        float held = pod_->button1.TimeHeldMs();
+        int   w    = (int)(Clampf(held / 400.f, 0.f, 1.f) * (disp_->Width() - 2));
+        disp_->SetCursor(0, 20);
+        WriteUpper("Hold: Duplicate...");
+        disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
+        if(w > 0)
+            disp_->DrawRect(1, 31, w, 33, true, true);
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        return;
+    }
+    if(pod_->button2.Pressed() && sd_mgmt_in_folder_)
+    {
+        float held = pod_->button2.TimeHeldMs();
+        int   w    = (int)(Clampf(held / kSdMgmtDeleteHoldMs, 0.f, 1.f) * (disp_->Width() - 2));
+        disp_->SetCursor(0, 20);
+        WriteUpper("Hold: Delete...");
+        disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
+        if(w > 0)
+            disp_->DrawRect(1, 31, w, 33, true, true);
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        return;
+    }
+
+    if(!sd_mgmt_in_folder_)
+    {
+        // Same ">"-highlighted-list convention as ChoosingSave's own
+        // Overwrite/Save New options.
+        for(int i = 0; i < (int)SdMgmtFolder::kCount; i++)
+        {
+            char line[20];
+            snprintf(line, sizeof(line), "%c %s", i == (int)sd_mgmt_folder_ ? '>' : ' ',
+                      SdMgmtFolderName((SdMgmtFolder)i));
+            disp_->SetCursor(0, 14 + i * 10);
+            WriteUpper(line);
+        }
+    }
+    else
+    {
+        char line1[24];
+        snprintf(line1, sizeof(line1), "%s:", SdMgmtFolderName(sd_mgmt_folder_));
+        disp_->SetCursor(0, 14);
+        WriteUpper(line1);
+
+        if(sd_mgmt_status_[0] != '\0')
+        {
+            disp_->SetCursor(0, 26);
+            WriteUpper(sd_mgmt_status_);
+        }
+        else
+        {
+            int        count = 0;
+            const int* slots = SdMgmtSlots(&count);
+            char       line2[16];
+            if(slots && count > 0)
+                snprintf(line2, sizeof(line2), "%d", slots[sd_mgmt_cursor_]);
+            else
+                snprintf(line2, sizeof(line2), "(empty)");
+            disp_->SetCursor(0, 26);
+            WriteUpper(line2);
+        }
+    }
+
+    DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Scroll", "", "", "");
+    DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                     sd_mgmt_in_folder_ ? "Back/Hold=Dup" : "Select", "", "",
+                     sd_mgmt_in_folder_ ? "Hold=Delete" : "");
 }
 
 void Ui::DrawExportScreen()
@@ -2372,6 +2912,7 @@ void Ui::DrawPadScreen()
     switch(pad_param_page_)
     {
         case PadParamPage::Tone: page_name = "Tone"; break;
+        case PadParamPage::Tune: page_name = "Tune"; break;
         case PadParamPage::ADSR: page_name = "ADSR"; break;
         case PadParamPage::Chorus: page_name = "Chorus"; break;
         case PadParamPage::Vibrato: page_name = "Vibrato"; break;
@@ -2382,7 +2923,7 @@ void Ui::DrawPadScreen()
         default: break;
     }
     char title[24];
-    snprintf(title, sizeof(title), "Plaits:%s", page_name);
+    snprintf(title, sizeof(title), "Pad:%s", page_name);
     disp_->SetCursor(0, 0);
     WriteUpper(title);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
@@ -2397,8 +2938,11 @@ void Ui::DrawPadScreen()
     const int kStatusY = 11;
     for(int i = 0; i < PadSynth::kMaxVoices; i++)
     {
-        int x = 1 + i * 3;
-        disp_->DrawRect(x, kStatusY, x + 1, kStatusY + 1, true, pad_synth_->IsVoiceActive(i));
+        // 3x3 (was 2x2 -- too small to read at a glance), stepped 4px
+        // apart so a 1px gap still separates adjacent boxes instead of
+        // them merging into one solid bar once several voices are lit.
+        int x = 1 + i * 4;
+        disp_->DrawRect(x, kStatusY, x + 2, kStatusY + 2, true, pad_synth_->IsVoiceActive(i));
     }
 
     const int kBendX0 = 30, kBendX1 = 62, kBendMidY = kStatusY + 1;
@@ -2412,17 +2956,17 @@ void Ui::DrawPadScreen()
         disp_->DrawLine(tick_x, kStatusY, tick_x, kStatusY + 2, true);
     }
 
-    // Font_6x8 text is a full 8px tall -- drawn on its own row below the
-    // dots/tick (which are only 1-3px), with kBandTop pushed down enough
-    // to give it real clearance, not sharing a cramped few-px band with
-    // whatever the current page draws next (that's what caused pages to
-    // visibly draw over this earlier).
-    const int kModRowY = 13;
-    char      mod_line[16];
-    snprintf(mod_line, sizeof(mod_line), "%.4s%d%%", ModDestName(pad_synth_->GetModDestination()),
+    // Tom Thumb, not Font_6x8 -- this "<dest> <value>%" readout otherwise
+    // doesn't fit the space next to the voice-activity dots/bend tick,
+    // and Font_6x8's fixed glyph width meant a 3-digit value (100%) drew
+    // right on top of the destination name instead of shrinking to fit.
+    // Tom Thumb's own narrower glyphs leave enough room to spell the
+    // destination out in full (no more truncating to 4 characters).
+    const int kModRowY = 15;
+    char      mod_line[20];
+    snprintf(mod_line, sizeof(mod_line), "%s %d%%", ModDestName(pad_synth_->GetModDestination()),
               (int)(pad_synth_->GetModWheel01() * 100.f + 0.5f));
-    disp_->SetCursor(66, kModRowY);
-    WriteUpper(mod_line);
+    TomThumbDrawText(disp_, 66, kModRowY, mod_line, true);
 
     const int kBandTop = 22, kBandBottom = 44;
     switch(pad_param_page_)
@@ -2437,6 +2981,15 @@ void Ui::DrawPadScreen()
                       (int)(pad_synth_->GetOscGain01() * 100.f + 0.5f));
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Tone", reg_val, gain_val,
                              "Gain");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case PadParamPage::Tune:
+        {
+            DrawOscilloscope(kBandTop, kBandBottom, pad_scope_buf_, pad_scope_capacity_);
+            char tune_val[8];
+            snprintf(tune_val, sizeof(tune_val), "%+d st", pad_synth_->GetTuneSemitones());
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Tune", tune_val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
@@ -2478,7 +3031,11 @@ void Ui::DrawPadScreen()
         }
         case PadParamPage::Chorus:
         {
-            DrawOscilloscope(kBandTop, kBandBottom, pad_scope_buf_, pad_scope_capacity_);
+            char mod_line[24];
+            snprintf(mod_line, sizeof(mod_line), "Mod wheel -> %s",
+                      ModDestName(pad_synth_->GetModDestination()));
+            TomThumbDrawText(disp_, 0, kBandTop, mod_line, true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, pad_scope_buf_, pad_scope_capacity_);
             char depth_val[8], rate_val[8];
             snprintf(depth_val, sizeof(depth_val), "%d%%",
                       (int)(pad_synth_->GetChorusDepth01() * 100.f + 0.5f));
@@ -2491,20 +3048,11 @@ void Ui::DrawPadScreen()
         }
         case PadParamPage::Vibrato:
         {
-            // No live oscilloscope here -- the LFO is far too slow
-            // (0.5-8Hz) to show anything meaningful in the scope's short
-            // capture window, unlike Tone/Chorus/Filter which all shape
-            // the waveform itself on audio-rate timescales.
             char mod_line[24];
             snprintf(mod_line, sizeof(mod_line), "Mod wheel -> %s",
                       ModDestName(pad_synth_->GetModDestination()));
-            disp_->SetCursor(0, kBandTop);
-            WriteUpper(mod_line);
-            if(pad_synth_->GetModDestination() != PadSynth::ModDestination::Vibrato)
-            {
-                disp_->SetCursor(0, kBandTop + 12);
-                WriteUpper("(wheel not on Vibrato)");
-            }
+            TomThumbDrawText(disp_, 0, kBandTop, mod_line, true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, pad_scope_buf_, pad_scope_capacity_);
             char depth_val[8], rate_val[8];
             snprintf(depth_val, sizeof(depth_val), "%d%%",
                       (int)(pad_synth_->GetVibratoDepth01() * 100.f + 0.5f));
@@ -2524,8 +3072,7 @@ void Ui::DrawPadScreen()
             char mode_line[20];
             snprintf(mode_line, sizeof(mode_line), "Mode: %s",
                       FilterModeName(pad_synth_->GetFilterMode()));
-            disp_->SetCursor(0, kBandTop);
-            WriteUpper(mode_line);
+            TomThumbDrawText(disp_, 0, kBandTop, mode_line, true);
             DrawOscilloscope(kBandTop + 9, kBandBottom, pad_scope_buf_, pad_scope_capacity_);
 
             char cutoff_val[8], res_val[8];
@@ -2555,8 +3102,7 @@ void Ui::DrawPadScreen()
             char dest_line[24];
             snprintf(dest_line, sizeof(dest_line), "Mod Dest: %s",
                       ModDestName(pad_synth_->GetModDestination()));
-            disp_->SetCursor(0, kBandTop);
-            WriteUpper(dest_line);
+            TomThumbDrawText(disp_, 0, kBandTop, dest_line, true);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle dest", "", "", "");
             break;
@@ -2565,7 +3111,7 @@ void Ui::DrawPadScreen()
         {
             if(!PerformanceStore::IsCardPresent())
             {
-                disp_->SetCursor(0, kBandTop);
+                disp_->SetCursor(0, 20);
                 WriteUpper("No card (factory OK)");
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
                 DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
@@ -2574,68 +3120,120 @@ void Ui::DrawPadScreen()
             if(pad_preset_slots_dirty_)
                 RefreshPadPresetSlots();
 
-            // Held Button2 takes over this space with a hold-to-confirm
-            // progress bar, same pattern as Global:File's Hold=Load.
-            if(pod_->button2.Pressed())
+            bool choosing_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+            bool browsing_load = save_load_mode_ == SaveLoadMode::BrowsingLoad;
+            bool load_chooser  = browsing_load && !load_browsing_files_;
+            bool can_hold_load = browsing_load && (load_browsing_files_ || load_new_selected_);
+
+            // Body text uses the same bigger Font_6x8/WriteUpper
+            // convention as Global:File (not TomThumb, unlike the rest of
+            // this screen's pages) -- same reasoning as Grains' own
+            // Preset page: this is the one page where matching
+            // Global:File's exact look matters more than matching this
+            // screen's other pages.
+            //
+            // Button2 confirms whichever of Save/Load is active (Button1
+            // is always "Back" (or "Select" on the Load chooser) once
+            // inside either state -- see OnButton1Short()/
+            // HandleButton2()).
+            if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
             {
-                float held = pod_->button2.TimeHeldMs();
-                int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
-                disp_->SetCursor(0, kBandTop);
-                WriteUpper("Hold: Load...");
-                disp_->DrawRect(0, kBandTop + 10, disp_->Width() - 1, kBandTop + 14, true, false);
+                float       held     = pod_->button2.TimeHeldMs();
+                int         w        = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+                const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
+                disp_->SetCursor(0, 20);
+                WriteUpper(hold_msg);
+                disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
                 if(w > 0)
-                    disp_->DrawRect(1, kBandTop + 11, w, kBandTop + 13, true, true);
+                    disp_->DrawRect(1, 31, w, 33, true, true);
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
                 DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
                 break;
             }
 
-            char line1[24], line2[24];
-            if(pad_loaded_preset_slot_ <= 0)
-                snprintf(line1, sizeof(line1), "Now: (custom)");
-            else if(pad_loaded_preset_slot_ <= PadSynth::kNumFactoryPresets)
-                snprintf(line1, sizeof(line1), "Now: %s",
-                          PadSynth::GetFactoryPresetName(pad_loaded_preset_slot_ - 1));
-            else
-                snprintf(line1, sizeof(line1), "Now: %d", pad_loaded_preset_slot_);
-            disp_->SetCursor(0, kBandTop);
-            WriteUpper(line1);
-
-            // Status (if any) takes this row's place instead of stacking
-            // below it -- same "fresh result takes priority over the
-            // steady-state line" convention Global:Tempo's own
-            // tempo_status_/"Clear layers first" already uses. There
-            // isn't room for 3 full text lines in this band any more
-            // (see kBandTop's own comment above), and the status is a
-            // direct response to what you just did, so it's more useful
-            // than "Load:" for that brief moment.
-            if(pad_preset_status_[0] != '\0')
+            if(choosing_save)
             {
-                disp_->SetCursor(0, kBandTop + 12);
-                WriteUpper(pad_preset_status_);
+                bool can_overwrite = pad_loaded_preset_slot_ > PadSynth::kNumFactoryPresets;
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Overwrite%s", !save_as_new_ ? '>' : ' ',
+                          can_overwrite ? "" : " (n/a)");
+                snprintf(line2, sizeof(line2), "%c Save New", save_as_new_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
             }
-            else
+            else if(load_chooser)
             {
-                int browsed_slot = PadPresetCursorToSlot(pad_preset_cursor_,
-                                                            pad_preset_user_slots_,
-                                                            pad_preset_user_slot_count_);
-                if(browsed_slot <= 0)
-                    snprintf(line2, sizeof(line2), "Load: (none)");
-                else if(browsed_slot <= PadSynth::kNumFactoryPresets)
+                // Same shape as ChoosingSave's own Overwrite/Save New --
+                // "Files" is always available here (factory presets
+                // always exist).
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Files", !load_new_selected_ ? '>' : ' ');
+                snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(browsing_load)
+            {
+                // Drilled into the numbered list (load_browsing_files_ ==
+                // true) -- factory presets first, then user slots.
+                char line2[24];
+                int  browsed_slot = PadPresetCursorToSlot(pad_preset_cursor_,
+                                                             pad_preset_user_slots_,
+                                                             pad_preset_user_slot_count_);
+                if(browsed_slot <= PadSynth::kNumFactoryPresets)
                     snprintf(line2, sizeof(line2), "Load: %s",
                               PadSynth::GetFactoryPresetName(browsed_slot - 1));
                 else
                     snprintf(line2, sizeof(line2), "Load: %d", browsed_slot);
-                disp_->SetCursor(0, kBandTop + 12);
+                disp_->SetCursor(0, 20);
                 WriteUpper(line2);
             }
+            else
+            {
+                char line1[24];
+                if(pad_loaded_preset_slot_ <= 0)
+                    snprintf(line1, sizeof(line1), "Now: (custom)");
+                else if(pad_loaded_preset_slot_ <= PadSynth::kNumFactoryPresets)
+                    snprintf(line1, sizeof(line1), "Now: %s",
+                              PadSynth::GetFactoryPresetName(pad_loaded_preset_slot_ - 1));
+                else
+                    snprintf(line1, sizeof(line1), "Now: %d", pad_loaded_preset_slot_);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line1);
+                if(pad_preset_status_[0] != '\0')
+                {
+                    disp_->SetCursor(0, 32);
+                    WriteUpper(pad_preset_status_);
+                }
+            }
 
-            // "Save" alone, not "Save/Hold=X" -- Button1 has no hold
-            // action on this page (unlike Global:File's own Button1),
-            // so implying one here would be misleading.
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save", "", "",
-                             "Copy/Hold=Load");
+            {
+                const char* b1_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b1_label = "Save";
+                else if(load_chooser && !load_new_selected_)
+                    b1_label = "Select";
+                else
+                    b1_label = "Back";
+                const char* b2_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b2_label = "Load";
+                else if(choosing_save)
+                    b2_label = "Hold=Save";
+                else if(can_hold_load)
+                    b2_label = "Hold=Load";
+                else
+                    b2_label = "";
+
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY,
+                                 (choosing_save || browsing_load) ? "Scroll" : "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, b1_label, "", "",
+                                 b2_label);
+            }
             break;
         }
         default: break;
@@ -2651,7 +3249,7 @@ void Ui::DrawGranularScreen()
     switch(granular_param_page_)
     {
         case GranularParamPage::Grain: page_name = "Grain"; break;
-        case GranularParamPage::Position: page_name = "Position"; break;
+        case GranularParamPage::Position: page_name = "Pos"; break;
         case GranularParamPage::TuneDirection: page_name = "Tune"; break;
         case GranularParamPage::ADSR: page_name = "ADSR"; break;
         case GranularParamPage::Filter: page_name = "Filter"; break;
@@ -2903,17 +3501,90 @@ void Ui::DrawGranularScreen()
         }
         case GranularParamPage::Capture:
         {
+            // Hold-to-confirm progress bar for the two fire-once gestures
+            // (From Layer, Import) -- same pattern as Preset's own
+            // "Hold: Load..." bar. Direct Record is deliberately excluded:
+            // holding Button2 there IS the recording itself (see the
+            // "Recording %" bar further down), not a confirm-then-fire
+            // action.
+            if(pod_->button2.Pressed()
+               && (granular_capture_source_ >= 0 || granular_capture_source_ == -2))
+            {
+                float held = pod_->button2.TimeHeldMs();
+                int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+                const char* hold_msg
+                    = granular_capture_source_ == -2 ? "Hold: Import..." : "Hold: Capture...";
+                TomThumbDrawText(disp_, 0, 15, hold_msg, true);
+                disp_->DrawRect(0, 20, disp_->Width() - 1, 24, true, false);
+                if(w > 0)
+                    disp_->DrawRect(1, 21, w, 23, true, true);
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+                break;
+            }
+
             char src_line[24];
             if(granular_capture_source_ >= 0)
                 snprintf(src_line, sizeof(src_line), "Source: Layer %d",
                           granular_capture_source_ + 1);
+            else if(granular_capture_source_ == -2)
+                snprintf(src_line, sizeof(src_line), "Source: Import");
             else
                 snprintf(src_line, sizeof(src_line), "Source: Direct Record");
             TomThumbDrawText(disp_, 0, 15, src_line, true);
 
-            bool recording = granular_capture_source_ < 0 && granular_capturing_
+            if(granular_capture_source_ == -2 && granular_import_files_dirty_)
+                RefreshGranularImportFiles();
+
+            bool recording = granular_capture_source_ == -1 && granular_capturing_
                               && *granular_capturing_;
-            if(recording)
+            if(granular_capture_source_ == -2)
+            {
+                // Browse the list of .wav files found in IMPORT/ --
+                // same "Load: <name>"-style live feedback as Preset's
+                // own browsing, status takes priority when there is one.
+                if(granular_capture_status_[0] != '\0')
+                {
+                    TomThumbDrawText(disp_, 0, 22, granular_capture_status_, true);
+                }
+                else if(granular_import_file_count_ > 0)
+                {
+                    // Scrollable list, not just the single selected name --
+                    // up to kVisibleRows entries at once (baselines 22, 28,
+                    // 34, 40 -- 6px TomThumb rows, fits between the "Source:"
+                    // line above and the footer divider below), with the
+                    // window centered on the cursor and clamped to the
+                    // list's own ends so it doesn't scroll past them.
+                    constexpr int kVisibleRows = 4;
+                    int           count        = granular_import_file_count_;
+                    int           start        = granular_import_cursor_ - kVisibleRows / 2;
+                    if(start > count - kVisibleRows)
+                        start = count - kVisibleRows;
+                    if(start < 0)
+                        start = 0;
+                    int rows = count < kVisibleRows ? count : kVisibleRows;
+                    for(int row = 0; row < rows; row++)
+                    {
+                        int  idx      = start + row;
+                        bool selected = idx == granular_import_cursor_;
+                        char line[64];
+                        snprintf(line, sizeof(line), "%c%s", selected ? '>' : ' ',
+                                  granular_import_names_[idx]);
+                        // Truncate from the end until it fits -- a long
+                        // sample filename (e.g. exported from a DAW)
+                        // otherwise runs straight past the 128px display
+                        // width.
+                        while(line[0] != '\0' && TomThumbAdvanceWidth(line) > disp_->Width())
+                            line[strlen(line) - 1] = '\0';
+                        TomThumbDrawText(disp_, 0, 22 + row * 6, line, true);
+                    }
+                }
+                else
+                {
+                    TomThumbDrawText(disp_, 0, 22, "No .wav files in IMPORT/", true);
+                }
+            }
+            else if(recording)
             {
                 // Holding Button2 IS the recording -- this bar is both
                 // progress feedback and the "how much of the 5s cap is
@@ -2944,9 +3615,14 @@ void Ui::DrawGranularScreen()
                                       granular_->GetScanAnchor01(), granular_->HasSource());
             }
 
+            const char* hold_label = "Hold=Record";
+            if(granular_capture_source_ >= 0)
+                hold_label = "Hold=Capture";
+            else if(granular_capture_source_ == -2)
+                hold_label = "Hold=Import";
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle Source", "", "",
-                             granular_capture_source_ >= 0 ? "Hold=Capture" : "Hold=Record");
+                             hold_label);
             break;
         }
         case GranularParamPage::Trim:
@@ -2976,7 +3652,8 @@ void Ui::DrawGranularScreen()
         {
             if(!PerformanceStore::IsCardPresent())
             {
-                TomThumbDrawText(disp_, 0, 15, "No card", true);
+                disp_->SetCursor(0, 20);
+                WriteUpper("No card");
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
                 DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
                 break;
@@ -2984,56 +3661,354 @@ void Ui::DrawGranularScreen()
             if(granular_preset_slots_dirty_)
                 RefreshGranularPresetSlots();
 
-            // Held Button2 takes over this space with a hold-to-confirm
-            // progress bar, same pattern as Pad Preset's own Hold=Load --
-            // the actual SD transfer (once the hold fires) takes over the
-            // WHOLE display via Ui::OnSaveLoadProgress() instead, since
-            // it can run long enough (up to ~1.9MB of audio) to need its
-            // own feedback, unlike Pad's instant tiny-struct load.
-            if(pod_->button2.Pressed())
+            bool choosing_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+            bool browsing_load = save_load_mode_ == SaveLoadMode::BrowsingLoad;
+            bool load_chooser  = browsing_load && !load_browsing_files_;
+            bool can_hold_load = browsing_load && (load_browsing_files_ || load_new_selected_);
+
+            // Body text uses the same bigger Font_6x8/WriteUpper
+            // convention as Global:File (not TomThumb, unlike the rest of
+            // this screen's pages) -- same reasoning: this is the one
+            // page where matching Global:File's exact look matters more
+            // than matching Grains' own other pages.
+            //
+            // Button2 confirms whichever of Save/Load is active (Button1
+            // is always "Back" (or "Select" on the Load chooser) once
+            // inside either state -- see OnButton1Short()/
+            // HandleButton2()). The actual SD transfer (once the hold
+            // fires) takes over the WHOLE display via
+            // Ui::OnSaveLoadProgress() instead, since it can run long
+            // enough (up to ~1.9MB of audio) to need its own feedback,
+            // unlike Pad's instant tiny-struct load.
+            if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
             {
-                float held = pod_->button2.TimeHeldMs();
-                int   w    = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
-                TomThumbDrawText(disp_, 0, 15, "Hold: Load...", true);
-                disp_->DrawRect(0, 20, disp_->Width() - 1, 24, true, false);
+                float       held     = pod_->button2.TimeHeldMs();
+                int         w        = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+                const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
+                disp_->SetCursor(0, 20);
+                WriteUpper(hold_msg);
+                disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
                 if(w > 0)
-                    disp_->DrawRect(1, 21, w, 23, true, true);
+                    disp_->DrawRect(1, 31, w, 33, true, true);
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
                 DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
                 break;
             }
 
-            char line1[24];
-            if(granular_loaded_preset_slot_ <= 0)
-                snprintf(line1, sizeof(line1), "Now: (custom)");
-            else
-                snprintf(line1, sizeof(line1), "Now: %d", granular_loaded_preset_slot_);
-            TomThumbDrawText(disp_, 0, 15, line1, true);
-
-            // Status (if any) takes this row's place instead of stacking
-            // below it -- same "fresh result takes priority" convention
-            // Pad Preset's own page uses.
-            if(granular_preset_status_[0] != '\0')
+            if(choosing_save)
             {
-                TomThumbDrawText(disp_, 0, 22, granular_preset_status_, true);
+                bool can_overwrite = granular_loaded_preset_slot_ > 0;
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Overwrite%s", !save_as_new_ ? '>' : ' ',
+                          can_overwrite ? "" : " (n/a)");
+                snprintf(line2, sizeof(line2), "%c Save New", save_as_new_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
             }
-            else
+            else if(load_chooser)
             {
+                // Same shape as ChoosingSave's own Overwrite/Save New --
+                // Files only a real option once something's actually
+                // saved, same "can't select what doesn't exist" reasoning
+                // as Overwrite's own.
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Files%s", !load_new_selected_ ? '>' : ' ',
+                          granular_preset_user_slot_count_ > 0 ? "" : " (n/a)");
+                snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(browsing_load)
+            {
+                // Drilled into the numbered list (load_browsing_files_ ==
+                // true).
                 char line2[24];
-                if(granular_preset_cursor_ < granular_preset_user_slot_count_)
-                    snprintf(line2, sizeof(line2), "Load: %d",
-                              granular_preset_user_slots_[granular_preset_cursor_]);
+                snprintf(line2, sizeof(line2), "Load: %d",
+                          granular_preset_user_slots_[granular_preset_cursor_]);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else
+            {
+                char line1[24];
+                if(granular_loaded_preset_slot_ <= 0)
+                    snprintf(line1, sizeof(line1), "Now: (custom)");
                 else
-                    snprintf(line2, sizeof(line2), "Load: (none)");
-                TomThumbDrawText(disp_, 0, 22, line2, true);
+                    snprintf(line1, sizeof(line1), "Now: %d", granular_loaded_preset_slot_);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line1);
+                if(granular_preset_status_[0] != '\0')
+                {
+                    disp_->SetCursor(0, 32);
+                    WriteUpper(granular_preset_status_);
+                }
             }
 
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Save", "", "",
-                             "Copy/Hold=Load");
+            {
+                const char* b1_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b1_label = "Save";
+                else if(load_chooser && !load_new_selected_)
+                    b1_label = "Select";
+                else
+                    b1_label = "Back";
+                const char* b2_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b2_label = "Load";
+                else if(choosing_save)
+                    b2_label = "Hold=Save";
+                else if(can_hold_load)
+                    b2_label = "Hold=Load";
+                else
+                    b2_label = "";
+
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY,
+                                 (choosing_save || browsing_load) ? "Scroll" : "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, b1_label, "", "",
+                                 b2_label);
+            }
             break;
         }
         default: break;
+    }
+}
+
+const char* Ui::MixerChannelName(int ch) const
+{
+    switch(ch)
+    {
+        case 0: return "L1";
+        case 1: return "L2";
+        case 2: return "L3";
+        case 3: return "L4";
+        case 4: return "PL";
+        case 5: return "GR";
+        case 6: return "BYP";
+        case 7: return "MAS";
+        default: return "?";
+    }
+}
+
+float Ui::MixerGetVolume01(int ch) const
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: return layers_[ch].GetVolume01();
+        case 4: return pad_synth_ ? pad_synth_->GetOutputLevel01() : 0.f;
+        case 5: return granular_ ? granular_->GetOutputLevel01() : 0.f;
+        case 6: return bypass_mix_volume01_;
+        case 7: return master_volume01_;
+        default: return 0.f;
+    }
+}
+
+float Ui::MixerGetPan01(int ch) const
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: return layers_[ch].GetPan01();
+        case 4: return pad_synth_ ? pad_synth_->GetPan01() : 0.5f;
+        case 5: return granular_ ? granular_->GetPan01() : 0.5f;
+        case 6: return bypass_pan01_;
+        default: return 0.5f; // Master has no Pan
+    }
+}
+
+float Ui::MixerGetSend01(int ch) const
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: return layers_[ch].GetReverbSend01();
+        case 4: return pad_synth_ ? pad_synth_->GetReverbSend01() : 0.f;
+        case 5: return granular_ ? granular_->GetReverbSend01() : 0.f;
+        case 6: return bypass_reverb_send01_;
+        default: return 0.f; // Master uses Reverb Size instead (see reverb_size01_)
+    }
+}
+
+void Ui::MixerSetVolume01(int ch, float v01)
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: layers_[ch].SetVolume01(v01); break;
+        case 4: if(pad_synth_) pad_synth_->SetOutputLevel01(v01); break;
+        case 5: if(granular_) granular_->SetOutputLevel01(v01); break;
+        case 6: SetBypassMixVolume01(v01); break;
+        case 7:
+            master_volume01_ = Clampf(v01, 0.f, 1.f);
+            master_volume_   = powf(master_volume01_, 2.5f) * 1.43f;
+            if(master_volume_ < 0.f)
+                master_volume_ = 0.f;
+            break;
+        default: break;
+    }
+}
+
+void Ui::MixerSetPan01(int ch, float v01)
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: layers_[ch].SetPan01(v01); break;
+        case 4: if(pad_synth_) pad_synth_->SetPan01(v01); break;
+        case 5: if(granular_) granular_->SetPan01(v01); break;
+        case 6: SetBypassPan01(v01); break;
+        default: break; // Master has no Pan
+    }
+}
+
+void Ui::MixerSetSend01(int ch, float v01)
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: layers_[ch].SetReverbSend01(v01); break;
+        case 4: if(pad_synth_) pad_synth_->SetReverbSend01(v01); break;
+        case 5: if(granular_) granular_->SetReverbSend01(v01); break;
+        case 6: bypass_reverb_send01_ = Clampf(v01, 0.f, 1.f); break;
+        default: break; // Master uses Reverb Size instead, set directly in ApplyKnobs()
+    }
+}
+
+// Vertical fader-style bar -- (x0,y0) is the box's top-left corner, fills
+// from the BOTTOM up (unlike every other bar in this project, which fills
+// left-to-right -- see the Mixer design discussion this was built from
+// for why a vertical fader reads better for a per-channel level here).
+void Ui::DrawMixerVBar(int x0, int y0, int w, int h, float v01)
+{
+    int x1 = x0 + w - 1;
+    int y1 = y0 + h - 1;
+    disp_->DrawRect(x0, y0, x1, y1, true, false);
+    int fill_h = (int)(Clampf(v01, 0.f, 1.f) * (float)(h - 2) + 0.5f);
+    if(fill_h > 0)
+        disp_->DrawRect(x0 + 1, y1 - fill_h, x1 - 1, y1 - 1, true, true);
+}
+
+void Ui::DrawMixerOverviewGrid(int top_y)
+{
+    // All 8 names across in one row, same per-channel aesthetic as
+    // Screen::Mixer's own Detail page (name on top, a real vertical bar
+    // below whose own outline shows the full min/max range) -- just one
+    // bar per column instead of two, and no numeric readout (the bar
+    // itself is the readout here). No selection box here -- unlike
+    // Screen::Mixer's own Detail page, there's no meaningful "currently
+    // selected" channel on this at-a-glance summary; mixer_position_ is
+    // just wherever Screen::Mixer was last left, not something being
+    // actively chosen from here.
+    // Bars stop at y=37, not the usual y=45 footer-divider margin -- this
+    // grid is also used above the "PUSH ENC TO ENTER" caption on
+    // Global:Mixer (see DrawGlobalScreen()), which needs its own clear
+    // strip beneath.
+    const int kColW  = disp_->Width() / kNumMixerChannels;
+    const int kBarW  = 8;
+    const int kBarY0 = top_y + 4;
+    const int kBarH  = 37 - kBarY0;
+    for(int ch = 0; ch < kNumMixerChannels; ch++)
+    {
+        int col_x    = kColW * ch;
+        int center_x = col_x + kColW / 2;
+
+        const char* name = MixerChannelName(ch);
+        int         nw   = TomThumbAdvanceWidth(name);
+        TomThumbDrawText(disp_, center_x - nw / 2, top_y + 1, name, true);
+
+        DrawMixerVBar(center_x - kBarW / 2, kBarY0, kBarW, kBarH, MixerGetVolume01(ch));
+    }
+}
+
+void Ui::DrawMixerScreen()
+{
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    if(mixer_position_ == kNumMixerChannels) // Scope stop
+    {
+        disp_->SetCursor(0, 0);
+        WriteUpper("Mixer:Scope");
+        TomThumbDrawText(disp_, 0, 15, "Final Mix", true);
+        DrawOscilloscope(19, 44, master_scope_buf_, master_scope_capacity_);
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        return;
+    }
+
+    // A real channel -- whichever group of 4 it belongs to (0-3 = the
+    // loop layers, 4-7 = Plaits/Grains/Bypass/Master), with real Vol/
+    // Rev/Pan bars for each of those 4 at once.
+    bool is_master = mixer_position_ == kNumMixerChannels - 1;
+    char title[24];
+    snprintf(title, sizeof(title), "Mixer:%s", MixerChannelName(mixer_position_));
+    disp_->SetCursor(0, 0);
+    WriteUpper(title);
+
+    int       group_start = mixer_position_ < 4 ? 0 : 4;
+    const int kColW       = disp_->Width() / 4;
+    // Centered between the header divider (y=9) and footer divider
+    // (kFooterDividerY=46) -- no per-bar "Vol"/"Rev" text any more (the
+    // footer already spells those out for the selected channel), so the
+    // freed-up room goes to real vertical centering instead of cramming
+    // everything against the top.
+    const int kBarW = 12, kBarGap = 2, kBarY0 = 20, kBarH = 18;
+    const int kPanY = 39, kPanH = 4;
+
+    for(int col = 0; col < 4; col++)
+    {
+        int  ch       = group_start + col;
+        bool selected = ch == mixer_position_;
+        int  col_x    = kColW * col;
+        int  bars_w   = kBarW * 2 + kBarGap;
+        int  bars_x0  = col_x + (kColW - bars_w) / 2;
+
+        if(selected)
+            disp_->DrawRect(col_x + 1, 11, col_x + kColW - 2, 44, true, false);
+
+        const char* name   = MixerChannelName(ch);
+        int         nw     = TomThumbAdvanceWidth(name);
+        int         name_x = col_x + (kColW - nw) / 2;
+        TomThumbDrawText(disp_, name_x, 17, name, true);
+
+        bool  channel_is_master = ch == kNumMixerChannels - 1;
+        float vol01             = MixerGetVolume01(ch);
+        float second01          = channel_is_master ? reverb_size01_ : MixerGetSend01(ch);
+
+        DrawMixerVBar(bars_x0, kBarY0, kBarW, kBarH, vol01);
+        DrawMixerVBar(bars_x0 + kBarW + kBarGap, kBarY0, kBarW, kBarH, second01);
+
+        if(!channel_is_master)
+        {
+            float pan01 = MixerGetPan01(ch);
+            disp_->DrawRect(bars_x0, kPanY, bars_x0 + bars_w - 1, kPanY + kPanH - 1, true, false);
+            int tick_x = bars_x0 + 1
+                         + (int)(Clampf(pan01, 0.f, 1.f) * (float)(bars_w - 3) + 0.5f);
+            disp_->DrawRect(tick_x, kPanY + 1, tick_x, kPanY + kPanH - 2, true, true);
+        }
+    }
+
+    char vol_val[8], second_val[8];
+    snprintf(vol_val, sizeof(vol_val), "%d%%",
+              (int)(MixerGetVolume01(mixer_position_) * 100.f + 0.5f));
+    if(is_master)
+    {
+        snprintf(second_val, sizeof(second_val), "%d%%", (int)(reverb_size01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, second_val, "RevSz");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+    }
+    else if(!mixer_target_reverb_)
+    {
+        char pan_val[8];
+        snprintf(pan_val, sizeof(pan_val), "%d%%",
+                  (int)(MixerGetPan01(mixer_position_) * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, pan_val, "Pan");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol/Pan*", "", "", "Rev");
+    }
+    else
+    {
+        snprintf(second_val, sizeof(second_val), "%d%%",
+                  (int)(MixerGetSend01(mixer_position_) * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Rev", second_val, "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol/Pan", "", "", "Rev*");
     }
 }
 
@@ -3177,8 +4152,15 @@ void Ui::TriggerNew()
 
 void Ui::TriggerLoad()
 {
-    if(file_slot_count_ == 0)
+    // !load_browsing_files_ means the top-level chooser confirmed with
+    // "New" highlighted (can_confirm_load only allows a confirm here when
+    // that's the case -- see HandleButton2()) -- confirming it is exactly
+    // TriggerNew()'s own wipe.
+    if(!load_browsing_files_)
+    {
+        TriggerNew();
         return;
+    }
     int slot = file_slots_[file_cursor_];
 
     // Freeze the audio engine for the whole load: it restores layers one
@@ -3230,6 +4212,127 @@ void Ui::TriggerLoad()
     }
 }
 
+const int* Ui::SdMgmtSlots(int* out_count)
+{
+    switch(sd_mgmt_folder_)
+    {
+        case SdMgmtFolder::Performances:
+            if(file_slots_dirty_)
+                RefreshFileSlots();
+            *out_count = file_slot_count_;
+            return file_slots_;
+        case SdMgmtFolder::PadPresets:
+            if(pad_preset_slots_dirty_)
+                RefreshPadPresetSlots();
+            *out_count = pad_preset_user_slot_count_;
+            return pad_preset_user_slots_;
+        case SdMgmtFolder::GranularPresets:
+            if(granular_preset_slots_dirty_)
+                RefreshGranularPresetSlots();
+            *out_count = granular_preset_user_slot_count_;
+            return granular_preset_user_slots_;
+        default:
+            *out_count = 0;
+            return nullptr;
+    }
+}
+
+void Ui::TriggerSdMgmtDuplicate()
+{
+    int        count = 0;
+    const int* slots = SdMgmtSlots(&count);
+    if(!slots || sd_mgmt_cursor_ >= count)
+        return;
+    int  slot     = slots[sd_mgmt_cursor_];
+    int  new_slot = -1;
+    bool ok;
+    g_progress_disp = disp_;
+    switch(sd_mgmt_folder_)
+    {
+        case SdMgmtFolder::Performances:
+            ok = PerformanceStore::DuplicateSlot(slot, &new_slot, &Ui::OnSaveLoadProgress);
+            break;
+        case SdMgmtFolder::PadPresets:
+            ok = PerformanceStore::DuplicatePadPreset(slot, &new_slot, &Ui::OnSaveLoadProgress);
+            break;
+        case SdMgmtFolder::GranularPresets:
+            ok = PerformanceStore::DuplicateGranularPreset(slot, &new_slot,
+                                                              &Ui::OnSaveLoadProgress);
+            break;
+        default: ok = false; break;
+    }
+    g_progress_disp = nullptr;
+
+    if(ok)
+    {
+        snprintf(sd_mgmt_status_, sizeof(sd_mgmt_status_), "Copied to %d", new_slot);
+        switch(sd_mgmt_folder_)
+        {
+            case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
+            case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+            case SdMgmtFolder::GranularPresets: granular_preset_slots_dirty_ = true; break;
+            default: break;
+        }
+    }
+    else
+    {
+        snprintf(sd_mgmt_status_, sizeof(sd_mgmt_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
+void Ui::TriggerSdMgmtDelete()
+{
+    int        count = 0;
+    const int* slots = SdMgmtSlots(&count);
+    if(!slots || sd_mgmt_cursor_ >= count)
+        return;
+    int  slot = slots[sd_mgmt_cursor_];
+    bool ok;
+    // Passing the relevant page's own "currently loaded" tracker lets
+    // Delete*() keep it correct across the gap-closing renumbering it
+    // does (see its own doc comment) -- otherwise a delete elsewhere in
+    // the list could silently leave e.g. the File page's "Now: N" naming
+    // the wrong performance (or Overwrite writing to it) after everything
+    // above it shifts down.
+    switch(sd_mgmt_folder_)
+    {
+        case SdMgmtFolder::Performances:
+            ok = PerformanceStore::DeleteSlot(slot, &loaded_slot_);
+            break;
+        case SdMgmtFolder::PadPresets:
+            ok = PerformanceStore::DeletePadPreset(slot, &pad_loaded_preset_slot_);
+            break;
+        case SdMgmtFolder::GranularPresets:
+            ok = PerformanceStore::DeleteGranularPreset(slot, &granular_loaded_preset_slot_);
+            break;
+        default: ok = false; break;
+    }
+
+    if(ok)
+    {
+        snprintf(sd_mgmt_status_, sizeof(sd_mgmt_status_), "Deleted %d", slot);
+        switch(sd_mgmt_folder_)
+        {
+            case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
+            case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+            case SdMgmtFolder::GranularPresets: granular_preset_slots_dirty_ = true; break;
+            default: break;
+        }
+        // The list just shrank -- pull the cursor back in range rather
+        // than leaving it pointing past the end (SdMgmtSlots() will
+        // re-scan on the very next call, so the shrunk count is already
+        // current the moment Draw() next asks for it).
+        if(sd_mgmt_cursor_ > 0)
+            sd_mgmt_cursor_--;
+    }
+    else
+    {
+        snprintf(sd_mgmt_status_, sizeof(sd_mgmt_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
 void Ui::RefreshPadPresetSlots()
 {
     pad_preset_user_slot_count_
@@ -3272,10 +4375,31 @@ void Ui::TriggerSavePadPreset(bool force_new)
     }
 }
 
+void Ui::TriggerNewPadPreset()
+{
+    if(!pad_synth_)
+        return;
+    // The Load chooser's "New" pick (see ApplyKnobs()'s BrowsingLoad
+    // handling) -- resets to the first factory patch, same fresh-start
+    // spirit as Global:File's own TriggerNew().
+    pad_synth_->ApplyPreset(PadSynth::GetFactoryPreset(0));
+    pad_loaded_preset_slot_ = 1;
+    snprintf(pad_preset_status_, sizeof(pad_preset_status_), "New (%s)",
+              PadSynth::GetFactoryPresetName(0));
+}
+
 void Ui::TriggerLoadPadPreset()
 {
     if(!pad_synth_)
         return;
+    // !load_browsing_files_ means the top-level chooser confirmed with
+    // "New" highlighted (can_confirm_load only allows a confirm here when
+    // that's the case -- see HandleButton2()).
+    if(!load_browsing_files_)
+    {
+        TriggerNewPadPreset();
+        return;
+    }
     int slot = PadPresetCursorToSlot(pad_preset_cursor_, pad_preset_user_slots_,
                                        pad_preset_user_slot_count_);
     if(slot < 0)
@@ -3321,6 +4445,43 @@ void Ui::TriggerGranularCaptureFromLayer()
     snprintf(granular_capture_status_, sizeof(granular_capture_status_), "Captured L%d",
               layer + 1);
     OnNewGranularCapture(len);
+}
+
+void Ui::RefreshGranularImportFiles()
+{
+    granular_import_file_count_
+        = PerformanceStore::ListImportWavFiles(granular_import_names_, kMaxImportFiles);
+    if(granular_import_cursor_ >= granular_import_file_count_)
+        granular_import_cursor_ = granular_import_file_count_ > 0 ? granular_import_file_count_ - 1 : 0;
+    granular_import_files_dirty_ = false;
+}
+
+void Ui::TriggerGranularImport()
+{
+    if(!granular_ || !granular_capture_buf_l_ || !granular_capture_buf_r_)
+        return;
+    if(granular_import_cursor_ < 0 || granular_import_cursor_ >= granular_import_file_count_)
+        return;
+
+    const char* filename = granular_import_names_[granular_import_cursor_];
+    size_t      len       = 0;
+    g_progress_disp = disp_;
+    bool ok = PerformanceStore::ImportWav(filename, granular_capture_buf_l_,
+                                            granular_capture_buf_r_, granular_capture_capacity_,
+                                            &len, &Ui::OnSaveLoadProgress);
+    g_progress_disp = nullptr;
+
+    if(ok)
+    {
+        granular_->SetSource(granular_capture_buf_l_, granular_capture_buf_r_, len);
+        OnNewGranularCapture(len);
+        snprintf(granular_capture_status_, sizeof(granular_capture_status_), "Imported");
+    }
+    else
+    {
+        snprintf(granular_capture_status_, sizeof(granular_capture_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
 }
 
 void Ui::OnNewGranularCapture(size_t full_len)
@@ -3431,9 +4592,34 @@ void Ui::TriggerSaveGranularPreset(bool force_new)
     }
 }
 
+void Ui::TriggerNewGranularPreset()
+{
+    if(!granular_)
+        return;
+    // The Load chooser's "New" pick (see ApplyKnobs()'s BrowsingLoad
+    // handling) -- clears the captured audio and resets every param to
+    // the engine's own defaults, same fresh-start spirit as Global:File's
+    // own TriggerNew().
+    granular_->ApplyPreset(GranularEngine::GranularPresetData{});
+    granular_->SetSource(granular_capture_buf_l_, granular_capture_buf_r_, 0);
+    OnNewGranularCapture(0);
+    granular_loaded_preset_slot_ = 0;
+    snprintf(granular_preset_status_, sizeof(granular_preset_status_), "New");
+}
+
 void Ui::TriggerLoadGranularPreset()
 {
-    if(!granular_ || granular_preset_cursor_ < 0
+    if(!granular_)
+        return;
+    // !load_browsing_files_ means the top-level chooser confirmed with
+    // "New" highlighted (can_confirm_load only allows a confirm here when
+    // that's the case -- see HandleButton2()).
+    if(!load_browsing_files_)
+    {
+        TriggerNewGranularPreset();
+        return;
+    }
+    if(granular_preset_cursor_ < 0
        || granular_preset_cursor_ >= granular_preset_user_slot_count_)
         return;
     int slot = granular_preset_user_slots_[granular_preset_cursor_];

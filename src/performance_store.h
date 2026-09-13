@@ -56,6 +56,24 @@ int NextFreeSlot();
 
 using ProgressFn = void (*)(float progress01);
 
+// Deletes an existing saved performance -- irreversible, same as deleting
+// any other file; the caller (SD MGMT's own hold-to-confirm gesture) owns
+// making that consequence clear before calling this. Also closes the gap
+// this leaves behind: every higher-numbered performance still on the card
+// (plus any other pre-existing gaps above it) shifts down to keep the
+// numbering contiguous from 1, so a later Save New always continues right
+// after the highest real performance instead of NextFreeSlot() picking
+// the low number this just freed. If loaded_slot_inout is non-null and
+// currently names a slot this shifts (or the one just deleted), it's
+// updated in place to follow that content to its new slot (or to -1 if it
+// was the slot just deleted).
+bool DeleteSlot(int slot, int* loaded_slot_inout = nullptr);
+// Byte-for-byte copy of an existing performance into the next free slot
+// (see NextFreeSlot()) -- chunked, so this can take real time for a
+// performance with a lot of recorded audio; pass on_progress the same way
+// Save()/Load() do. *out_new_slot is set to the slot actually used.
+bool DuplicateSlot(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
 bool Save(int                slot,
           TempoClock&        tempo,
           LooperLayer*       layers,
@@ -103,6 +121,12 @@ bool LoadPadPreset(int slot, PadSynth::PadPresetData* out_preset);
 int  ListPadPresets(int* out_numbers, int max_out);
 // Lowest free USER slot, or -1 if the whole range is full/no card.
 int  NextFreePadPresetSlot();
+// Refuses factory slots (1..PadSynth::kNumFactoryPresets aren't files at
+// all) same as SavePadPreset() -- see DeleteSlot()/DuplicateSlot() above
+// for the general shape, including the same gap-closing renumbering and
+// loaded_slot_inout follow-along.
+bool DeletePadPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
 
 // Grains (GranularEngine) presets: parameters AND the captured audio
 // itself (unlike Pad presets above, which are parameters only) -- a
@@ -138,6 +162,50 @@ bool LoadGranularPreset(int                                  slot,
                         ProgressFn                            on_progress = nullptr);
 int  ListGranularPresets(int* out_numbers, int max_out);
 int  NextFreeGranularPresetSlot();
+// No factory range to guard against here (see kMaxGranularPresets's own
+// comment) -- see DeleteSlot()/DuplicateSlot() above for the general
+// shape, including the same gap-closing renumbering and
+// loaded_slot_inout follow-along. Duplicating copies the whole file
+// (params + captured audio) in one chunked byte-for-byte pass, not
+// through GranularEngine at all.
+bool DeleteGranularPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Importing a user-supplied WAV file (from a computer, dropped into
+// IMPORT/ on the SD card) as Grains capture audio -- a third capture
+// source alongside Direct Record and From Layer. Accepts 16-bit PCM,
+// mono or stereo, 48000 or 44100 Hz; 44100 Hz files are resampled up to
+// the native 48000 Hz engine rate with the same exact-ratio linear
+// resampler ExportWav() already uses in the other direction. Anything
+// else (24-bit, non-PCM, other sample rates) is cleanly refused
+// (GetLastError() reports why) rather than misread -- there's no
+// general resampler/format-conversion here, just these two exact rates.
+constexpr int kMaxImportWavNameLen = 60;
+// Fills out_names ascending (directory order) with .wav/.WAV filenames
+// found in IMPORT/ on the SD root, returns how many were found (up to
+// max_out). A name longer than kMaxImportWavNameLen is SKIPPED entirely
+// rather than truncated -- an earlier version truncated it instead, which
+// silently produced a listed name that didn't match any real file on
+// disk (ImportWav() would then fail to open it, FR_NO_FILE) since
+// truncating can chop off the ".wav" extension or land mid-name.
+// Realistic sample filenames are well under this length in practice.
+// Also skips macOS "._name.wav" AppleDouble sidecar files -- these get
+// silently created alongside every real file when Finder (or many other
+// macOS copy tools) writes to a non-HFS+ volume like a FAT32 SD card;
+// they end in .wav and so pass the extension filter, but their content
+// isn't a real WAV file (fails ImportWav()'s own RIFF magic check).
+int  ListImportWavFiles(char out_names[][kMaxImportWavNameLen + 1], int max_out);
+// out_l/out_r must have room for at least audio_capacity samples each --
+// the file's own length (after any resampling) is truncated to that,
+// same "never write past what the caller owns" rule as
+// LoadGranularPreset(). *out_len is set to however many samples were
+// actually produced.
+bool ImportWav(const char* filename,
+               float*      out_l,
+               float*      out_r,
+               size_t      audio_capacity,
+               size_t*     out_len,
+               ProgressFn  on_progress = nullptr);
 
 // Renders the current in-memory performance (one full shared loop length,
 // every layer's real filter/character-effect/reverb chain applied,

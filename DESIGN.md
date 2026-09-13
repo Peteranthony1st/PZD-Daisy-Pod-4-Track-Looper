@@ -57,19 +57,45 @@ hardware nobody's confirmed keeping.
 One consistent grammar everywhere:
 
 - **Rotate** the encoder: on Home, moves the layer cursor; on any other
-  screen, cycles through that screen's pages.
-- **Click** the encoder: only meaningful on Home, where it drills into
-  the layer under the cursor.
+  screen, cycles through that screen's pages — with one exception,
+  `Screen::Mixer`, where rotate instead steps through channel "stops"
+  (see its own section below) since there's no page-switching job left
+  for it there.
+- **Click** the encoder: on Home, drills into the layer under the cursor.
+  On `Global:Pad`/`Global:Granular`/`Global:Mixer` specifically, it's
+  instead this Global page's own entry point into a real top-level
+  screen (`Screen::Pad`/`Screen::Granular`/`Screen::Mixer`) — the same
+  encoder-click gesture, just repurposed per-page since Home's own
+  drill-in doesn't apply outside Home. On `Screen::Pad`/`Screen::Granular`
+  themselves (and every other Global page), a click mutes/unmutes all 4
+  loop layers (`Ui::TogglePauseAll()`) — there's no drill-in job left for
+  it on those screens, so it's free for the same mute Global pages
+  already use. Unused on `Screen::Mixer` (rotate already picks the stop).
 - **Long-press** the encoder (~600ms): from Home, opens Global settings;
-  from anywhere else, goes back to Home.
+  from anywhere else — including `Screen::Pad`/`Screen::Granular`/
+  `Screen::Mixer` — goes back to Home.
 
 ```
 Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
   │                                             Effect / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
   └──(long-press)──► Global ──(rotate)──► Tempo / Filter / Reverb / File /
-                                             Export
-                                                (long-press ⤴ back to Home)
+       │                                    SdMgmt / Export / Pad / Granular /
+       │                                    Looper / Mixer
+       │                                       (long-press ⤴ back to Home)
+       ├──(click on Global:Pad)──► Screen::Pad ──(rotate)──► Tone / Tune / ADSR /
+       │                                                     Chorus / Vibrato / Filter /
+       │                                                     Mix / ModAssign / Preset
+       │                                                        (click ⤴ mute loop layers)
+       │                                                        (long-press ⤴ back to Home)
+       ├──(click on Global:Granular)──► Screen::Granular ──(rotate)──► Grain / Position /
+       │                                                     TuneDirection / ADSR / Filter /
+       │                                                     Mix / Capture / Trim / Preset
+       │                                                        (click ⤴ mute loop layers)
+       │                                                        (long-press ⤴ back to Home)
+       └──(click on Global:Mixer)──► Screen::Mixer ──(rotate)──► 8 channel stops, then
+                                                                  a Scope stop, wrapping
+                                                                     (long-press ⤴ back to Home)
 ```
 
 Both knobs and both buttons are "soft" — their function depends on
@@ -100,8 +126,33 @@ Full control map:
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
 | Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Toggle scrub mode (see below) | Reset to 1.0x |
-| Global: File | Browse save slots | — | Tap = Save, hold 400ms = New | Hold 800ms = Load |
+| Global: File | Idle: nothing. ChoosingSave: Overwrite/Save New. BrowsingLoad chooser: Files/New, drilled-in: browse files | — | Idle: tap = reveal Save; chooser: tap = drill into file list (Files) or Back (New); elsewhere: tap = Back | Idle: tap = reveal Load; ChoosingSave/drilled-into-Load: hold 800ms = confirm |
+| Global: SD Mgmt | Folder select / file browse (same list, always "Scroll") | — | Tap = drill into folder / back up a level; hold 800ms = Duplicate the browsed file | Hold `kSdMgmtDeleteHoldMs` (1500ms) = Delete the browsed file |
 | Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
+| Global: Pad | — | — | Toggle Pad Synth on/off (see *Per-engine on/off* below) | — |
+| Global: Granular | — | — | Toggle Grains on/off | — |
+| Global: Looper | — | — | Toggle the whole 4-layer loop system on/off (also resets `TempoClock`'s phase) | — |
+| Global: Mixer | — (entry point + at-a-glance overview grid, see *Screen::Mixer* below) | — | — | — |
+| Pad: Tone | Registration (dark↔bright oscillator morph) | Osc gain | — | — |
+| Pad: Tune | Coarse tune, ±24 semitones | — | — | — |
+| Pad: ADSR | Attack (or Sustain) | Decay (or Release) | Knobs → Attack+Decay | Knobs → Sustain+Release |
+| Pad: Chorus | Depth | Rate | — | — |
+| Pad: Vibrato | Depth | Rate (ceiling the mod wheel scales up to, see *ModDestination*) | — | — |
+| Pad: Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Pad: Mix | Reverb send | Output level | — | — |
+| Pad: Mod Assign | — | — | Cycle `ModDestination` (Vibrato/FilterCutoff/ChorusDepth) | — |
+| Pad: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File |
+| Granular: Grain | Size (or Gap) | Fill (or Scan) | Knobs → Size+Fill | Knobs → Gap+Scan |
+| Granular: Position | Position (Grain layer's fixed anchor) | — | — | — |
+| Granular: TuneDirection | Tune (grain pitch, ±24 semitones) | Direction (Forward/Reverse/Random) | Toggle Map-to-Note | — |
+| Granular: ADSR | Attack (or Sustain) | Decay (or Release) | Knobs → Attack+Decay | Knobs → Sustain+Release |
+| Granular: Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Granular: Mix | Grain volume (or Reverb send) | Scan volume | Knobs → Grain+Scan volume | Knobs → Reverb send |
+| Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
+| Granular: Trim | Trim start | Trim end | — | — |
+| Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
+| Mixer: Layer/Pad/Grains/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Mixer: Master | Volume | Reverb size | — | — |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
 affecting them, so you can't accidentally pull every track out of sync —
@@ -330,25 +381,443 @@ is kept as cheap insurance against this exact failure shape for any
 current or future SDRAM-placed effect, not just the one that first
 surfaced it.
 
+### Bypass's own mix volume/pan
+
+Home's Bypass (Button 2) mixes live input directly into the output; it
+now has its own Volume/Pan on `Screen::Mixer`'s Bypass channel,
+independent of the per-layer recording input **Gain** (which only ever
+affects what gets *captured*, not the Bypass monitor mix). Like Master
+Volume and vari-speed, these are live-performance controls, not part of
+a saved performance — they reset to their defaults (Volume 0.8, Pan
+center) on boot and after `Load()`, never persisted to `PERF/*.DAT`.
+
+## MIDI
+
+Two MIDI-played instruments — Pad Synth and Grains, both described below
+— run alongside the looper, driven by the Pod's built-in MIDI IN jack
+(`hw.midi`, a `MidiUartHandler` on the Pod's UART). One real hardware
+quirk this needed working around: libDaisy's default MIDI transport
+config claims the same physical pin as the encoder's own click button
+(`D13`) for MIDI TX, but the Pod's MIDI jack only ever wires up RX per
+Electrosmith's own pinout — that TX claim is never actually usable here.
+`main.cpp` re-inits MIDI with TX explicitly disabled
+(`Pin(PORTX, 0)`, the standard "don't claim this pin" sentinel) and
+re-inits the encoder afterward to reclaim `D13`, rather than relying on
+TX simply never being driven.
+
+MIDI is polled from the **1kHz control-rate callback**, not the main
+loop — the same reasoning buttons already use: the main loop's OLED
+redraw is a blocking I2C write, and if a redraw stall delayed draining
+the UART, a very fast note tap's NoteOn and NoteOff could end up sitting
+in the queue together, both getting drained in the same pass with no
+audio block ever seeing the note as held — a silent note instead of a
+short blip. Pitch bend updates read more naturally at this steady rate
+too, for the same reason.
+
+- **NoteOn/NoteOff** currently drive **both** Pad Synth and Grains from
+  the same incoming stream — there's no per-engine MIDI channel or
+  screen-based routing yet (flagged in `main.cpp` as a temporary,
+  first-pass simplification). Playing a note plays it on whichever of
+  the two engines are enabled (see *Per-engine on/off* below).
+- **Pitch bend** (±2 semitones, the MIDI standard default) feeds Pad
+  Synth only (`PadSynth::SetPitchBendSemis()`) — Grains has no pitch
+  bend input.
+- **Mod wheel** (CC1) feeds Pad Synth's mod-wheel-assignable destination
+  (Vibrato/FilterCutoff/ChorusDepth, see below) — also Pad Synth only.
+
+## Per-engine on/off
+
+`Global:Pad`/`Global:Granular`/`Global:Looper` each carry a plain
+Button-1-tap on/off toggle (`pad_enabled_`/`granular_enabled_`/
+`looper_enabled_`) — a real CPU lever, not just a mute: `AudioCallback()`
+skips calling that engine's `Process()` entirely while disabled and
+writes silence instead, so someone using only Pad Synth (say) genuinely
+gets the other two engines' CPU share back, not just their silence.
+Switching the looper off also resets `TempoClock`'s phase (bar/beat
+position, count-in state, click envelope) back to bar 1 beat 1, so
+turning it back on always resumes cleanly rather than picking up
+mid-phase from wherever it happened to be frozen.
+
+## Pad Synth (Screen::Pad)
+
+A MIDI-played, polyphonic pad instrument (`pad_synth.h/.cpp`), meant for
+warm/lush sustained sounds (chords held via a MIDI keyboard), not a
+percussive/plucked instrument. Owns its own DSP state directly as
+members, the same ownership model `LooperLayer` already uses for its own
+`Svf` filter pair — a single self-contained instrument with its own
+filter/level/send, not a cross-cutting bus effect like `main.cpp`'s
+master filter.
+
+**Architecture, proven cheap on real hardware before this class was
+written** (measured directly in `main.cpp` with the same DWT
+cycle-counter technique used throughout this project): `kMaxVoices` ×
+`daisysp::OscillatorBank` (a divide-down organ/"string synth" oscillator
+— no transcendental calls at all in its `Process()`), each with its own
+`daisysp::Adsr` envelope (also pure arithmetic per sample), plus ONE
+shared `daisysp::Chorus` on the summed bus. At 8 voices this cost 49%
+worst-case CPU alongside a full 4-layer loop + reverb already playing.
+`daisysp::StringVoice` (Karplus-Strong) was measured and ruled out
+instead — a SINGLE voice alone cost 68% (two `powf()` + one `atanf()`
+every sample, unconditionally), which is why the additive/organ approach
+was chosen over a plucked-string model.
+
+**Voice count**: `kMaxVoices` was reduced from 8 to **6** after measuring
+the genuine worst case with everything running at once (4 loop layers +
+reverb + full Pad Synth + Grains, all simultaneously active) at ~94% —
+a direct, proportional trade-off of polyphony for headroom, not a free
+optimization. Every loop/array in the class already keys off this one
+constant, so this is the only line that needs to change if that
+trade-off is revisited (e.g. under the FM-synth experiment mentioned in
+project history, where a cheaper per-voice cost might afford more
+voices back).
+
+**Voice allocation**: `FindVoiceForNote()` prefers an already-silent
+voice (its `Adsr` in `ADSR_SEG_IDLE`) that isn't currently held, then a
+genuinely free (never-triggered) voice, then falls back to stealing the
+oldest currently-held voice (`triggered_at`, a simple monotonic counter)
+— standard oldest-note voice stealing, no special-casing beyond that.
+
+**Tone/Registration**: `SetRegistration01()` is a single-knob morph
+between a hand-tuned "dark" (weighted toward 8'/4' organ stops) and
+"bright" (weighted toward 2'/1') `OscillatorBank` amplitude vector,
+applied identically to every voice — a property of the instrument's
+overall character, not a per-note thing.
+
+**Tune**: a coarse ±24-semitone transpose, discretized the same way
+Grains' own `GetGrainTuneSemitones01()` is (see *Grains* below and its
+bucket-center rounding note) — recomputed at control-rate
+(`tune_rate_ = powf(2, semitones/12)`), not per sample, same as pitch
+bend's own `bend_ratio_`.
+
+**Envelope**: attack/decay/release use the project's existing curved-
+seconds convention (`kMinAdsrSeconds`=5ms .. `kMaxAdsrSeconds`=3s,
+exponential) so a knob's physical travel doesn't visually "do nothing"
+for most of its range the way a raw-01-to-seconds mapping would — the
+same math already backing the ADSR-shape graph drawn on screen.
+
+**Chorus**: one shared `daisysp::Chorus` instance on the summed voice
+bus (Depth/Rate knobs), not per-voice — the same "one shared instance,
+not N" reasoning as the loop layers' shared reverb bus.
+
+**Vibrato**: a cheap phase-accumulator triangle LFO (not a
+`daisysp::Oscillator` instance — this project already has the identical
+`phase_ += inc; wrap` pattern elsewhere, e.g. `TempoClock`), scaling
+fractional FM up to `kVibratoMaxDepthFraction` (0.06, ≈1 semitone at
+full depth). The mod wheel gates/scales it (wheel at 0 = no vibrato
+regardless of the Depth knob, wheel at 1 = the full Depth-set amount) —
+Vibrato has no meaningful "always-on" base the way Filter/Chorus's mod
+destinations do, so this is a ceiling-and-scale relationship, not an
+additive one.
+
+**Mod wheel destinations** (`ModDestination`, cycled by the Preset
+page's neighbor, Mod Assign): Vibrato (see above), FilterCutoff, or
+ChorusDepth — the wheel routes additively on top of whichever page's own
+knob as the base value for the latter two; Vibrato is the one exception
+(no separate base, a still wheel means no vibrato at all).
+
+**Filter**: one bus-level `Svf` pair (post-chorus, pre-reverb-send),
+independent of `main.cpp`'s own master-bus filter, sharing the same
+`FilterMode`/curve it uses.
+
+**Mix**: Reverb Send and Output Level, both reachable identically from
+this engine's own Mix page and from `Screen::Mixer`'s Pad channel — same
+underlying value either way, so changing it in one place updates the
+other with no extra sync needed.
+
+**Pan**: linear pan law (`panL = 1-v`, `panR = v`), the same law
+`LooperLayer::SetPan01()` uses — kept consistent so Pad Synth pans the
+same way the loop layers do at the same knob position, rather than a
+"nicer" equal-power curve that would behave differently from everything
+else in the mix. Applied to both the dry output and the reverb send
+(post-pan), again matching `LooperLayer`'s own `Process()`.
+
+**Presets** (`PadSynth::PadPresetData`): a flat snapshot of every
+setting above. ~10 hand-tuned factory presets are embedded in firmware
+(not SD files), always available even on a blank/unformatted card —
+index 0 ("New") is the neutral/default preset, and `Init()` applies it
+directly, so what boots is always exactly preset 0, not a second,
+separately-hand-coded default that could quietly drift out of sync with
+it. User presets save/load to `PADP/PRESnnn.DAT` (up to 99 slots, on top
+of the always-available factory range) via the same Save/Load/Back
+convention as Global:File (see *Save/load* below) — plus a full
+performance save embeds the *currently loaded* Pad sound directly (not
+just a reference to a preset slot), so loading an old performance always
+restores exactly the pad tone it was saved with even if the named preset
+was later changed or deleted.
+
+Two fields (`tune01`, `pan01`) were added to `PadPresetData` after most
+of the factory presets were already written — both are trailing fields
+with default member initializers (0.5f = neutral/centered), so every
+existing positional initializer list (which only lists the fields that
+existed at the time it was written) still gets a sensible neutral value
+with no need to touch any of them.
+
+## Grains (Screen::Granular / GranularEngine)
+
+A MIDI-played, **monophonic** granular instrument (`granular_engine.h/
+.cpp`) — deliberately much simpler than an earlier 8-voice granular
+engine this project shelved on its own git branch: one held note at a
+time, no oscillator layer (Pad Synth covers that role now), and two
+overlapping-grain layers sharing one Size/Fill/Gap scheduling mechanism
+instead of one polyphonic grain cloud plus a separate, thinner "scan
+grain".
+
+**Does not own its captured buffer** — `SetSource()` just points the
+engine at whatever buffer currently holds a capture (SDRAM, owned by
+`main.cpp`), the same convention the earlier engine used. `len == 0`
+means "nothing captured yet" (`NoteOn()` is then a no-op); setting a new,
+possibly-shorter source outright silences both grain clusters, since a
+grain's position was computed against the *old* `src_len_` and could
+otherwise read out of bounds against a shorter new capture.
+
+**Two grain layers, one mechanism**: both **Grain** (a fixed-Position
+anchor) and **Scan** (a continuously-sweeping anchor, bouncing between
+Scan Start/End at a speed/direction set by the Scan knob) are the exact
+same `GrainCluster` — `kGrainsPerVoice` = 3 overlapping grain slots
+(3-way overlap is the standard granular-synthesis compromise for a
+smooth, click-free texture at any grain size), scheduled from the same
+Size/Fill/Gap values. This is a deliberate redesign, not a port: the
+earlier engine's Scan was a single retriggered grain on its own timer,
+and even after several rounds of tuning it stayed thinner/choppier than
+the main grain cloud, because one voice retriggering periodically is
+inherently less smooth than several overlapping ones. Giving Scan the
+identical multi-slot scheduling the Grain layer already uses fixes that
+by construction rather than by tuning constants further.
+
+**Size/Fill/Gap** (shared by both layers, since they're reading the same
+kind of grains, just from different anchors):
+- **Size**: grain length, `kMinGrainMs`(1ms)..`kMaxGrainMs`(500ms).
+- **Fill**: how many of the `kGrainsPerVoice` slots are active (0 =
+  silence). Renamed from the earlier engine's "Grain Count" to match the
+  reference hardware granular device this redesign is modeled after.
+- **Gap**: 0 = grains packed with no gap (hop = grain length / Fill), 1 =
+  maximally sparse (real silence between grains). Renamed AND
+  polarity-flipped from the earlier engine's "Density" (where 1.0 meant
+  "packed") to match that same reference device's own "Gap" vocabulary,
+  which goes the other way.
+
+**Position/Scan**: Position is a real knob-controlled fixed anchor for
+the Grain layer. Scan uses the same dead-zone-centered bidirectional
+curve as this project's own vari-speed/scrub controls: center (0.5,
+default) is off, above/below picks which end of the Scan Start/End range
+it heads toward first, speed proportional to distance from center.
+
+**Tune / Map to Note**: Tune is a fixed per-grain pitch offset
+independent of the held note; Map to Note additionally tracks the note's
+own pitch (12-TET against middle C) on top of Tune. `SetGrainTuneSemitones01()`
+quantizes to whole semitones (±24) — its matching getter,
+`GetGrainTuneSemitones01()`, returns each bucket's *center*, not its
+edge: a discretizing setter using `(int)(v01*N + 0.5f)` must have its
+getter return `(value+offset)/N`, not `(value+offset+0.5f)/N` (which
+would land on the bucket edge and round-trip to the next semitone up on
+every save/reload) — a real bug once found and fixed here, and
+deliberately avoided when `PadSynth::GetTuneSemitones01()` was written
+afterward using the same pattern.
+
+**Direction**: per-grain read direction, Forward/Reverse/Random,
+quantized from one knob. Spray (randomized per-grain timing jitter) was
+dropped in this redesign — it was a source of real, hard-to-diagnose
+jitter bugs in the earlier engine.
+
+**Note-level ADSR**: shapes the whole voice's overall loudness across a
+held note, layered ON TOP of (not instead of) a fixed per-grain Hann
+window (a 256-entry lookup table, `ReadHann()`) — the Hann window only
+prevents clicks within a single grain, it has no swell-in/tail-off of
+its own, which is what the ADSR adds. Same curved-seconds convention as
+Pad Synth's own ADSR.
+
+**Monophonic voice logic**: `NoteOn()` always retriggers the single
+voice (last-note priority, plain retrigger, no legato/portamento).
+`NoteOff()` only releases if it matches the currently-held note, so
+releasing an old note after a new one has already retriggered doesn't
+cut the new one short. A genuinely different note interrupting one still
+sounding calls `ChokeCluster()` on both clusters — moving every
+currently-active grain into its own release-fade slot (one per grain
+slot, not one shared slot, so several simultaneously-active grains each
+fade independently) rather than an audible instant cut.
+
+**Capture**: three sources, all landing in the same SDRAM-owned buffer
+`main.cpp` allocates:
+- **Direct Record** — Button 2 held on the Capture page streams live
+  input straight into the buffer for as long as it's held (or until the
+  buffer's fixed capacity is reached).
+- **From Layer** — an instant copy of whichever loop layer is currently
+  selected as the capture source (independent of Home's own cursor) into
+  the same buffer, then points the engine at it via `SetSource()`.
+- **Import** — reads a user-supplied `.wav` file from the SD card's
+  `IMPORT/` folder (16-bit PCM, mono or stereo, 48000 or 44100 Hz; 44.1kHz
+  files are resampled up to the engine's native 48kHz with the same
+  exact-ratio linear resampler `ExportWav()` already uses in the other
+  direction). Anything else (24-bit, non-PCM, other rates) is cleanly
+  refused rather than misread.
+- **Trim**: non-destructive start/end trim over whatever's currently
+  captured — the underlying buffer is untouched, only the sub-range
+  passed to `SetSource()` changes, so re-trimming always works from the
+  original full capture, not whatever the previous trim left behind.
+
+**Filter/Mix/Reverb send/Pan/Output level**: same shape as Pad Synth's
+own (see above) — one bus-level `Svf` pair, independent Grain-layer and
+Scan-layer volumes summed before a single Output Level stage, a
+continuous Reverb Send knob (previously an unconditional full send with
+no control at all), and the same linear pan law applied to the
+already-stereo captured signal (Grains reads real L/R from whatever was
+captured/imported, unlike Pad Synth's mono voice sum).
+
+**Presets** (`GranularEngine::GranularPresetData`): unlike Pad Synth,
+Grains presets are **audio-inclusive** — a Grains preset IS a specific
+captured sound plus how it's being played back, so saving/loading one
+needs to restore both. `PerformanceStore::SaveGranularPreset()`/
+`LoadGranularPreset()` stream the captured audio alongside the
+parameters into ONE combined file per slot (`GRNP/PRESnnn.DAT`, up to 99
+slots — no factory range, there's no hand-tuned-capture equivalent to a
+hand-tuned patch), so this can take real SD-transfer time (up to ~1.9MB
+of audio) and shows a live progress bar during the save/load, unlike Pad
+Presets' instant tiny-struct transfer. Output Level and Reverb Send are
+deliberately excluded from the saved struct (same reasoning as Pan) —
+session-level mixer settings, not part of the captured sound's own
+identity.
+
+## Screen::Mixer
+
+One screen covering all 8 mixable channels — Loop Layers 1–4, Pad
+Synth, Grains, Bypass, and Master — reached by clicking the encoder on
+`Global:Mixer` (which itself shows a static at-a-glance overview grid:
+all 8 channel names in a row, each with a real vertical Volume bar, no
+numeric readout, via `DrawMixerOverviewGrid()`).
+
+**Rotate picks the channel, not the page** — unlike every other
+Pad/Granular-style screen, `Screen::Mixer` has no sub-pages of its own;
+the encoder's usual "cycle this screen's pages" job is repurposed to
+step through one continuous, endlessly-wrapping sequence of 8 channel
+stops plus a final Scope stop (a live oscilloscope of the actual
+post-fader master mix, captured in `main.cpp` right after the master
+filter/click/master-volume stage — the real final signal, not any one
+instrument's own output), then wraps back to channel 0. This was a
+deliberate design constraint, not an oversight: encoder rotate means
+"next page" on every other screen in this project with zero exceptions,
+so when Mixer needed a way to move between 8 channels *and* had no
+"next page" job of its own left to give the encoder, repurposing rotate
+for exactly this one screen was the least-surprising option, rather than
+inventing a second, competing "rotate" gesture.
+
+**Each of the 7 non-Master channels** shows a Detail page with real
+Volume/Pan/Reverb-Send vertical bars: Button 1 tap maps the knobs to
+Volume+Pan, Button 2 tap maps them to Reverb Send — the same
+Button-1/Button-2-toggle-which-pair idiom already used elsewhere (Pad's
+merged ADSR page, Grains' merged Grain/ADSR/Mix pages). **Master** (the
+8th channel) has no toggle — Knob 1 is Volume, Knob 2 is Reverb Size,
+always, since there's no per-channel Pan/Send concept for the master bus
+itself.
+
+**A genuine knob-pickup exception, and why**: `KnobContext::MixerVolPan`/
+`MixerReverb` are each shared across all 7 non-Master channels (branching
+internally on `mixer_position_`, the same "one context, branch on which
+target" idiom `KnobContext::LayerStatus` already uses for
+`cursor_layer_`). Unlike `LayerStatus`, though, `mixer_position_` can
+change *while this exact KnobContext value stays the same* (rotating
+between two Volume+Pan channels doesn't change which enum value
+`CurrentKnobContext()` returns) — so the automatic "re-arm pickup on
+context change" logic every other rotate-driven index in this project
+relies on never fires here on its own. `HandleEncoder()`'s own rotate
+handling explicitly re-runs the pickup reset/reseed by hand on every
+channel change as a deliberate, documented exception to that otherwise-
+universal rule.
+
+## SD card management (Global:SdMgmt)
+
+Lets you browse any of the 3 save categories — Performances, Pad
+Presets, Grains Presets — and Duplicate or Delete individual files
+directly from the Pod, no computer needed. Reuses the exact same cached
+slot-list arrays and dirty-flag/`Refresh*()` functions the 3 save pages
+already scan and cache — no duplicate directory-scanning logic anywhere.
+
+- **Duplicate** (Button 1 held 800ms): byte-for-byte chunked copy into
+  the next free slot in that category (`CopyFileChunked()`, shared by
+  all 3 categories) — `FA_CREATE_NEW`, not `FA_CREATE_ALWAYS`, so an
+  unexpected filename collision fails loudly instead of silently
+  overwriting something; any failure partway through deletes the partial
+  destination file rather than leaving a corrupt copy behind.
+- **Delete** (Button 2 held `kSdMgmtDeleteHoldMs` = 1500ms — longer than
+  every other hold-to-confirm gesture in this project, since unlike
+  Overwrite/New (which can just be re-saved/re-loaded), delete has no
+  undo): removes the file, then **closes the gap it leaves behind** —
+  every higher-numbered file still on the card in that same category
+  (and any other pre-existing gaps above it) shifts down to the lowest
+  free number below it, converging back to contiguous numbering from 1
+  (or from the first user slot, for Pad Presets' factory-reserved range)
+  regardless of deletion order. Without this, `NextFree*Slot()`'s own
+  "lowest free slot" scan would silently reuse the low number a delete
+  just freed on the very next Save New, while other, higher-numbered
+  saves sat stranded above it with a permanent gap in between. If the
+  file that was deleted (or one that got shifted) happens to be the one
+  currently loaded on its own save/load page, that page's own "Now: N"
+  tracking is updated in the same pass to follow it to its new slot (or
+  to "unsaved"/"custom" if it was the one actually deleted) — passed
+  through as an in/out pointer to `DeleteSlot()`/`DeletePadPreset()`/
+  `DeleteGranularPreset()` rather than guessed at from the caller side,
+  since only the delete function itself knows exactly how far each
+  surviving file actually moved.
+
+## The Files/New Load chooser
+
+Save and Load use a deliberately identical two-step interaction on all 3
+save pages (Global:File, Pad Preset, Grains Preset), so the convention
+never needs re-learning between them:
+
+- **Save** (Button 1 tap from idle): reveals a two-line choice —
+  Overwrite (only offered once something's actually loaded) vs. Save
+  New — picked with Knob 1, confirmed with Button 2 held 800ms.
+- **Load** (Button 2 tap from idle): reveals the *same shape* of
+  two-line choice — **Files** vs. **Load New** — picked with Knob 1.
+  Selecting Files and tapping Button 1 drills in: the chooser is
+  replaced by the actual numbered file list, and Knob 1 now scrolls it
+  directly. Button 1 is "Back" everywhere else inside Load (drilled-in
+  → back to the chooser; chooser-with-New-highlighted → back to idle).
+  Button 2 held 800ms confirms whichever is actually selected — a
+  specific browsed file, or New — and does nothing yet at the chooser
+  with Files highlighted, since there's no specific target picked at
+  that level ("nothing if it does nothing", the same footer-label rule
+  this project already applies everywhere else).
+- **New**, reached this way instead of a separate hidden gesture, means:
+  Global:File clears every layer's recorded audio (keeping every
+  setting); Pad Preset resets to the first factory patch; Grains Preset
+  clears the captured audio and resets every parameter to the engine's
+  own defaults — each the same "genuine fresh start" as the category's
+  own factory-default state.
+
+Both this chooser and Overwrite/Save New share the same forcing rule
+when the "other" option isn't valid: Overwrite forces Save New when
+nothing's loaded; the Load chooser forces New when there's nothing to
+browse (an empty save list) — Knob 1 simply can't land on a choice that
+doesn't exist.
+
 ## Save/load
 
 `PerformanceStore` saves/loads a whole performance (all 4 layers' audio
-plus tempo/global/per-layer settings) as one flat binary file per slot,
+plus tempo/global/per-layer settings, plus the currently loaded Pad
+Synth sound — see *Pad Synth* above) as one flat binary file per slot,
 `PERF/PERF001.DAT` .. `PERF/PERF099.DAT`, via Global:File — kept in its
 own subfolder for the same reason WAV exports get their own (see below):
 a tidier SD root, and it keeps `ListSlots()`/`NextFreeSlot()`'s directory
 scan scoped to just that folder. The on-disk layout has a
-version tag (`kFileVersion` in `performance_store.cpp`) that gets bumped
-whenever a field is added — a save from an older firmware version is
-rejected cleanly on load (shown as a short error on the File page)
-rather than being misread, so a firmware update can mean older saves
-need re-saving under the new version.
+version tag (`kFileVersion` in `performance_store.cpp`, currently **9**)
+that gets bumped whenever a field is added — a save from an older
+firmware version is rejected cleanly on load (shown as a short error on
+the File page) rather than being misread, so a firmware update can mean
+older saves need re-saving under the new version. Pad Presets
+(`PADP/PRESnnn.DAT`) and Grains Presets (`GRNP/PRESnnn.DAT`, audio-
+inclusive — see *Grains* above) are each their own separate on-disk
+format with their own independent numbering, not part of a performance
+file's own version tag.
 
-"New" (`Ui::TriggerNew()`, Button1 held 400ms on Global:File) only wipes
-each layer's recorded *audio* (`LooperLayer::Clear()`) — every global
-and per-layer setting is left exactly as it was. It's deliberately not
-the same as applying the startup default (see below); those are two
-different, independent actions.
+"New" (reached via the Load chooser's own "New" pick on Global:File —
+see *The Files/New Load chooser* above) only wipes each layer's recorded
+*audio* (`LooperLayer::Clear()`) — every global and per-layer setting is
+left exactly as it was. It's deliberately not the same as applying the
+startup default (see below); those are two different, independent
+actions. Delete/Duplicate for all 3 save categories live on
+`Global:SdMgmt` instead (see *SD card management* above), not on these
+individual save/load pages.
 
 ## Startup defaults
 
@@ -474,6 +943,15 @@ A few things that are intentional, not bugs:
 - **Export is one stereo mixdown, not per-track stems**: all 4 layers'
   post-effects signal is summed into a single file (either export mode)
   — there's no way to export each layer as its own file.
+- **No per-engine MIDI routing yet**: NoteOn/NoteOff drive both Pad
+  Synth and Grains from the same incoming MIDI stream (see *MIDI*
+  above) — there's no way to play just one of them from a keyboard
+  without also disabling the other on `Global:Pad`/`Global:Granular`.
+  Pitch bend and mod wheel are already Pad-Synth-only, though.
+- **Bypass's mix Volume/Pan don't persist**: like Master Volume and
+  vari-speed, they're live-performance controls that always reset to
+  their defaults on boot and after Load — not part of a saved
+  performance, and not covered by Startup Defaults either.
 - **No SD card hot-swapping while powered on**: the SD socket is
   hand-wired with no card-detect pin (see *Hardware* above), so the
   firmware has no way to know a card was physically pulled and
@@ -490,16 +968,22 @@ A few things that are intentional, not bugs:
 
 ## Files
 
-- `main.cpp` — hardware init, audio callback, main loop
+- `main.cpp` — hardware init, audio callback, main loop, MIDI polling
 - `looper_layer.h/.cpp` — per-layer state machine, filter/effects/
   reverb, waveform cache, audio
 - `tempo_clock.h/.cpp` — BPM/bars/metronome/count-in engine
-- `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering
+- `pad_synth.h/.cpp` — the Pad Synth instrument (see *Pad Synth* above)
+- `granular_engine.h/.cpp` — the Grains instrument (see *Grains* above)
+- `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering, for
+  every screen (Home/Layer/Global/Pad/Granular/Mixer)
 - `font_tomthumb.h/.cpp` — the tiny proportional font used in the
   footer rows (see `README.md`'s Thanks section for credit)
-- `performance_store.h/.cpp` — SD card save/load + WAV export. On-disk
-  format is at `kFileVersion = 6` (bumped from 5 when Pitch's fields were
-  removed — see *Pitch removal* below).
+- `performance_store.h/.cpp` — SD card save/load (performances, Pad
+  Presets, Grains Presets), WAV export, and SD Mgmt's Duplicate/Delete.
+  Performance on-disk format is at `kFileVersion = 9` (see *Save/load*
+  above; bumped from 5→6 when Pitch's fields were removed — see *Pitch
+  removal* below — and further since for Pad Synth's embedded sound and
+  other additions).
 - `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio
   callback output silence without touching any layer/tempo state, so
   `PerformanceStore::Load()` (which restores layers one at a time,
@@ -548,10 +1032,20 @@ helper calls, which weren't (and, being template/inline code, couldn't
 cleanly be) pulled into the same ITCM placement.
 
 Since the Pitch feature was removed for unrelated reasons (see below) and
-took its cost with it, worst-case CPU under the current `BOOT_QSPI` +
-ITCM build measures **45%** — better than the original internal-flash
-baseline, with the QSPI chip's ~8MB now available for future features
-(the original motivation for this migration).
+took its cost with it, worst-case CPU under `BOOT_QSPI` + ITCM measured
+**45%** for the 4-layer looper alone — better than the original
+internal-flash baseline, with the QSPI chip's ~8MB now available for
+future features (the original motivation for this migration).
+
+That 45% predates Pad Synth and Grains; with both instruments added
+(and voice counts tuned against real measurements rather than paper
+estimates — see *Pad Synth*'s own CPU note above, including the
+`StringVoice` architecture that was measured and ruled out), the
+**genuine worst case with everything running at once** — full 4-layer
+loop + reverb, 6-voice Pad Synth, and Grains, all simultaneously active
+— measures **~94%**. The per-engine on/off toggles (see *Per-engine
+on/off* above) are a real, immediate mitigation if a given performance's
+actual worst case turns out tighter than that in practice.
 
 **A genuinely new linker-level detail worth knowing if extending this**:
 the custom `.itcm_text` section has a load address (LMA) in QSPI flash but

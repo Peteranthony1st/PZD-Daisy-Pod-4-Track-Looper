@@ -31,6 +31,9 @@ The name, general concept, and file organization are based on
   dark, it's likely a `0x3D` module; there's a commented-out line in
   `main.cpp` to switch it.
 
+- **MIDI IN** (optional) — the Pod's built-in MIDI jack, used to play the
+  Pad Synth and Grains instruments described below. Standard 5-pin DIN or
+  TRS MIDI IN, whatever your controller uses; no extra wiring needed.
 - **Micro SD Card** formatted to FAT32.
   Inserted into the pod to save and load your files. This is a
   hand-wired socket with no card-detect pin, so swapping cards while the
@@ -90,7 +93,13 @@ The name, general concept, and file organization are based on
 
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
-  setting) to an SD card, up to 99 slots
+  setting, including the current Pad Synth sound) to an SD card, up to 99
+  slots. Pad Synth and Grains also have their own independent preset
+  systems (see above), saved/loaded separately from performances.
+- Saving always offers a choice between Overwrite (the currently loaded
+  file) and Save New; loading shows the same style of choice between
+  browsing existing files or starting fresh with New — identical
+  convention across performances, Pad presets, and Grains presets.
 - Export the current performance as a standard stereo WAV file — one full
   loop, every layer's live filter/effect/reverb chain and the
   master filter applied, peak-normalized so it doesn't come out quiet.
@@ -100,6 +109,43 @@ The name, general concept, and file organization are based on
   slot and be picked up as a sample with no copying needed. Whatever
   vari-speed is currently dialed in gets baked into the export on
   purpose, so you can capture a deliberate vari-speed effect to a file
+
+**Pad Synth** — a MIDI-played, 6-voice pad instrument running alongside
+the looper (`Global:Pad`, opened by clicking the encoder there). Tone
+(a dark↔bright oscillator registration morph) and gain, coarse tune
+(±24 semitones), a full Attack/Decay/Sustain/Release envelope, chorus,
+mod-wheel-assignable vibrato, its own filter (Off/Low/High/Band), reverb
+send, output level, and pan — plus a save/load preset system with ~10
+built-in factory patches and up to 99 of your own on the SD card. Can be
+switched off entirely from `Global:Pad` to reclaim its CPU share.
+
+**Grains** — a MIDI-played, monophonic granular instrument
+(`Global:Granular`), also running alongside the looper. Capture audio
+either by recording live input directly or pulling in whatever's already
+on one of the 4 loop layers, then play it back through two overlapping
+grain layers: a fixed-position **Grain** cloud and a sweeping **Scan**
+layer, both sharing Size/Fill/Gap controls, plus Position, Tune (with
+optional note-tracking), Direction (forward/reverse/random), its own
+ADSR/filter/reverb send/pan, and a full-sample waveform display with live
+grain markers. Presets save the captured audio itself alongside every
+parameter, so loading one restores the exact sound, not just settings.
+Also switchable off from `Global:Granular` to free its CPU share.
+
+**Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
+there) with Volume/Pan/Reverb-Send for all 4 loop layers, Pad Synth,
+Grains, and Bypass, plus Volume/Reverb-Size for the final Master bus,
+ending in a live oscilloscope of the actual output mix. Rotate the
+encoder to step through each channel in turn; `Global:Mixer` itself shows
+an at-a-glance overview grid of all 8 channels' levels.
+
+**SD card management** — `Global:SdMgmt` lets you browse any of the 3
+save categories (Performances/Pad Presets/Grains Presets) and Duplicate
+or Delete individual files directly on the card, without needing a
+computer. Deleting a file automatically closes the gap left behind —
+every higher-numbered file in that category shifts down to keep the
+numbering contiguous, so a later Save New always continues right after
+the last real file instead of quietly reusing whatever number you just
+freed.
 
 ## How to use it
 
@@ -115,9 +161,15 @@ The name, general concept, and file organization are based on
 **Navigating the menu**
 - **Rotate** the encoder: on Home, moves between layers; on any other
   page, cycles through that page's sub-pages.
-- **Click** the encoder: from Home, opens the selected layer's pages.
+- **Click** the encoder: from Home, opens the selected layer's pages; on
+  `Global:Pad`/`Global:Granular`/`Global:Mixer`, drills into that
+  instrument/mixer's own screen; on any Pad Synth or Grains page, mutes/
+  unmutes all 4 loop layers, same as every other Global page's click. On
+  the Mixer screen itself, rotate steps through channels instead of
+  pages (see below).
 - **Long-press** the encoder: from Home, opens Global settings; from
-  anywhere else, goes back to Home.
+  anywhere else (including Pad Synth, Grains, and Mixer), goes back to
+  Home.
 
 Both knobs and both buttons are "soft" — what they do depends on which
 page is open, and it's always shown on screen: each footer row has a
@@ -179,8 +231,58 @@ hit Export gets baked into the file on purpose.
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Global: Reverb | Size | Bypass reverb send | — | — |
 | Global: Speed | Vari-speed | — | Toggle scrub mode | Reset to 1.0x |
-| Global: File | Browse save slots | — | Tap = Save, Hold 400ms = New | Hold 800ms = Load |
+| Global: File | Choosing Save: Overwrite/Save New; Browsing Load: scroll files | — | Save / Select file list (Load) / Back | Hold 800ms = Save or Load, whichever's open |
+| Global: SD Mgmt | Scroll (folder or file list) | — | Tap = drill in/back, Hold 800ms = Duplicate | Hold 1500ms = Delete |
 | Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
+| Global: Pad | — | — | Toggle Pad Synth on/off | — |
+| Global: Granular | — | — | Toggle Grains on/off | — |
+| Global: Looper | — | — | Toggle the whole 4-layer looper on/off | — |
+| Global: Mixer | — | — | — | — (push encoder to enter the Mixer screen) |
+
+**Pad Synth (`Screen::Pad`, rotate to cycle pages)**
+
+| Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
+|---|---|---|---|---|
+| Tone | Registration (dark↔bright) | Osc gain | — | — |
+| Tune | Coarse tune, ±24 semitones | — | — | — |
+| ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
+| Chorus | Depth | Rate | — | — |
+| Vibrato | Depth | Rate | — | — |
+| Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Mix | Reverb send | Output level | — | — |
+| Mod Assign | — | — | Cycle mod wheel destination | — |
+| Preset | See Save/load above | — | Save / Select (Load) / Back | Hold 800ms = confirm |
+
+Clicking the encoder on any Pad Synth page mutes/unmutes all 4 loop
+layers, same as every Global page.
+
+**Grains (`Screen::Granular`, rotate to cycle pages)**
+
+| Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
+|---|---|---|---|---|
+| Grain | Size / Gap | Fill / Scan | Knobs → Size+Fill | Knobs → Gap+Scan |
+| Position | Position | — | — | — |
+| Tune/Direction | Tune | Direction | Toggle Map-to-Note | — |
+| ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
+| Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Mix | Grain volume / Reverb send | Scan volume | Knobs → Grain+Scan | Knobs → Reverb send |
+| Capture | — | — | Cycle source (Direct/Layer/Import) | Hold = record or capture |
+| Trim | Trim start | Trim end | — | — |
+| Preset | See Save/load above | — | Save / Select (Load) / Back | Hold 800ms = confirm |
+
+Clicking the encoder on any Grains page also mutes/unmutes all 4 loop
+layers.
+
+**Mixer (`Screen::Mixer`, rotate to step through channels)**
+
+Each of the 8 channels (Layer 1–4, Pad Synth, Grains, Bypass, Master)
+gets its own stop; rotating past the last one shows a live oscilloscope
+of the final output mix, then wraps back to Layer 1.
+
+| Channel | Knob 1 | Knob 2 | Button 1 | Button 2 |
+|---|---|---|---|---|
+| Layer 1–4 / Pad / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Master | Volume | Reverb size | — | — |
 
 ## Building and flashing
 

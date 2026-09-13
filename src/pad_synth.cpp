@@ -204,7 +204,7 @@ void PadSynth::NoteOn(uint8_t note, uint8_t velocity)
     v.base_hz      = 440.f * powf(2.f, ((float)note - 69.f) / 12.f);
     v.triggered_at = ++trigger_seq_;
     if(mod_dest_ != ModDestination::Vibrato)
-        v.osc.SetFreq(v.base_hz * bend_ratio_);
+        v.osc.SetFreq(v.base_hz * bend_ratio_ * tune_rate_);
 
     // A genuinely new/stolen voice picks up Attack naturally next
     // Process() call (its Adsr's internal gate_ is already false, so
@@ -219,6 +219,29 @@ void PadSynth::NoteOff(uint8_t note)
     for(int i = 0; i < kMaxVoices; i++)
         if(voices_[i].held_note == (int)note)
             voices_[i].held_note = -1;
+}
+
+void PadSynth::SetTuneSemitones01(float v01)
+{
+    v01             = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    tune_semitones_ = (int)(v01 * 48.f + 0.5f) - 24; // -24..+24
+    tune_rate_      = powf(2.f, (float)tune_semitones_ / 12.f);
+}
+
+float PadSynth::GetTuneSemitones01() const
+{
+    // Bucket center, not its exclusive upper edge -- see GranularEngine's
+    // GetGrainTuneSemitones01() for the exact bug this avoids (an earlier
+    // version of that getter landed on the edge instead, which round-
+    // tripped through Save/Load into the next semitone up every time).
+    return (float)(tune_semitones_ + 24) / 48.f;
+}
+
+void PadSynth::SetPan01(float v01)
+{
+    pan01_      = Clampf(v01, 0.f, 1.f);
+    pan_l_gain_ = 1.f - pan01_;
+    pan_r_gain_ = pan01_;
 }
 
 void PadSynth::SetPitchBendSemis(float semis)
@@ -347,6 +370,8 @@ void PadSynth::ApplyPreset(const PadPresetData& p)
     SetModDestination((ModDestination)p.mod_destination);
     SetVibratoDepth01(p.vibrato_depth01);
     SetVibratoRate01(p.vibrato_rate01);
+    SetTuneSemitones01(p.tune01);
+    SetPan01(p.pan01);
 }
 
 PadSynth::PadPresetData PadSynth::CapturePreset() const
@@ -368,6 +393,8 @@ PadSynth::PadPresetData PadSynth::CapturePreset() const
     p.mod_destination = (int32_t)mod_dest_;
     p.vibrato_depth01 = vibrato_depth01_;
     p.vibrato_rate01  = vibrato_rate01_;
+    p.tune01          = GetTuneSemitones01();
+    p.pan01           = pan01_;
     return p;
 }
 
@@ -418,7 +445,7 @@ void PadSynth::Process(size_t size,
     {
         for(int v = 0; v < kMaxVoices; v++)
             if(voices_[v].held_note >= 0)
-                voices_[v].osc.SetFreq(voices_[v].base_hz * bend_ratio_);
+                voices_[v].osc.SetFreq(voices_[v].base_hz * bend_ratio_ * tune_rate_);
     }
 
     for(size_t i = 0; i < size; i++)
@@ -446,7 +473,7 @@ void PadSynth::Process(size_t size,
                 // Linear FM, not exponential/powf-based -- cheap enough
                 // to run every sample for every voice (confirmed: no
                 // transcendentals in OscillatorBank::SetFreq/Process).
-                voice.osc.SetFreq(voice.base_hz * bend_ratio_
+                voice.osc.SetFreq(voice.base_hz * bend_ratio_ * tune_rate_
                                     * (1.f + lfo_val * mod_wheel01_ * vibrato_depth_fraction));
             }
             voice_sum += voice.osc.Process() * env;
@@ -470,8 +497,8 @@ void PadSynth::Process(size_t size,
             }
         }
 
-        out_l[i] = fl * output_level_;
-        out_r[i] = fr * output_level_;
+        out_l[i] = fl * output_level_ * pan_l_gain_;
+        out_r[i] = fr * output_level_ * pan_r_gain_;
         reverb_send_l[i] += out_l[i] * reverb_send01_;
         reverb_send_r[i] += out_r[i] * reverb_send01_;
     }

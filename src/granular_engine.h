@@ -156,6 +156,16 @@ class GranularEngine
     void  SetReverbSend01(float v01) { reverb_send01_ = v01; }
     float GetReverbSend01() const { return reverb_send01_; }
 
+    // --- Pan -- same linear law as LooperLayer/PadSynth (panL = 1-v,
+    // panR = v), applied to the already-stereo captured signal (Grains
+    // reads real L/R from whatever was captured/imported, unlike Pad's
+    // mono voice sum) right before writing out_l/out_r. A session-level
+    // mixer setting, not part of the captured sound's own identity --
+    // same reasoning that already excludes output_level01_/reverb_send01_
+    // from GranularPresetData below, kept consistent with those.
+    void  SetPan01(float v01);
+    float GetPan01() const { return pan01_; }
+
     // Renders `size` samples, WRITES into out_l/out_r (see PadSynth's own
     // Process() doc comment for why -- main.cpp needs this exact signal
     // for more than one consumer). ADDS into reverb_send_l/r (already
@@ -320,6 +330,10 @@ class GranularEngine
     float output_level01_  = 0.8f;
     float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
     float reverb_send01_   = 0.f; // was an unconditional full send before this existed
+
+    float pan01_      = 0.5f;
+    float pan_l_gain_ = 0.5f; // 1-pan01_, control-rate cache
+    float pan_r_gain_ = 0.5f; // pan01_
 
     static constexpr int kHannTableSize = 256;
     float hann_table_[kHannTableSize];

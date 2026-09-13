@@ -63,6 +63,16 @@ class PadSynth
     void  SetOscGain01(float v01);
     float GetOscGain01() const { return osc_gain01_; }
 
+    // --- Tune (coarse transpose, -24..+24 semitones) --------------------
+    // Same discretized-01 convention as GranularEngine's own
+    // SetGrainTuneSemitones01()/GetGrainTuneSemitones01() -- a fixed
+    // multiplier on top of every voice's note-derived frequency, recomputed
+    // at control-rate (like SetPitchBendSemis()'s bend_ratio_), not per
+    // sample.
+    void  SetTuneSemitones01(float v01);
+    float GetTuneSemitones01() const;
+    int   GetTuneSemitones() const { return tune_semitones_; }
+
     // --- Envelope --------------------------------------------------------
     // Curved-seconds convention (kMinAdsrSeconds..kMaxAdsrSeconds,
     // exponential) matching this project's existing ADSR-shape visual
@@ -107,6 +117,14 @@ class PadSynth
     float GetReverbSend01() const { return reverb_send01_; }
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
+    // Linear pan law (panL = 1-v, panR = v), same as LooperLayer::SetPan01
+    // -- kept consistent so Plaits pans the same way the loop layers do at
+    // the same knob position, not some "nicer" equal-power curve that
+    // would make it behave differently from everything else in the mix.
+    // Applied to both the dry output and the reverb send (post-pan),
+    // again matching LooperLayer's own Process().
+    void  SetPan01(float v01);
+    float GetPan01() const { return pan01_; }
 
     // Renders `size` samples. WRITES (overwrites, not adds) the final
     // post-chorus/post-filter/post-output-level dry pad signal into
@@ -154,6 +172,16 @@ class PadSynth
         int32_t mod_destination  = (int32_t)ModDestination::Vibrato;
         float vibrato_depth01    = 0.3f;
         float vibrato_rate01     = 0.4f;
+        // Added after all existing factory presets below were written --
+        // trailing field, defaulted to 0.5f (0 semitones) so every one of
+        // those positional initializer lists (which only list the fields
+        // that existed at the time) still gets a neutral transpose via
+        // this default member initializer, with no need to touch them.
+        float tune01             = 0.5f;
+        // Added for the new Screen::Mixer -- same trailing-field/default-
+        // member-initializer reasoning as tune01 just above (0.5f = dead
+        // center, so every pre-existing factory preset stays unpanned).
+        float pan01              = 0.5f;
     };
     void           ApplyPreset(const PadPresetData& p);
     PadPresetData  CapturePreset() const;
@@ -214,6 +242,9 @@ class PadSynth
     float registration01_ = 0.5f;
     float osc_gain01_     = 0.8f;
 
+    int   tune_semitones_ = 0;
+    float tune_rate_      = 1.f; // powf(2, tune_semitones_/12), control-rate like bend_ratio_
+
     float attack01_  = 0.3f;
     float decay01_   = 0.3f;
     float sustain01_ = 0.8f;
@@ -233,4 +264,8 @@ class PadSynth
     float reverb_send01_  = 0.2f;
     float output_level01_ = 0.7f;
     float output_level_   = 1.f; // curved, see SetOutputLevel01()
+
+    float pan01_  = 0.5f;
+    float pan_l_gain_ = 0.5f; // 1-pan01_, control-rate cache like tune_rate_
+    float pan_r_gain_ = 0.5f; // pan01_
 };

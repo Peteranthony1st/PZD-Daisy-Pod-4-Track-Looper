@@ -1,6 +1,7 @@
 #include "performance_store.h"
 #include <cstdio>
 #include <cstring>
+#include <cctype>
 #include <math.h>
 #include "per/sdmmc.h"
 #include "sys/fatfs.h"
@@ -68,6 +69,16 @@ void PadPresetFilename(int slot, char* out, size_t out_size)
 void GranularPresetFilename(int slot, char* out, size_t out_size)
 {
     snprintf(out, out_size, "GRNP/PRES%03d.DAT", slot);
+}
+
+// Own subfolder for user-supplied WAV files to import as Grains capture
+// audio -- unlike every other subfolder here, filenames underneath this
+// one are arbitrary (whatever the user named the file on their
+// computer), not a fixed 8.3 numbered pattern, so this takes a name
+// rather than a slot number.
+void ImportWavFilename(const char* filename, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "IMPORT/%s", filename);
 }
 
 // Bare filename in the SD root (unlike PERFxxx.DAT/EXPnnn.wav, this one's
@@ -196,6 +207,96 @@ struct Resampler48to44_1
     }
 };
 
+// Mirror image of Resampler48to44_1 above for ImportWav()'s own 44100 ->
+// 48000 Hz upsampling -- same exact-ratio linear interpolation, just
+// kInRate/kOutRate swapped (48000/44100 reduces to the same 160/147 as
+// the other direction, just inverted).
+struct Resampler44_1to48
+{
+    static constexpr uint64_t kInRate  = 147;
+    static constexpr uint64_t kOutRate = 160;
+
+    // 4-sample rolling history (s0 oldest .. s3 newest) for Catmull-Rom
+    // cubic interpolation, not the 2-point linear interpolation an
+    // earlier version used. Linear interpolation between just two
+    // samples is a known source of audible aliasing/imaging artifacts on
+    // bright, dense program material -- fine for a quick draft, but
+    // exactly what was left over (heard as "poppy"/crackly", worse under
+    // Grains' own grain-boundary windowing) once the separate dropped-
+    // sample bug above was fixed. Cubic uses the two neighboring samples
+    // either side of the segment being interpolated to fit a smooth
+    // curve instead of a straight line, which is a large, well-
+    // established quality step up for a modest cost (one extra sample of
+    // input latency, a few more FLOPs per output sample) -- not a full
+    // windowed-sinc filter (a bigger, higher-risk change: a filter
+    // kernel table plus real DSP tuning that's hard to verify without
+    // being able to listen on hardware directly), which would be the
+    // next step up if this still isn't enough.
+    float    s0_l = 0.f, s1_l = 0.f, s2_l = 0.f, s3_l = 0.f;
+    float    s0_r = 0.f, s1_r = 0.f, s2_r = 0.f, s3_r = 0.f;
+    int      real_count = 0; // total real samples pushed so far (saturating checks only need <3)
+    uint64_t in_count    = 0; // input-sample index of s1/s2's segment (see Push())
+    uint64_t out_count  = 0;
+
+    static float CatmullRom(float p0, float p1, float p2, float p3, float t)
+    {
+        float t2 = t * t;
+        float t3 = t2 * t;
+        return 0.5f
+               * (2.f * p1 + (p2 - p0) * t + (2.f * p0 - 5.f * p1 + 4.f * p2 - p3) * t2
+                  + (3.f * p1 - p0 - 3.f * p2 + p3) * t3);
+    }
+
+    // Push one 44100 Hz sample. Writes up to 2 output (48000 Hz) samples
+    // into out_l/out_r (each must have room for 2) and returns how many
+    // were actually produced -- never more than 2 since kOutRate/kInRate
+    // (160/147) is < 2 (see the dropped-sample comment this replaced).
+    //
+    // in_count/out_count start at 0 and only ever advance from inside the
+    // real-processing branch below, in lockstep with the (already
+    // verified correct) linear resampler's own timing -- an earlier
+    // version instead jumped in_count straight to 1 once history was
+    // primed while leaving out_count at 0, which desynced the two
+    // permanently (every frac computed from then on used a mismatched
+    // pair of counters, extrapolating wildly instead of interpolating)
+    // and produced silence/garbage for the whole file instead of the
+    // first few samples it meant to skip.
+    int Push(float in_l, float in_r, float* out_l, float* out_r)
+    {
+        s0_l = s1_l; s1_l = s2_l; s2_l = s3_l; s3_l = in_l;
+        s0_r = s1_r; s1_r = s2_r; s2_r = s3_r; s3_r = in_r;
+        real_count++;
+
+        // The very first segment [x[0],x[1]] finalizes once this call's
+        // new sample (x[2]) is available as its s3 lookahead -- i.e. on
+        // the 3rd real push, at which point s1==x[0]/s2==x[1]/s3==x[2]
+        // but s0 is still the initial 0 (there's no real x[-1]) --
+        // clamped to s1 (duplicate the edge sample) rather than left as
+        // a stray 0, same idea as any edge-clamped interpolation.
+        if(real_count < 3)
+            return 0;
+        if(real_count == 3)
+        {
+            s0_l = s1_l;
+            s0_r = s1_r;
+        }
+
+        int      emitted = 0;
+        uint64_t n       = in_count + 1;
+        while(emitted < 2 && out_count * kInRate < n * kOutRate)
+        {
+            uint64_t base = in_count * kOutRate;
+            float    frac = (float)(out_count * kInRate - base) / (float)kOutRate;
+            out_l[emitted] = CatmullRom(s0_l, s1_l, s2_l, s3_l, frac);
+            out_r[emitted] = CatmullRom(s0_r, s1_r, s2_r, s3_r, frac);
+            out_count++;
+            emitted++;
+        }
+        in_count++;
+        return emitted;
+    }
+};
+
 // Fixed-layout header, written/read as one raw block. Every field is a
 // plain float/int32/uint8 (no bitfields, no padding-sensitive types) so
 // the layout is stable across compilers -- this firmware is both the only
@@ -243,6 +344,8 @@ struct FileHeader
     // Added in version 8, alongside PadParamPage::Vibrato.
     float   pad_vibrato_depth01;
     float   pad_vibrato_rate01;
+    // Added in version 9, alongside PadParamPage::Tune.
+    float   pad_tune01;
 };
 
 struct LayerHeader
@@ -261,13 +364,13 @@ struct LayerHeader
     float    reverb_send01; // Size is now a global FileHeader field, not per-layer
 };
 
-// Bumped 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 as FileHeader/LayerHeader's
-// layout changed (most recently: added the pad synth's Vibrato Depth/
-// Rate) -- Load() already rejects a version mismatch cleanly (see
+// Bumped 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 as FileHeader/
+// LayerHeader's layout changed (most recently: added the pad synth's
+// Tune) -- Load() already rejects a version mismatch cleanly (see
 // below), so a performance saved under an older version will correctly
 // fail to load rather than being misread. Same accepted tradeoff as
 // every past bump.
-constexpr uint32_t kFileVersion = 8;
+constexpr uint32_t kFileVersion = 9;
 
 } // namespace
 
@@ -335,6 +438,167 @@ int NextFreeSlot()
             return slot;
     }
     return -1;
+}
+
+// -- SD MGMT: generic delete/duplicate, shared by every category below --
+
+bool DeleteFileGeneric(const char* path)
+{
+    ClearError();
+    FRESULT fr = f_unlink(path);
+    if(fr != FR_OK)
+    {
+        SetError("delete", fr);
+        return false;
+    }
+    return true;
+}
+
+// Byte-for-byte, chunked (same reasoning as every audio-streaming loop
+// elsewhere in this file: keeps progress responsive, doesn't need a
+// buffer anywhere near the size of a whole performance/preset). Refuses
+// to leave a partial file behind on any failure -- f_unlink()s dst_path
+// rather than risking a later Load() silently misreading a half-written
+// duplicate as real data.
+bool CopyFileChunked(const char* src_path, const char* dst_path, ProgressFn on_progress)
+{
+    ClearError();
+    static FIL src, dst;
+    FRESULT    fr = f_open(&src, src_path, FA_READ);
+    if(fr != FR_OK)
+    {
+        SetError("dupopen", fr);
+        return false;
+    }
+    // FA_CREATE_NEW, not FA_CREATE_ALWAYS -- dst_path came from a
+    // NextFree*Slot() scan moments ago, so this failing at all would mean
+    // something raced/changed underneath us; better to fail loudly than
+    // silently overwrite whatever's actually there.
+    fr = f_open(&dst, dst_path, FA_CREATE_NEW | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("dupcreate", fr);
+        f_close(&src);
+        return false;
+    }
+
+    FSIZE_t       total = f_size(&src);
+    FSIZE_t       done  = 0;
+    static uint8_t buf[4096]; // see the DTCMRAM/DMA comment on Save() above
+    bool          ok    = true;
+    while(ok && done < total)
+    {
+        UINT to_read = (UINT)((total - done) < sizeof(buf) ? (total - done) : sizeof(buf));
+        UINT br, bw;
+        fr = f_read(&src, buf, to_read, &br);
+        ok = fr == FR_OK && br == to_read;
+        if(!ok)
+        {
+            SetError("dupread", fr);
+            break;
+        }
+        fr = f_write(&dst, buf, br, &bw);
+        ok = fr == FR_OK && bw == br;
+        if(!ok)
+        {
+            SetError("dupwrite", fr);
+            break;
+        }
+        done += br;
+        if(on_progress && total > 0)
+            on_progress((float)done / (float)total);
+    }
+
+    f_close(&src);
+    FRESULT close_dst = f_close(&dst);
+    if(ok && close_dst != FR_OK)
+    {
+        SetError("dupclose", close_dst);
+        ok = false;
+    }
+    if(!ok)
+        f_unlink(dst_path);
+    return ok;
+}
+
+// After a delete, closes every gap from just above the deleted slot up to
+// max_slot -- not just the one slot that was just freed -- shifting each
+// surviving file down to the lowest free number below it. This is what
+// keeps the numbering contiguous from 1 (or from the first user slot, for
+// the two ranges that reserve low numbers for something else) so that
+// NextFree*Slot()'s own "lowest free slot" scan naturally continues right
+// after the last real save instead of reusing a hole a delete left behind
+// while other, higher-numbered saves sit stranded above it. Scans past
+// any gap rather than stopping at the first one, so it also repairs any
+// non-contiguous numbering left over from before this existed.
+//
+// filename_fn must match SlotFilename()/PadPresetFilename()/
+// GranularPresetFilename()'s own signature. If loaded_slot_inout is
+// non-null and currently names a slot this moves, it's updated in place
+// to follow that file to wherever it actually ends up.
+void CompactSlotsAfterDelete(int  deleted_slot,
+                              int  max_slot,
+                              void (*filename_fn)(int, char*, size_t),
+                              int* loaded_slot_inout)
+{
+    int target = deleted_slot;
+    for(int src = deleted_slot + 1; src <= max_slot; src++)
+    {
+        char    src_name[24];
+        FILINFO fno;
+        filename_fn(src, src_name, sizeof(src_name));
+        if(f_stat(src_name, &fno) != FR_OK)
+            continue; // gap here -- nothing to shift down (yet)
+        char dst_name[24];
+        filename_fn(target, dst_name, sizeof(dst_name));
+        f_rename(src_name, dst_name);
+        if(loaded_slot_inout && *loaded_slot_inout == src)
+            *loaded_slot_inout = target;
+        target++;
+    }
+}
+
+bool DeleteSlot(int slot, int* loaded_slot_inout)
+{
+    if(!card_ready || slot < 1 || slot > kMaxSlots)
+        return false;
+    char fname[20];
+    SlotFilename(slot, fname, sizeof(fname));
+    if(!DeleteFileGeneric(fname))
+        return false;
+    if(loaded_slot_inout && *loaded_slot_inout == slot)
+        *loaded_slot_inout = -1;
+    CompactSlotsAfterDelete(slot, kMaxSlots, SlotFilename, loaded_slot_inout);
+    return true;
+}
+
+bool DuplicateSlot(int slot, int* out_new_slot, ProgressFn on_progress)
+{
+    if(!out_new_slot)
+        return false;
+    *out_new_slot = -1;
+    if(!card_ready || slot < 1 || slot > kMaxSlots)
+        return false;
+    char    src[20];
+    FILINFO fno;
+    SlotFilename(slot, src, sizeof(src));
+    if(f_stat(src, &fno) != FR_OK)
+    {
+        SetError("dupsrc", FR_NO_FILE);
+        return false;
+    }
+    int new_slot = NextFreeSlot();
+    if(new_slot < 0)
+    {
+        SetError("dupslot", FR_OK);
+        return false;
+    }
+    char dst[20];
+    SlotFilename(new_slot, dst, sizeof(dst));
+    if(!CopyFileChunked(src, dst, on_progress))
+        return false;
+    *out_new_slot = new_slot;
+    return true;
 }
 
 bool Save(int                slot,
@@ -421,6 +685,7 @@ bool Save(int                slot,
     hdr.pad_mod_destination     = pad_preset.mod_destination;
     hdr.pad_vibrato_depth01     = pad_preset.vibrato_depth01;
     hdr.pad_vibrato_rate01      = pad_preset.vibrato_rate01;
+    hdr.pad_tune01              = pad_preset.tune01;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -592,6 +857,7 @@ bool Load(int          slot,
             out_pad_preset->mod_destination = hdr.pad_mod_destination;
             out_pad_preset->vibrato_depth01 = hdr.pad_vibrato_depth01;
             out_pad_preset->vibrato_rate01  = hdr.pad_vibrato_rate01;
+            out_pad_preset->tune01          = hdr.pad_tune01;
         }
     }
 
@@ -682,11 +948,12 @@ struct PadPresetFileHeader
     char     magic[4]; // "PPST"
     uint32_t version;
 };
-// Bumped 1 -> 2 alongside PadPresetData's own Vibrato Depth/Rate fields
-// -- same accepted "cleanly refuses instead of misreading" tradeoff as
-// kFileVersion above (the size check alone would already catch this, but
-// bumping the version keeps the failure explicit rather than incidental).
-constexpr uint32_t kPadPresetFileVersion = 2;
+// Bumped 1 -> 2 -> 3 alongside PadPresetData's own Vibrato Depth/Rate and
+// (most recently) Tune fields -- same accepted "cleanly refuses instead
+// of misreading" tradeoff as kFileVersion above (the size check alone
+// would already catch this, but bumping the version keeps the failure
+// explicit rather than incidental).
+constexpr uint32_t kPadPresetFileVersion = 3;
 
 // Header + one raw GranularPresetData block + audio_len samples each of
 // L then R (float32, chunked -- see kChunkSamples), same shape as Save()'s
@@ -838,6 +1105,49 @@ int NextFreePadPresetSlot()
             return slot;
     }
     return -1;
+}
+
+bool DeletePadPreset(int slot, int* loaded_slot_inout)
+{
+    if(!card_ready || slot <= PadSynth::kNumFactoryPresets || slot > kMaxPadPresets)
+        return false;
+    char fname[24];
+    PadPresetFilename(slot, fname, sizeof(fname));
+    if(!DeleteFileGeneric(fname))
+        return false;
+    if(loaded_slot_inout && *loaded_slot_inout == slot)
+        *loaded_slot_inout = 0;
+    CompactSlotsAfterDelete(slot, kMaxPadPresets, PadPresetFilename, loaded_slot_inout);
+    return true;
+}
+
+bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress)
+{
+    if(!out_new_slot)
+        return false;
+    *out_new_slot = -1;
+    if(!card_ready || slot <= PadSynth::kNumFactoryPresets || slot > kMaxPadPresets)
+        return false;
+    char    src[24];
+    FILINFO fno;
+    PadPresetFilename(slot, src, sizeof(src));
+    if(f_stat(src, &fno) != FR_OK)
+    {
+        SetError("dupsrc", FR_NO_FILE);
+        return false;
+    }
+    int new_slot = NextFreePadPresetSlot();
+    if(new_slot < 0)
+    {
+        SetError("dupslot", FR_OK);
+        return false;
+    }
+    char dst[24];
+    PadPresetFilename(new_slot, dst, sizeof(dst));
+    if(!CopyFileChunked(src, dst, on_progress))
+        return false;
+    *out_new_slot = new_slot;
+    return true;
 }
 
 bool SaveGranularPreset(int                                       slot,
@@ -1038,6 +1348,345 @@ int NextFreeGranularPresetSlot()
             return slot;
     }
     return -1;
+}
+
+bool DeleteGranularPreset(int slot, int* loaded_slot_inout)
+{
+    if(!card_ready || slot < 1 || slot > kMaxGranularPresets)
+        return false;
+    char fname[24];
+    GranularPresetFilename(slot, fname, sizeof(fname));
+    if(!DeleteFileGeneric(fname))
+        return false;
+    if(loaded_slot_inout && *loaded_slot_inout == slot)
+        *loaded_slot_inout = 0;
+    CompactSlotsAfterDelete(slot, kMaxGranularPresets, GranularPresetFilename, loaded_slot_inout);
+    return true;
+}
+
+bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress)
+{
+    if(!out_new_slot)
+        return false;
+    *out_new_slot = -1;
+    if(!card_ready || slot < 1 || slot > kMaxGranularPresets)
+        return false;
+    char    src[24];
+    FILINFO fno;
+    GranularPresetFilename(slot, src, sizeof(src));
+    if(f_stat(src, &fno) != FR_OK)
+    {
+        SetError("dupsrc", FR_NO_FILE);
+        return false;
+    }
+    int new_slot = NextFreeGranularPresetSlot();
+    if(new_slot < 0)
+    {
+        SetError("dupslot", FR_OK);
+        return false;
+    }
+    char dst[24];
+    GranularPresetFilename(new_slot, dst, sizeof(dst));
+    if(!CopyFileChunked(src, dst, on_progress))
+        return false;
+    *out_new_slot = new_slot;
+    return true;
+}
+
+int ListImportWavFiles(char out_names[][kMaxImportWavNameLen + 1], int max_out)
+{
+    if(!card_ready)
+        return 0;
+    static DIR dir; // see the DTCMRAM/DMA comment on Save() above
+    if(f_opendir(&dir, "IMPORT") != FR_OK)
+        return 0; // no IMPORT/ folder yet -- not an error, just nothing to list
+
+    int            count = 0;
+    static FILINFO fno; // see the DTCMRAM/DMA comment on Save() above
+    while(count < max_out)
+    {
+        if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0)
+            break; // error or end of directory
+        if(fno.fattrib & AM_DIR)
+            continue;
+        if(fno.fname[0] == '.' && fno.fname[1] == '_')
+            continue; // macOS AppleDouble sidecar file, not a real WAV -- see this function's doc comment
+        size_t len = strlen(fno.fname);
+        if(len < 4)
+            continue; // too short for a ".wav" extension
+        char ext[5];
+        for(int i = 0; i < 4; i++)
+            ext[i] = (char)tolower((unsigned char)fno.fname[len - 4 + i]);
+        ext[4] = '\0';
+        if(strcmp(ext, ".wav") != 0)
+            continue;
+        if(len > kMaxImportWavNameLen)
+            continue; // skip, don't truncate -- see this function's doc comment
+        snprintf(out_names[count], kMaxImportWavNameLen + 1, "%s", fno.fname);
+        count++;
+    }
+    f_closedir(&dir);
+    return count;
+}
+
+bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_capacity,
+               size_t* out_len, ProgressFn on_progress)
+{
+    if(!card_ready || !filename || !out_l || !out_r || !out_len)
+        return false;
+    *out_len = 0;
+
+    char fname[64];
+    ImportWavFilename(filename, fname, sizeof(fname));
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_READ);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    // -- RIFF/WAVE header -------------------------------------------------
+    // All of these are `static` (see the DTCMRAM/DMA comment on Save()
+    // above) -- f_read() into a plain stack-local here silently fails
+    // the DMA transfer (stack lives in DTCMRAM, unreachable by SDMMC's
+    // DMA), leaving the "destination" full of stale/garbage stack
+    // contents while FRESULT still reports FR_OK -- exactly what was
+    // happening here before this fix (a real file always failed the
+    // very first magic-byte check with a misleadingly benign "riff:0").
+    UINT br;
+    static char     riff_id[4], wave_id[4];
+    static uint32_t riff_size_unused;
+    bool ok = true;
+    fr = f_read(&file, riff_id, 4, &br);
+    ok = fr == FR_OK && br == 4 && memcmp(riff_id, "RIFF", 4) == 0;
+    if(ok)
+    {
+        fr = f_read(&file, &riff_size_unused, 4, &br);
+        ok = fr == FR_OK && br == 4;
+    }
+    if(ok)
+    {
+        fr = f_read(&file, wave_id, 4, &br);
+        ok = fr == FR_OK && br == 4 && memcmp(wave_id, "WAVE", 4) == 0;
+    }
+    if(!ok)
+    {
+        SetError("riff", fr);
+        f_close(&file);
+        return false;
+    }
+
+    // -- Walk chunks until fmt and data are both found -- unlike this
+    // firmware's own fixed 44-byte WavHeader (used for ExportWav(), which
+    // controls the exact layout it writes), a file from an arbitrary
+    // computer/DAW can have extra metadata chunks (LIST/INFO/etc.) or the
+    // chunks in a different order, so this walks generically instead of
+    // assuming a fixed layout. --------------------------------------------
+    bool     have_fmt = false, have_data = false;
+    uint16_t audio_format = 0, num_channels = 0, bits_per_sample = 0;
+    uint32_t sample_rate = 0, data_size = 0, data_start_offset = 0;
+    static char     chunk_id[4]; // static -- see the DTCMRAM/DMA comment above
+    static uint32_t chunk_size;
+    while(ok && !(have_fmt && have_data))
+    {
+        fr = f_read(&file, chunk_id, 4, &br);
+        if(fr != FR_OK || br != 4)
+            break;
+        fr = f_read(&file, &chunk_size, 4, &br);
+        if(fr != FR_OK || br != 4)
+            break;
+
+        if(memcmp(chunk_id, "fmt ", 4) == 0)
+        {
+            static uint8_t fmt_buf[16]; // static -- see the DTCMRAM/DMA comment above
+            if(chunk_size < 16)
+            {
+                ok = false;
+                break;
+            }
+            fr = f_read(&file, fmt_buf, sizeof(fmt_buf), &br);
+            if(fr != FR_OK || br != sizeof(fmt_buf))
+            {
+                ok = false;
+                break;
+            }
+            memcpy(&audio_format, fmt_buf + 0, 2);
+            memcpy(&num_channels, fmt_buf + 2, 2);
+            memcpy(&sample_rate, fmt_buf + 4, 4);
+            memcpy(&bits_per_sample, fmt_buf + 14, 2);
+            // Skip any remaining bytes of an extended fmt chunk (word-
+            // aligned, same as every other chunk here).
+            uint32_t remaining = chunk_size - 16 + ((chunk_size - 16) & 1);
+            if(remaining > 0)
+                f_lseek(&file, f_tell(&file) + remaining);
+            have_fmt = true;
+        }
+        else if(memcmp(chunk_id, "data", 4) == 0)
+        {
+            data_size         = chunk_size;
+            data_start_offset = (uint32_t)f_tell(&file);
+            have_data         = true;
+            // Skipped like any other chunk (unlike an earlier version of
+            // this function, which left the file pointer sitting here
+            // assuming fmt always comes first) -- data_start_offset is
+            // what the streaming loop below actually seeks back to once
+            // the walk finishes, so this works whether fmt comes before
+            // or after data in the file.
+            uint32_t skip = chunk_size + (chunk_size & 1);
+            fr             = f_lseek(&file, f_tell(&file) + skip);
+            if(fr != FR_OK)
+                break;
+        }
+        else
+        {
+            uint32_t skip = chunk_size + (chunk_size & 1); // word-aligned
+            fr             = f_lseek(&file, f_tell(&file) + skip);
+            if(fr != FR_OK)
+                break;
+        }
+    }
+
+    if(!ok || !have_fmt || !have_data)
+    {
+        SetError("chunks", fr);
+        f_close(&file);
+        return false;
+    }
+    if(audio_format != 1 || bits_per_sample != 16 || (num_channels != 1 && num_channels != 2)
+       || (sample_rate != 48000 && sample_rate != 44100))
+    {
+        // Not a FatFS error -- the file itself is a format this importer
+        // doesn't handle (see ImportWav()'s own doc comment for exactly
+        // which formats are accepted).
+        SetError("format", FR_OK);
+        f_close(&file);
+        return false;
+    }
+
+    // -- Stream-convert the data chunk -------------------------------
+    // Seek back to the data payload's own start -- the chunk walk above
+    // always skips past it (see the "data" branch's own comment), so
+    // this is needed regardless of whether fmt came before or after it.
+    fr = f_lseek(&file, data_start_offset);
+    if(fr != FR_OK)
+    {
+        SetError("seek", fr);
+        f_close(&file);
+        return false;
+    }
+
+    // Some tools (streamed/live-bounced exports in particular) never go
+    // back and patch the "data" chunk's declared size, leaving it as a
+    // placeholder that's larger than what's actually there -- trusting
+    // it as-is would read straight past the real audio into whatever
+    // bytes happen to follow on disk (another chunk's raw data, or
+    // undefined trailing bytes) as if they were more PCM, which plays
+    // back as noise/crackle right where the real audio ends rather than
+    // a clean stop. Clamp to what the file can actually provide instead.
+    uint32_t bytes_left_in_file = (uint32_t)f_size(&file) - data_start_offset;
+    if(data_size > bytes_left_in_file)
+        data_size = bytes_left_in_file;
+
+    bool   need_resample = sample_rate == 44100;
+    static Resampler44_1to48 resampler; // see the DTCMRAM/DMA comment on Save() above
+    resampler = Resampler44_1to48{};
+
+    static int16_t raw_buf[kChunkSamples * 2]; // interleaved, up to stereo
+    uint32_t       bytes_per_frame = (uint32_t)num_channels * 2;
+    uint32_t       total_frames    = data_size / bytes_per_frame;
+    uint32_t       frames_done     = 0;
+    size_t         written         = 0;
+
+    while(ok && frames_done < total_frames && written < audio_capacity)
+    {
+        UINT frames_this_chunk = (UINT)((total_frames - frames_done) < kChunkSamples
+                                             ? (total_frames - frames_done)
+                                             : kChunkSamples);
+        UINT bytes_this_chunk  = frames_this_chunk * bytes_per_frame;
+        fr = f_read(&file, raw_buf, bytes_this_chunk, &br);
+        ok = fr == FR_OK && br == bytes_this_chunk;
+        if(!ok)
+        {
+            SetError("data", fr);
+            break;
+        }
+
+        for(UINT i = 0; i < frames_this_chunk && written < audio_capacity; i++)
+        {
+            float l, r;
+            if(num_channels == 1)
+            {
+                l = r = (float)raw_buf[i] / 32768.f;
+            }
+            else
+            {
+                l = (float)raw_buf[i * 2] / 32768.f;
+                r = (float)raw_buf[i * 2 + 1] / 32768.f;
+            }
+
+            if(!need_resample)
+            {
+                out_l[written] = l;
+                out_r[written] = r;
+                written++;
+            }
+            else
+            {
+                float rl[2], rr[2];
+                int   n = resampler.Push(l, r, rl, rr);
+                for(int k = 0; k < n && written < audio_capacity; k++)
+                {
+                    out_l[written] = rl[k];
+                    out_r[written] = rr[k];
+                    written++;
+                }
+            }
+        }
+
+        frames_done += frames_this_chunk;
+        if(on_progress && total_frames > 0)
+            on_progress((float)frames_done / (float)total_frames);
+    }
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK && ok)
+        SetError("close", close_res);
+    if(ok)
+    {
+        // Downward-only peak normalization -- a WAV authored/mastered on a
+        // computer is often close to 0dBFS, whereas nothing else Grains
+        // can capture (Direct Record off the pod's own audio-in, or a
+        // loop layer's already-mixed audio) tends to sit anywhere near
+        // that hot, so an unscaled import plays back jarringly loud next
+        // to those. Only ever scales down (never boosts a quiet file) --
+        // this is loudness-matching against the other capture sources,
+        // not a general "make everything as loud as possible" normalizer.
+        constexpr float kTargetPeak = 0.9f;
+        float           peak        = 0.f;
+        for(size_t i = 0; i < written; i++)
+        {
+            float a = fabsf(out_l[i]);
+            if(a > peak)
+                peak = a;
+            a = fabsf(out_r[i]);
+            if(a > peak)
+                peak = a;
+        }
+        if(peak > kTargetPeak)
+        {
+            float scale = kTargetPeak / peak;
+            for(size_t i = 0; i < written; i++)
+            {
+                out_l[i] *= scale;
+                out_r[i] *= scale;
+            }
+        }
+        *out_len = written;
+    }
+    return ok && close_res == FR_OK;
 }
 
 bool ExportWav(TempoClock&  tempo,

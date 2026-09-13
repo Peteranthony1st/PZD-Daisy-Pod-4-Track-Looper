@@ -131,13 +131,12 @@ constexpr size_t kGranularScopeSamples = 1024;
 static float      g_granular_scope_l[kGranularScopeSamples];
 static size_t      g_granular_scope_write_pos = 0;
 
-// TEMPORARY -- DWT cycle-counter CPU diagnostic, same technique used
-// earlier in this project to measure StringVoice/OscillatorBank per-voice
-// cost. Ratchets up only (never decreases within a session), so a rare
-// worst-case block isn't missed by only sampling occasionally from the
-// main loop. Remove once the new Granular engine's real-hardware CPU cost
-// (alongside the full loop + Pad synth) is confirmed safe.
-volatile uint32_t g_diag_worst_cycles = 0;
+// Same convention, for Screen::Mixer's own oscilloscope page -- captures
+// the actual final post-fader mix (after reverb/bypass/master filter/
+// click/master volume), not any one instrument's own signal.
+constexpr size_t kMasterScopeSamples = 1024;
+static float      g_master_scope_l[kMasterScopeSamples];
+static size_t      g_master_scope_write_pos = 0;
 
 TimerHandle control_timer;
 
@@ -231,11 +230,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     static float pad_r[256];
     static float gran_l[256];
     static float gran_r[256];
-
-    // TEMPORARY -- see g_diag_worst_cycles's comment above. Captured
-    // first/last so the measured window covers this whole callback,
-    // including the early-return path below.
-    uint32_t diag_cyc_start = DWT->CYCCNT;
 
     if(g_audio_suspended)
     {
@@ -411,6 +405,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     const bool  byp          = ui.IsBypassed();
     const float bypass_gain  = ui.GetBypassGain();
     const float bypass_reverb_send01 = ui.GetBypassReverbSend01();
+    // Screen::Mixer's own Bypass channel -- multiplies on top of
+    // bypass_gain above (see Ui::GetBypassMixVolume01()'s own comment for
+    // why these are two separate controls), plus a genuine Pan, applied
+    // to both the dry monitor mix and its reverb send below (same "pan
+    // affects the send too" treatment LooperLayer::Process() already
+    // uses for every loop layer).
+    const float bypass_mix_volume = ui.GetBypassMixVolume();
+    const float bypass_pan01      = ui.GetBypassPan01();
+    const float bypass_pan_l      = 1.f - bypass_pan01;
+    const float bypass_pan_r      = bypass_pan01;
     const FilterMode mfilt_mode = ui.GetMasterFilterMode();
 
     // Block-rate controls (matches LooperLayer's own per-layer filter
@@ -438,14 +442,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Bypass's own Send into the shared reverb bus -- independent of
         // every layer's own Send, same bus though. Must happen BEFORE
         // the Process() call right below, which is what actually
-        // consumes reverb_send_l/r for this sample. Same bypass_gain-
-        // scaled, L+R-summed-to-mono treatment as the dry bypass mix
-        // further down (see its own comment for why mono).
+        // consumes reverb_send_l/r for this sample. Same bypass_gain/
+        // mix-volume-scaled, L+R-summed-to-mono treatment as the dry
+        // bypass mix further down (see its own comment for why mono),
+        // now also panned the same way -- same "pan affects the send
+        // too" treatment LooperLayer::Process() uses for every layer.
         if(byp && bypass_reverb_send01 > 0.f)
         {
-            float byp_send = (in[0][i] + in[1][i]) * bypass_gain * bypass_reverb_send01;
-            reverb_send_l[i] += byp_send;
-            reverb_send_r[i] += byp_send;
+            float byp_mono_base = (in[0][i] + in[1][i]) * bypass_gain * bypass_mix_volume;
+            reverb_send_l[i] += byp_mono_base * bypass_pan_l * bypass_reverb_send01;
+            reverb_send_r[i] += byp_mono_base * bypass_pan_r * bypass_reverb_send01;
         }
 
         // Shared reverb: process the summed sends once per sample and
@@ -479,9 +485,14 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             // still captures each ADC channel independently (see
             // LooperLayer::Process()'s mic_in/guitar_in), so a genuinely
             // stereo source still records in true stereo.
-            float byp_mono = (in[0][i] + in[1][i]) * bypass_gain;
-            out[0][i] += byp_mono;
-            out[1][i] += byp_mono;
+            //
+            // Also scaled by Screen::Mixer's own Bypass Volume and panned
+            // (bypass_mix_volume/bypass_pan_l/r above) -- panning this
+            // mono signal spreads it across the stereo field same as any
+            // other mixer channel, same linear law as everything else.
+            float byp_mono = (in[0][i] + in[1][i]) * bypass_gain * bypass_mix_volume;
+            out[0][i] += byp_mono * bypass_pan_l;
+            out[1][i] += byp_mono * bypass_pan_r;
         }
 
         // Master filter -- applied to the full mix (all layers, their
@@ -512,12 +523,13 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         out[0][i] = (out[0][i] + click[i]) * mv;
         out[1][i] = (out[1][i] + click[i]) * mv;
-    }
 
-    // TEMPORARY -- see g_diag_worst_cycles's comment above.
-    uint32_t diag_cycles = DWT->CYCCNT - diag_cyc_start;
-    if(diag_cycles > g_diag_worst_cycles)
-        g_diag_worst_cycles = diag_cycles;
+        // Screen::Mixer's own oscilloscope -- the actual final signal,
+        // captured last, same "write every block, wrap" pattern as
+        // g_pad_scope_l/g_granular_scope_l above.
+        g_master_scope_l[g_master_scope_write_pos] = out[0][i];
+        g_master_scope_write_pos = (g_master_scope_write_pos + 1) % kMasterScopeSamples;
+    }
 }
 
 // Linker-provided symbols from STM32H750IB_qspi_custom.lds -- .itcm_text
@@ -543,13 +555,6 @@ int main(void)
     memcpy(_sitcm_text, _siitcm_text, (size_t)(_eitcm_text - _sitcm_text));
 
     hw.Init();
-
-    // TEMPORARY -- enables the cycle counter g_diag_worst_cycles reads in
-    // AudioCallback(). Must happen before that callback ever runs (see
-    // hw.StartAudio() below).
-    CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
-    DWT->CYCCNT = 0;
-    DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     // hw.Init() -> InitMidi() claims D13 as MIDI UART TX via
     // MidiUartHandler::Config's default-constructed transport_config --
@@ -626,7 +631,8 @@ int main(void)
     ui.Init(&hw, &display, &tempo, layers, kNumLayers, &pad_synth, g_pad_scope_l,
             kPadScopeSamples, &granular, g_granular_scope_l, kGranularScopeSamples,
             g_granular_capture_l, g_granular_capture_r, kGranularCaptureSamples,
-            &g_granular_capturing, &g_granular_capture_write_pos);
+            &g_granular_capturing, &g_granular_capture_write_pos, g_master_scope_l,
+            kMasterScopeSamples);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();
@@ -669,17 +675,6 @@ int main(void)
 
         // MIDI is polled from ControlTimerCallback() (TIM5 ISR) now, not
         // here -- see its own comment for why.
-
-        // TEMPORARY -- see g_diag_worst_cycles's comment above. Budget is
-        // cycles-per-1ms-block (matches hw.SetAudioBlockSize(48) at 48kHz,
-        // ~1ms/block); worst-case-so-far cycles against that budget is
-        // the same ratio the earlier StringVoice/OscillatorBank
-        // measurements used.
-        {
-            uint32_t budget = System::GetSysClkFreq() / 1000;
-            int      pct    = (int)((uint64_t)g_diag_worst_cycles * 100 / budget);
-            ui.SetDiagCpuPercent(pct);
-        }
 
         ui.Update(events);
 

@@ -84,7 +84,9 @@ class Ui
               float*                        granular_capture_buf_r,
               size_t                        granular_capture_capacity,
               volatile bool*                granular_capturing,
-              volatile size_t*              granular_capture_write_pos);
+              volatile size_t*              granular_capture_write_pos,
+              const float*                  master_scope_buf,
+              size_t                        master_scope_capacity);
 
     // Call once from main(), right after Init() -- applies the user's
     // saved startup defaults (see PerformanceStore::LoadPrefs()) on top
@@ -124,6 +126,33 @@ class Ui
     // LooperLayer::SetInputGain01(), the same control used at actual
     // record time).
     float GetBypassGain() const { return layers_[cursor_layer_].GetInputGain(); }
+    // Screen::Mixer's own Bypass channel -- a genuine mix-level fader
+    // multiplied ON TOP of GetBypassGain() above, not a replacement for
+    // it: GetBypassGain() is deliberately about gain-staging/checking
+    // levels before recording (see its own comment), while this is about
+    // how loud Bypass sits in the overall final mix once you're past
+    // that -- two different jobs on the same live signal, so this is
+    // additive rather than reusing/repurposing the existing knob.
+    // Defaults to 0.8f (matching every other engine's own Output Level
+    // default in this codebase) since this is a brand new control with
+    // no prior loudness to preserve -- same curve as every other Volume-
+    // type knob (LooperLayer::SetVolume01(), PadSynth/GranularEngine's
+    // own SetOutputLevel01()).
+    float GetBypassMixVolume01() const { return bypass_mix_volume01_; }
+    float GetBypassMixVolume() const { return bypass_mix_volume_; }
+    // Defined in ui.cpp, not inline here -- needs powf(), same reasoning
+    // every other curved setter in this header already avoids inlining.
+    void  SetBypassMixVolume01(float v01);
+    // Linear pan law, same as every other engine's own Pan (see
+    // PadSynth::SetPan01()'s comment) -- main.cpp computes panL/panR
+    // from this directly (0.5 = center), same "no cached gain members
+    // needed, this is UI-owned global state not a DSP object" treatment
+    // as GetMasterVolume()'s own curve being applied inline there.
+    float GetBypassPan01() const { return bypass_pan01_; }
+    void  SetBypassPan01(float v01)
+    {
+        bypass_pan01_ = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    }
     // Block-rate: tape-style multiplier applied on top of every layer's
     // own Speed and TempoClock's own tick rate -- see main.cpp's
     // AudioCallback(), TempoClock::Process(), LooperLayer::Process().
@@ -149,15 +178,6 @@ class Ui
     // original core feature, not an add-on someone opts into.
     bool IsLooperEnabled() const { return looper_enabled_; }
 
-    // TEMPORARY -- CPU diagnostic overlay (see main.cpp's DWT cycle
-    // counter). Drawn as part of Draw() itself, not a separate direct
-    // display write, so it's redrawn every frame at the same throttled
-    // rate as everything else instead of being wiped almost immediately
-    // by the next regular redraw (the earlier version's "hard to read"
-    // problem). -1 = don't draw (default). Remove once CPU is confirmed
-    // safe and this is no longer needed.
-    void SetDiagCpuPercent(int pct) { diag_cpu_percent_ = pct; }
-
   private:
     enum class Screen
     {
@@ -171,7 +191,35 @@ class Ui
         Pad,
         // Same treatment as Pad above, entered from Global:Granular. See
         // GranularParamPage for its own pages.
-        Granular
+        Granular,
+        // Same treatment as Pad/Granular above, entered from Global:Mixer.
+        // Unlike every other screen, encoder rotate here doesn't select a
+        // page -- it scrolls through one continuous, endlessly-wrapping
+        // sequence of "stops" (see mixer_position_): the 8 real channels
+        // (each showing a Detail page with real Vol/Pan/Rev bars for the
+        // group of 4 it belongs to), then a Scope stop (the final post-
+        // fader mix), then back to channel 0 -- Global:Mixer's own page
+        // already covers the "all 8 at a glance" job, so there's no
+        // separate Overview stop in here too. Encoder click is unused
+        // here, same as every other Pad/Granular-style screen.
+        Mixer
+    };
+    // Shared save/load interaction state for Global:File, Pad Preset, and
+    // Grains Preset -- only one of those three pages is ever visible at
+    // once, so one set of fields covers all three (see save_load_mode_'s
+    // own comment for the reset-on-leave rule that keeps that safe).
+    // Idle: just shows current status, Button1/Button2 say "Save"/"Load".
+    // ChoosingSave: Button1 was tapped -- Knob1 picks Overwrite (only
+    // offered when something's actually loaded) vs Save New, Button1's
+    // own label becomes "Hold=Save" to commit whichever's picked.
+    // BrowsingLoad: Button2 was tapped -- Knob1 browses the slot list
+    // (same as it already did unconditionally before this), Button2's
+    // label becomes "Hold=Load" to commit.
+    enum class SaveLoadMode
+    {
+        Idle,
+        ChoosingSave,
+        BrowsingLoad
     };
     enum class LayerPage
     {
@@ -190,6 +238,14 @@ class Ui
         Reverb,
         Speed,
         File,
+        // File management: Knob1 picks which of the 3 save folders
+        // (Performances/Pad Presets/Grains Presets) then Button1 tap
+        // drills in; once inside, Knob1 browses that folder's own files
+        // (reusing the exact same list Global:File/Pad Preset/Grains
+        // Preset already scan and cache), Button1 tap goes back up,
+        // Button1 hold Duplicates the browsed file, Button2 hold Deletes
+        // it. See SdMgmtFolder/sd_mgmt_in_folder_.
+        SdMgmt,
         Export,
         // Entry point into Screen::Pad only -- no continuous knobs of its
         // own, same treatment as every other screen's Global entry page.
@@ -213,12 +269,20 @@ class Ui
         Mixer,
         kCount
     };
+    enum class SdMgmtFolder
+    {
+        Performances,
+        PadPresets,
+        GranularPresets,
+        kCount
+    };
 
     // Screen::Pad's own pages, cycled by encoder rotate while there (same
     // convention as LayerPage/GlobalPage).
     enum class PadParamPage
     {
         Tone,      // Registration (tone morph) + Osc Gain
+        Tune,      // Coarse transpose, -24..+24 semitones -- single knob
         // Attack/Decay/Sustain/Release graph, all four stages always
         // shown together -- Button1 maps the knobs to Attack+Decay,
         // Button2 maps them to Sustain+Release (see pad_adsr_target_sr_).
@@ -307,9 +371,10 @@ class Ui
         GlobalPad, // entry point only -- see Screen::Pad instead
         GlobalGranular, // entry point only -- see Screen::Granular instead
         GlobalLooper, // no continuous knobs -- Button1 toggle only
-        GlobalMixer,
-        GlobalMixerReverb,
+        GlobalMixer, // entry point only -- see Screen::Mixer instead
+        GlobalSdMgmt, // browses a list directly, no pickup used -- see GlobalPage::SdMgmt
         PadTone,
+        PadTune,
         PadEnvAD,
         PadEnvSR,
         PadChorus,
@@ -332,6 +397,19 @@ class Ui
         GranularCapture, // no continuous knobs -- Button1/Button2 only
         GranularTrim,
         GranularPreset, // browses a list directly, no pickup used
+        // Screen::Mixer -- shared across all 7 non-Master channels (see
+        // mixer_position_), same "one context, branch internally on which
+        // channel" idiom as LayerStatus already uses for Cur()/
+        // cursor_layer_ -- except unlike LayerStatus, mixer_position_ CAN
+        // change while this exact context stays active (rotating between
+        // channels doesn't change context), so HandleEncoder()'s own
+        // rotate handling must explicitly re-run the pickup reset/reseed
+        // this enum's own change would normally trigger automatically
+        // (see its own comment there).
+        MixerVolPan,
+        MixerReverb,
+        MixerMaster, // Master has no toggle -- Volume + Reverb Size, always
+        MixerNoKnobs, // Overview/Scope stops -- no continuous knobs
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -381,10 +459,38 @@ class Ui
     void DrawLayerScreen();
     void DrawGlobalScreen();
     void DrawFileScreen();
+    void DrawSdMgmtScreen();
+    static const char* SdMgmtFolderName(SdMgmtFolder f);
     void DrawExportScreen();
     void DrawSpeedScreen();
     void DrawPadScreen();
     void DrawGranularScreen();
+    void DrawMixerScreen();
+    // Screen::Mixer's own per-channel accessors -- channel index 0..3 is
+    // Layer 1..4, 4 is Plaits, 5 is Grains, 6 is Bypass, 7 is Master.
+    // Kept as small indexed switches rather than a polymorphic interface
+    // since there are only 8 cases and they already read/write each
+    // engine's own real getters/setters directly -- no new state of its
+    // own, this is purely another view onto values that already exist.
+    static constexpr int kNumMixerChannels = 8;
+    // Total encoder "stops" in Screen::Mixer -- the 8 real channels above
+    // plus the Scope stop (mixer_position_ == kNumMixerChannels). See
+    // Screen::Mixer's own comment.
+    static constexpr int kNumMixerPositions = kNumMixerChannels + 1;
+    const char* MixerChannelName(int ch) const;
+    float       MixerGetVolume01(int ch) const;
+    float       MixerGetPan01(int ch) const; // Master (ch 7) has none -- returns 0.5f
+    float       MixerGetSend01(int ch) const; // Master (ch 7) has none -- returns 0.f
+    void        MixerSetVolume01(int ch, float v01);
+    void        MixerSetPan01(int ch, float v01);   // no-op on Master
+    void        MixerSetSend01(int ch, float v01);  // no-op on Master
+    // Small helper for the Detail page's vertical bars.
+    void DrawMixerVBar(int x0, int y0, int w, int h, float v01);
+    // All 8 channels' names across one row, each with a real vertical
+    // Volume bar (no numeric readout) -- GlobalPage::Mixer's at-a-glance
+    // summary (see DrawGlobalScreen()). `top_y` is the name row's
+    // baseline.
+    void DrawMixerOverviewGrid(int top_y);
     // Attack/decay/sustain/release graph, four fixed-equal-width zones
     // (so turning one knob never visibly shifts another stage that
     // didn't change) -- shared by PadParamPage::EnvAD/EnvSR, given the
@@ -452,16 +558,36 @@ class Ui
     // "never overwrites/destroys anything, plain tap is safe" class as
     // TriggerExport(), so this needs no hold-to-confirm either.
     void TriggerSave(bool force_new = false);
-    // Button1 long-hold (800ms, see HandleButton1FilePage): clears every
-    // layer's audio (keeping tempo/global/per-layer settings, same as
-    // the per-layer Clear()) and forgets loaded_slot_, so the next Save
-    // lands in a new slot rather than overwriting whatever was loaded --
-    // the prior save on the card is untouched either way.
+    // Global:File's own Load chooser confirmed with "New" highlighted
+    // (see TriggerLoad() and load_new_selected_'s own comment) -- clears
+    // every layer's audio (keeping tempo/global/per-layer settings, same
+    // as the per-layer Clear()) and forgets loaded_slot_, so the next
+    // Save lands in a new slot rather than overwriting whatever was
+    // loaded -- the prior save on the card is untouched either way.
     void TriggerNew();
-    // Button2 long-hold (800ms): loads file_slots_[file_cursor_],
-    // replacing every layer's audio and all settings with the saved
-    // performance's.
+    // Button2 long-hold (800ms): confirms whatever the Load chooser has
+    // settled on -- delegates to TriggerNew() if "New" is highlighted,
+    // otherwise loads file_slots_[file_cursor_] (drilled into via
+    // Button1, see load_browsing_files_'s own comment), replacing every
+    // layer's audio and all settings with the saved performance's.
     void TriggerLoad();
+
+    // --- SD MGMT (Global:SdMgmt page) ------------------------------------
+    // Returns whichever of file_slots_/pad_preset_user_slots_/
+    // granular_preset_user_slots_ applies to sd_mgmt_folder_ (refreshing
+    // it first if that folder's own dirty flag is set) and writes its
+    // count to *out_count.
+    const int* SdMgmtSlots(int* out_count);
+    // Button1 hold (800ms) while browsing a folder's files: duplicates
+    // the browsed file via PerformanceStore::Duplicate*() -- same
+    // "WORKING..." full-screen progress overlay as Save/Load for
+    // whichever category can actually take real time (Performances,
+    // Grains Presets).
+    void TriggerSdMgmtDuplicate();
+    // Button2 hold (see kSdMgmtDeleteHoldMs -- longer than the usual
+    // 800ms, since unlike every other hold-to-confirm gesture in this
+    // project, delete has no "just re-save/re-load" undo).
+    void TriggerSdMgmtDelete();
     // Global:Tempo's Button2 held 800ms: saves the current global
     // settings (BPM/Bars/Volume/Metro/Filter/Reverb size/Bypass --
     // deliberately no per-layer settings) as the startup default -- see
@@ -498,10 +624,17 @@ class Ui
     // user slot, same non-destructive reasoning as TriggerSave's own
     // force_new.
     void TriggerSavePadPreset(bool force_new = false);
-    // Button2 long-hold (800ms): loads whichever preset pad_preset_cursor_
-    // is currently browsing (factory or user), replacing every live pad
+    // Button2 long-hold (800ms): confirms whatever the Load chooser has
+    // settled on -- delegates to TriggerNewPadPreset() if "New" is
+    // highlighted, otherwise loads whichever preset pad_preset_cursor_ is
+    // currently browsing (factory or user, drilled into via Button1, see
+    // load_browsing_files_'s own comment), replacing every live pad
     // setting.
     void TriggerLoadPadPreset();
+    // Pad Preset's own Load chooser confirmed with "New" highlighted --
+    // resets to the first factory patch, same fresh-start spirit as
+    // Global:File's own TriggerNew().
+    void TriggerNewPadPreset();
     // Instant copy of whichever loop layer granular_capture_source_
     // currently names (independent of Home's own cursor_layer_) into
     // Grains' own capture buffer, up to granular_capture_capacity_, then
@@ -510,6 +643,18 @@ class Ui
     // to low milliseconds of copying is fine there, same reasoning as
     // SetSource()'s own waveform-peak rebuild.
     void TriggerGranularCaptureFromLayer();
+    // Re-scans IMPORT/ on the SD card for .wav files -- called once on
+    // entry to the Capture page's Import source (mirrors
+    // RefreshGranularPresetSlots()'s own "dirty flag, refresh on entry"
+    // idiom).
+    void RefreshGranularImportFiles();
+    // Loads/converts whichever file granular_import_cursor_ is currently
+    // browsing into Grains' capture buffer (see
+    // PerformanceStore::ImportWav()). Runs from the main loop with a live
+    // progress overlay (Ui::OnSaveLoadProgress()), same as a Preset
+    // load -- this involves real SD reads and per-sample conversion
+    // (and possibly resampling), not an instant copy.
+    void TriggerGranularImport();
     // Call whenever a new capture/load completes (Direct Record
     // finalizing, TriggerGranularCaptureFromLayer(),
     // TriggerLoadGranularPreset()) -- records the just-captured length as
@@ -532,10 +677,18 @@ class Ui
     // R()/GetSourceLen()) alongside the parameters -- same non-destructive
     // reasoning as TriggerSave()/TriggerSavePadPreset()'s own force_new.
     void TriggerSaveGranularPreset(bool force_new = false);
-    // Button2 long-hold (800ms): loads whichever preset
-    // granular_preset_cursor_ is currently browsing, replacing both the
-    // live parameters AND the currently loaded capture audio.
+    // Button2 long-hold (800ms): confirms whatever the Load chooser has
+    // settled on -- delegates to TriggerNewGranularPreset() if "New" is
+    // highlighted, otherwise loads whichever preset
+    // granular_preset_cursor_ is currently browsing (drilled into via
+    // Button1, see load_browsing_files_'s own comment), replacing both
+    // the live parameters AND the currently loaded capture audio.
     void TriggerLoadGranularPreset();
+    // Grains Preset's own Load chooser confirmed with "New" highlighted
+    // -- clears the captured audio and resets every param to the
+    // engine's own defaults, same fresh-start spirit as Global:File's
+    // own TriggerNew().
+    void TriggerNewGranularPreset();
     // Two-row control legend, drawn at the bottom of every screen in
     // Tom Thumb (see font_tomthumb.h): a knob row (circle icon) and a
     // button row (square icon), each with a label flush to the screen
@@ -630,7 +783,10 @@ class Ui
     // it stays consistent if that curve ever changes.
     float master_volume_   = 1.f;
     float master_volume01_ = 0.5f; // raw 0..1 last set by the knob, for save/restore
-    bool  bypass_          = false;
+    // On by default -- overridden by a saved startup default if one
+    // exists (see ApplyStartupDefaults()/PerformanceStore::LoadPrefs()),
+    // same as every other field here.
+    bool  bypass_          = true;
 
     FilterMode master_filter_mode_      = FilterMode::Off;
     float      master_filter_cutoff01_  = 0.5f;
@@ -638,6 +794,9 @@ class Ui
 
     float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
     float bypass_reverb_send01_ = 0.f; // see GetBypassReverbSend01()
+    float bypass_mix_volume01_  = 0.8f; // see GetBypassMixVolume01()
+    float bypass_mix_volume_    = 1.f;  // curved, set properly in the ctor below
+    float bypass_pan01_         = 0.5f; // see GetBypassPan01()
 
     // Global:Speed -- live-performance controls, deliberately NEVER
     // persisted (Save/Load/PREFS.DAT) -- same treatment as master volume.
@@ -654,11 +813,30 @@ class Ui
     bool pad_enabled_      = false;
     bool granular_enabled_ = false;
     bool looper_enabled_   = true; // see IsLooperEnabled()'s own comment for why true
-    // false = knobs control Output Level (Plaits/Grains), true = Reverb
-    // Send -- see GlobalPage::Mixer's Button1/Button2 handling.
-    bool global_mixer_target_reverb_ = false;
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
+
+    // See SaveLoadMode's own comment -- shared by Global:File, Pad
+    // Preset, and Grains Preset. Reset to Idle whenever the page/screen
+    // changes (see HandleEncoder()'s rotate handling), so leaving one of
+    // these three pages never leaves it stuck mid-flow for the next visit.
+    SaveLoadMode save_load_mode_ = SaveLoadMode::Idle;
+    bool         save_as_new_    = false; // ChoosingSave's own Knob1 pick
+
+    // BrowsingLoad's own two-level structure, mirroring ChoosingSave's
+    // Overwrite/Save New chooser: entering Load first shows a top-level
+    // "Files" vs "New" pick (Knob1), same as ChoosingSave's own pick --
+    // load_new_selected_ is that pick, forced true when there's nothing
+    // to browse (same "can't select what doesn't exist" reasoning as
+    // Overwrite's own force-Save-New-when-nothing-loaded). Button1
+    // tapped while "Files" is picked drills in (load_browsing_files_ =
+    // true), handing Knob1 to the actual numbered list instead; Button1
+    // tapped anywhere else in Load backs out one level (to the chooser,
+    // or to Idle from the chooser itself) -- see OnButton1Short(). Reset
+    // alongside save_load_mode_ (both wherever it's set to Idle and
+    // wherever it's set to BrowsingLoad fresh).
+    bool load_new_selected_   = false;
+    bool load_browsing_files_ = false;
 
     // --- SD save/load (Global:File page) -----------------------------
     static constexpr int kMaxFileSlots = 99; // must match PerformanceStore::kMaxSlots
@@ -674,6 +852,19 @@ class Ui
     bool file_slots_dirty_          = true; // forces one RefreshFileSlots() on first Draw()
     bool file_op_in_progress_       = false; // true only while inside Save()/Load()
     char file_status_[24]           = {};    // last result, shown briefly on the page
+
+    // --- SD MGMT (Global:SdMgmt page) ------------------------------------
+    // Reuses file_slots_/pad_preset_user_slots_/granular_preset_user_slots_
+    // (and their own dirty flags/Refresh*() calls) as the file list for
+    // whichever folder is selected -- no separate copy of the same scan.
+    // Delete gets a longer hold than every other confirm gesture in this
+    // project (800ms elsewhere) -- unlike an overwrite or a wipe, there's
+    // no "just re-save/re-load" undo for it.
+    static constexpr float kSdMgmtDeleteHoldMs = 1500.f;
+    SdMgmtFolder sd_mgmt_folder_    = SdMgmtFolder::Performances;
+    bool         sd_mgmt_in_folder_ = false; // false = picking a folder, true = browsing its files
+    int          sd_mgmt_cursor_    = 0;     // index into the current folder's own slot list
+    char         sd_mgmt_status_[24] = {};   // last duplicate/delete result
 
     // --- WAV export (Global:Export page) ------------------------------
     bool export_op_in_progress_     = false; // true only while inside ExportWav()
@@ -709,6 +900,26 @@ class Ui
     const float* granular_scope_buf_      = nullptr;
     size_t       granular_scope_capacity_ = 0;
 
+    // --- Mixer (Screen::Mixer) ------------------------------------------
+    // Live post-fader master mix ring buffer (captured in main.cpp right
+    // after the master filter/click/master-volume stage -- the actual
+    // final signal, not any one instrument's own output) for the
+    // Mixer's own oscilloscope page. Same ownership convention as
+    // pad_scope_buf_/granular_scope_buf_ above.
+    const float* master_scope_buf_      = nullptr;
+    size_t       master_scope_capacity_ = 0;
+    // 0..3 = Layer 1..4, 4 = Plaits, 5 = Grains, 6 = Bypass, 7 = Master,
+    // 8 = Overview, 9 = Scope -- see kNumMixerChannels/kNumMixerPositions/
+    // MixerChannelName(). Changed by encoder rotate while on
+    // Screen::Mixer (see HandleEncoder()'s own comment on why that needs
+    // an explicit pickup reseed, unlike every other rotate-driven index
+    // in this project).
+    int  mixer_position_       = 0;
+    // false = knobs control Volume+Pan, true = Reverb Send -- ignored on
+    // Master and on the Overview/Scope stops (see MixerVolPan/
+    // MixerReverb/MixerMaster/MixerNoKnobs's own KnobContext comment).
+    bool mixer_target_reverb_  = false;
+
     // --- Grains capture (GranularParamPage::Capture) --------------------
     // Mutable (not const, unlike granular_scope_buf_ above) -- Ui writes
     // into these directly for the From-Layer copy, and main.cpp's
@@ -720,16 +931,31 @@ class Ui
     size_t           granular_capture_capacity_   = 0;
     volatile bool*   granular_capturing_          = nullptr;
     volatile size_t* granular_capture_write_pos_  = nullptr;
-    // -1 = Direct Record, 0..num_layers_-1 = pull from that loop layer
-    // (independent of cursor_layer_/Home's own selection) -- Button1
-    // cycles through all of these on the Capture page: Direct, Layer 1,
-    // Layer 2, Layer 3, Layer 4, back to Direct.
+    // -1 = Direct Record, -2 = Import (a WAV file from IMPORT/ on the SD
+    // card), 0..num_layers_-1 = pull from that loop layer (independent of
+    // cursor_layer_/Home's own selection) -- Button1 cycles through all
+    // of these on the Capture page: Direct, Layer 1, Layer 2, Layer 3,
+    // Layer 4, Import, back to Direct.
     int granular_capture_source_ = -1;
     // Edge-detection for Direct Record's press-to-start/release-to-stop
     // gesture (see HandleButton2()) -- also catches the ISR's own
     // auto-stop when the 5s buffer fills while Button2 is still held.
     bool granular_was_capturing_ = false;
-    char granular_capture_status_[24] = {}; // last From-Layer copy result
+    char granular_capture_status_[24] = {}; // last From-Layer/Import result
+
+    // --- Grains WAV import (granular_capture_source_ == -2) -------------
+    static constexpr int kMaxImportFiles = 16;
+    // 61, matching PerformanceStore::kMaxImportWavNameLen+1 -- can't
+    // reference that constant directly here since this header doesn't
+    // include performance_store.h (only ui.cpp does, same reasoning as
+    // GranularEngine/PadSynth being forward-declared instead of fully
+    // included).
+    char granular_import_names_[kMaxImportFiles][61] = {};
+    int  granular_import_file_count_ = 0;
+    // Same "no factory range, browses a list directly" idiom as
+    // granular_preset_cursor_ -- no continuous knob, just an index.
+    int  granular_import_cursor_       = 0;
+    bool granular_import_files_dirty_  = true; // forces one RefreshGranularImportFiles() on entry
 
     // --- Grains trim (GranularParamPage::Trim) --------------------------
     // The true, untrimmed length of whatever was most recently captured/
@@ -780,7 +1006,4 @@ class Ui
     // what PadSynth::Init() actually applies at boot.
     int  pad_loaded_preset_slot_     = 1;
     char pad_preset_status_[24]      = {}; // last save/load result, shown briefly here
-
-    // TEMPORARY -- see SetDiagCpuPercent() above.
-    int diag_cpu_percent_ = -1;
 };
