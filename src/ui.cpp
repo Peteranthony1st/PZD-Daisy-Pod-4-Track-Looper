@@ -94,6 +94,63 @@ const char* ModDestName(PadSynth::ModDestination d)
     }
 }
 
+// Same 3 values as PadSynth::ModDestination, but a distinct enum type
+// (FmSynth doesn't depend on PadSynth's own header) -- a small overload
+// rather than sharing one enum across two otherwise-independent engines.
+const char* ModDestName(FmSynth::ModDestination d)
+{
+    switch(d)
+    {
+        case FmSynth::ModDestination::Vibrato: return "Vibrato";
+        case FmSynth::ModDestination::FilterCutoff: return "Filter";
+        case FmSynth::ModDestination::ChorusDepth: return "Chorus";
+        default: return "?";
+    }
+}
+
+const char* FmAlgorithmName(FastFmVoice::Algorithm a)
+{
+    switch(a)
+    {
+        case FastFmVoice::Algorithm::Stack: return "Stack";
+        case FastFmVoice::Algorithm::Parallel: return "Parallel";
+        case FastFmVoice::Algorithm::DualStack: return "DualStack";
+        case FastFmVoice::Algorithm::YBranch: return "YBranch";
+        default: return "?";
+    }
+}
+
+// One-line routing summary for FmParamPage::Ratio/Index/Op4 -- those
+// pages otherwise just show static "Op2"/"Op3"/"Ratio"/"Index" labels
+// with no hint of what each operator actually feeds in the CURRENT
+// algorithm (Op2 feeds the carrier in every algorithm here, but Op3/Op4's
+// role changes -- see FastFmVoice::Algorithm's own doc comment). Same
+// condensed information as the Algo page's own diagram, small enough to
+// sit in the kBandTop+9 status-line slot above the oscilloscope (same
+// convention Chorus/Vibrato's own "Mod wheel -> X" line uses).
+const char* FmAlgorithmRouteSummary(FastFmVoice::Algorithm a)
+{
+    switch(a)
+    {
+        case FastFmVoice::Algorithm::Stack: return "Route: 4>3>2>1";
+        case FastFmVoice::Algorithm::Parallel: return "Route: 2,3,4>1";
+        case FastFmVoice::Algorithm::DualStack: return "Route: 2>1  4>3";
+        case FastFmVoice::Algorithm::YBranch: return "Route: 3,4>2>1";
+        default: return "Route: ?";
+    }
+}
+
+// Folder list entry name for FM's own Preset-page folder browsing (see
+// Ui::fm_preset_folder_open_'s own comment) -- 0..kNumFactoryCategories-1
+// name a factory category, kNumFactoryCategories itself the trailing
+// synthetic folder holding every SD-saved slot.
+const char* FmFolderName(int folder_cursor)
+{
+    if(folder_cursor < FmSynth::kNumFactoryCategories)
+        return FmSynth::GetFactoryCategoryName(folder_cursor);
+    return "User";
+}
+
 const char* GranularDirectionName(GranularEngine::Direction d)
 {
     switch(d)
@@ -117,6 +174,11 @@ int PadPresetCursorToSlot(int cursor, const int* user_slots, int user_count)
         return -1;
     return user_slots[ui2];
 }
+
+// FM's own folder-then-preset resolution lives on Ui itself
+// (Ui::ResolveFmPresetSlot()) rather than as a free function like
+// PadPresetCursorToSlot() above -- it needs fm_preset_folder_cursor_
+// alongside the cursor, not just a single flat index.
 
 const char* EffectParamBLabel(LayerEffect e)
 {
@@ -151,7 +213,10 @@ void Ui::Init(daisy::DaisyPod*              pod,
               volatile bool*                granular_capturing,
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
-              size_t                        master_scope_capacity)
+              size_t                        master_scope_capacity,
+              FmSynth*                      fm_synth,
+              const float*                  fm_scope_buf,
+              size_t                        fm_scope_capacity)
 {
     pod_        = pod;
     disp_       = display;
@@ -171,6 +236,9 @@ void Ui::Init(daisy::DaisyPod*              pod,
     granular_capture_write_pos_ = granular_capture_write_pos;
     master_scope_buf_      = master_scope_buf;
     master_scope_capacity_ = master_scope_capacity;
+    fm_synth_          = fm_synth;
+    fm_scope_buf_       = fm_scope_buf;
+    fm_scope_capacity_  = fm_scope_capacity;
 
     // Same curve ApplyKnobs() uses for knob1 on Home, applied once here
     // so master_volume_ actually matches master_volume01_'s starting
@@ -305,6 +373,19 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             global_page_    = new_page;
             save_load_mode_ = SaveLoadMode::Idle; // leaving/entering any page resets this
         }
+        else if(screen_ == Screen::Fm)
+        {
+            int n = (int)FmParamPage::kCount;
+            int p = (((int)fm_param_page_ + inc) % n + n) % n;
+            FmParamPage new_fm_page = (FmParamPage)p;
+            if(new_fm_page == FmParamPage::Preset && fm_param_page_ != FmParamPage::Preset)
+            {
+                fm_preset_slots_dirty_  = true; // re-scan the card on entry
+                fm_preset_folder_open_  = false; // always start at the folder list
+            }
+            fm_param_page_  = new_fm_page;
+            save_load_mode_ = SaveLoadMode::Idle; // same reset as Global:File above
+        }
         else if(screen_ == Screen::Pad)
         {
             int n = (int)PadParamPage::kCount;
@@ -386,6 +467,13 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             layer_page_ = LayerPage::Status;
         }
         else if(!encoder_long_fired_ && screen_ == Screen::Global
+                && global_page_ == GlobalPage::Fm)
+        {
+            // Global:Fm is an entry point into Screen::Fm, same
+            // convention Global:Pad's own click uses.
+            screen_ = Screen::Fm;
+        }
+        else if(!encoder_long_fired_ && screen_ == Screen::Global
                 && global_page_ == GlobalPage::Pad)
         {
             // Global:Pad is an entry point into Screen::Pad, same
@@ -422,12 +510,14 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             TogglePauseAll();
         }
         else if(!encoder_long_fired_
-                && (screen_ == Screen::Pad || screen_ == Screen::Granular))
+                && (screen_ == Screen::Pad || screen_ == Screen::Granular
+                    || screen_ == Screen::Fm))
         {
             // Same mute-all-loop-layers click as every Global page's own
-            // (TogglePauseAll()) -- Pad/Granular have no click-to-drill-in
-            // of their own (that's the encoder's job from Global instead),
-            // so there's nothing else useful for their click to do either.
+            // (TogglePauseAll()) -- Pad/Granular/Fm have no click-to-
+            // drill-in of their own (that's the encoder's job from Global
+            // instead), so there's nothing else useful for their click to
+            // do either.
             TogglePauseAll();
         }
         // Screen::Mixer: rotate already picks the stop (see
@@ -564,6 +654,71 @@ void Ui::HandleButton2(const UiControlEvents& events)
                     save_load_mode_     = SaveLoadMode::BrowsingLoad;
                     load_new_selected_  = false;
                     load_browsing_files_ = false;
+                }
+            }
+            button2_long_fired_ = false;
+        }
+    }
+    else if(screen_ == Screen::Fm && fm_param_page_ == FmParamPage::Preset)
+    {
+        // Button2 confirms whichever of Save/Load is revealed -- see
+        // Global:File's own Button2 handling for the shared SaveLoadMode
+        // this mirrors.
+        bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+        // Nothing concrete is highlighted while just browsing the folder
+        // list (folder names aren't presets) -- confirm only once "New"
+        // is picked at the top-level chooser, or a folder has actually
+        // been opened onto a real preset (see fm_preset_folder_open_'s
+        // own comment).
+        bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
+                                 && (load_new_selected_
+                                     || (load_browsing_files_ && fm_preset_folder_open_));
+        bool can_confirm      = can_confirm_save || can_confirm_load;
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
+        {
+            button2_long_fired_ = true;
+            if(can_confirm_save)
+                TriggerSaveFmPreset(save_as_new_);
+            else
+                TriggerLoadFmPreset();
+            save_load_mode_ = SaveLoadMode::Idle;
+        }
+        if(events.btn2_released)
+        {
+            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && can_confirm)
+            {
+                if(can_confirm_save)
+                    TriggerSaveFmPreset(save_as_new_);
+                else
+                    TriggerLoadFmPreset();
+                save_load_mode_ = SaveLoadMode::Idle;
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::BrowsingLoad
+                     && load_browsing_files_ && fm_preset_folder_open_)
+            {
+                // Short tap while a preset is highlighted inside an open
+                // folder -- preview it immediately (apply to the live
+                // engine) WITHOUT leaving the browser, so scrolling K1
+                // and tapping B2 auditions one preset after another
+                // without re-entering the whole Save/Load flow each
+                // time. Button2's hold gesture above still does the same
+                // load AND exits back to Idle, for once you've settled
+                // on one.
+                TriggerLoadFmPreset();
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
+            {
+                // Short tap from Idle only: reveal the preset list to
+                // browse (Button2's own label becomes "Hold=Load" to
+                // commit).
+                if(!PerformanceStore::IsCardPresent())
+                    PerformanceStore::Remount();
+                else
+                {
+                    save_load_mode_        = SaveLoadMode::BrowsingLoad;
+                    load_new_selected_     = false;
+                    load_browsing_files_   = false;
+                    fm_preset_folder_open_ = false; // always start at the folder list
                 }
             }
             button2_long_fired_ = false;
@@ -866,8 +1021,18 @@ void Ui::OnButton1Short()
                 else
                     TriggerExport();
             }
+            else if(global_page_ == GlobalPage::Fm)
+            {
+                fm_enabled_ = !fm_enabled_;
+                if(fm_enabled_)
+                    pad_enabled_ = false; // mutually exclusive -- see IsFmEnabled()'s own comment
+            }
             else if(global_page_ == GlobalPage::Pad)
+            {
                 pad_enabled_ = !pad_enabled_;
+                if(pad_enabled_)
+                    fm_enabled_ = false; // mutually exclusive -- see IsFmEnabled()'s own comment
+            }
             else if(global_page_ == GlobalPage::Granular)
                 granular_enabled_ = !granular_enabled_;
             else if(global_page_ == GlobalPage::Looper)
@@ -898,6 +1063,7 @@ void Ui::OnButton1Short()
                     {
                         case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
                         case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+                        case SdMgmtFolder::FmPresets: fm_preset_slots_dirty_ = true; break;
                         case SdMgmtFolder::GranularPresets:
                             granular_preset_slots_dirty_ = true;
                             break;
@@ -910,6 +1076,77 @@ void Ui::OnButton1Short()
                     // Duplicate once already browsing files (see
                     // OnButton1Long()), so its tap is free to mean this.
                     sd_mgmt_in_folder_ = false;
+                }
+            }
+            break;
+        case Screen::Fm:
+            if(fm_param_page_ == FmParamPage::Algo && fm_synth_)
+            {
+                // Same "Button1 cycles" idiom as Layer:Filter/Pad:Filter/
+                // Fm:Filter -- see FastFmVoice::Algorithm's own comment
+                // for what each one sounds like.
+                int n = (int)FastFmVoice::Algorithm::YBranch + 1;
+                int m = (fm_synth_->GetAlgorithm() + 1) % n;
+                fm_synth_->SetAlgorithm(m);
+            }
+            else if(fm_param_page_ == FmParamPage::ADSR)
+            {
+                fm_adsr_target_sr_ = false; // knobs -> Attack/Decay
+            }
+            else if(fm_param_page_ == FmParamPage::Filter && fm_synth_)
+            {
+                // Same "Button1 cycles" idiom as Layer:Filter/Pad:Filter.
+                int n = (int)FilterMode::kNumModes;
+                int m = ((int)fm_synth_->GetFilterMode() + 1) % n;
+                fm_synth_->SetFilterMode((FilterMode)m);
+            }
+            else if(fm_param_page_ == FmParamPage::ModAssign && fm_synth_)
+            {
+                int n = (int)FmSynth::ModDestination::ChorusDepth + 1;
+                int m = ((int)fm_synth_->GetModDestination() + 1) % n;
+                fm_synth_->SetModDestination((FmSynth::ModDestination)m);
+            }
+            else if(fm_param_page_ == FmParamPage::Preset)
+            {
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                {
+                    // Two levels here, unlike Global:File's single
+                    // numbered list -- see fm_preset_folder_open_'s own
+                    // comment. Folder open: back out to the folder list.
+                    // Folder list: open the highlighted folder instead
+                    // (Knob1 now scrolls the presets inside it).
+                    if(fm_preset_folder_open_)
+                        fm_preset_folder_open_ = false;
+                    else
+                    {
+                        fm_preset_folder_open_ = true;
+                        fm_preset_cursor_      = 0;
+                    }
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
+                {
+                    // "Files" is highlighted -- drill into the folder
+                    // list (Knob1 now scrolls fm_preset_folder_cursor_
+                    // directly), always starting at its very top.
+                    load_browsing_files_     = true;
+                    fm_preset_folder_open_   = false;
+                    fm_preset_folder_cursor_ = 0;
+                }
+                else if(save_load_mode_ != SaveLoadMode::Idle)
+                {
+                    // Back -- Button2 confirms Save/Load (see
+                    // HandleButton2()), so this tap always just returns
+                    // to the page's own idle state, same as Global:File.
+                    save_load_mode_ = SaveLoadMode::Idle;
+                }
+                else if(!PerformanceStore::IsCardPresent())
+                    PerformanceStore::Remount();
+                else
+                {
+                    // Reveal the Overwrite/Save New choice -- Button2's
+                    // hold now confirms it (see HandleButton2()).
+                    save_load_mode_ = SaveLoadMode::ChoosingSave;
+                    save_as_new_    = fm_loaded_preset_slot_ <= FmSynth::kNumFactoryPresets;
                 }
             }
             break;
@@ -1070,6 +1307,8 @@ void Ui::OnButton2Short()
     }
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Export)
         TriggerExportMicroDexed();
+    else if(screen_ == Screen::Fm && fm_param_page_ == FmParamPage::ADSR)
+        fm_adsr_target_sr_ = true; // knobs -> Sustain/Release
     else if(screen_ == Screen::Pad && pad_param_page_ == PadParamPage::ADSR)
         pad_adsr_target_sr_ = true; // knobs -> Sustain/Release
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Grain)
@@ -1112,12 +1351,31 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Speed: return KnobContext::GlobalSpeed;
                 case GlobalPage::File: return KnobContext::GlobalFile;
                 case GlobalPage::Export: return KnobContext::GlobalExport;
+                case GlobalPage::Fm: return KnobContext::GlobalFm;
                 case GlobalPage::Pad: return KnobContext::GlobalPad;
                 case GlobalPage::Granular: return KnobContext::GlobalGranular;
                 case GlobalPage::Looper: return KnobContext::GlobalLooper;
                 case GlobalPage::Mixer: return KnobContext::GlobalMixer;
                 case GlobalPage::SdMgmt: return KnobContext::GlobalSdMgmt;
                 default: return KnobContext::GlobalTempo;
+            }
+        case Screen::Fm:
+            switch(fm_param_page_)
+            {
+                case FmParamPage::Algo: return KnobContext::FmAlgo;
+                case FmParamPage::Ratio: return KnobContext::FmRatio;
+                case FmParamPage::Index: return KnobContext::FmIndex;
+                case FmParamPage::Op4: return KnobContext::FmOp4;
+                case FmParamPage::Tune: return KnobContext::FmTune;
+                case FmParamPage::ADSR:
+                    return fm_adsr_target_sr_ ? KnobContext::FmEnvSR : KnobContext::FmEnvAD;
+                case FmParamPage::Chorus: return KnobContext::FmChorus;
+                case FmParamPage::Vibrato: return KnobContext::FmVibrato;
+                case FmParamPage::Filter: return KnobContext::FmFilter;
+                case FmParamPage::Mix: return KnobContext::FmMix;
+                case FmParamPage::ModAssign: return KnobContext::FmModAssign;
+                case FmParamPage::Preset: return KnobContext::FmPreset;
+                default: return KnobContext::FmRatio;
             }
         case Screen::Pad:
             switch(pad_param_page_)
@@ -1227,6 +1485,77 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalLooper: break; // no continuous knobs, Button1 toggle only
         case KnobContext::GlobalMixer: break; // entry point only -- see Screen::Mixer instead
         case KnobContext::GlobalSdMgmt: break; // browses a list directly, no pickup used
+        case KnobContext::GlobalFm: break; // entry point only -- see Screen::Fm instead
+        case KnobContext::FmAlgo: break; // no continuous knob values, Button1 cycles it
+        case KnobContext::FmRatio:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetOp2Ratio01();
+                k2_pickup_raw_[i] = fm_synth_->GetOp3Ratio01();
+            }
+            break;
+        case KnobContext::FmIndex:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetOp2Index01();
+                k2_pickup_raw_[i] = fm_synth_->GetOp3Index01();
+            }
+            break;
+        case KnobContext::FmOp4:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetOp4Ratio01();
+                k2_pickup_raw_[i] = fm_synth_->GetOp4Index01();
+            }
+            break;
+        case KnobContext::FmTune:
+            if(fm_synth_)
+                k1_pickup_raw_[i] = fm_synth_->GetTuneSemitones01();
+            break;
+        case KnobContext::FmEnvAD:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetAttack01();
+                k2_pickup_raw_[i] = fm_synth_->GetDecay01();
+            }
+            break;
+        case KnobContext::FmEnvSR:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetSustain01();
+                k2_pickup_raw_[i] = fm_synth_->GetRelease01();
+            }
+            break;
+        case KnobContext::FmChorus:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetChorusDepth01();
+                k2_pickup_raw_[i] = fm_synth_->GetChorusRate01();
+            }
+            break;
+        case KnobContext::FmVibrato:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetVibratoDepth01();
+                k2_pickup_raw_[i] = fm_synth_->GetVibratoRate01();
+            }
+            break;
+        case KnobContext::FmFilter:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetFilterCutoff01();
+                k2_pickup_raw_[i] = fm_synth_->GetFilterResonance01();
+            }
+            break;
+        case KnobContext::FmMix:
+            if(fm_synth_)
+            {
+                k1_pickup_raw_[i] = fm_synth_->GetReverbSend01();
+                k2_pickup_raw_[i] = fm_synth_->GetOutputLevel01();
+            }
+            break;
+        case KnobContext::FmModAssign: break; // no continuous knob values, Button1 cycles it
+        case KnobContext::FmPreset: break; // browses a list directly, no pickup used
         case KnobContext::PadTone:
             if(pad_synth_)
             {
@@ -1615,6 +1944,140 @@ void Ui::ApplyKnobs()
             }
             break;
 
+        case Screen::Fm:
+            if(!fm_synth_)
+                break;
+            switch(fm_param_page_)
+            {
+                case FmParamPage::Algo: break; // no knobs, Button1 cycles it
+                case FmParamPage::Ratio:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetOp2Ratio01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetOp3Ratio01(k2);
+                    break;
+                case FmParamPage::Index:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetOp2Index01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetOp3Index01(k2);
+                    break;
+                case FmParamPage::Op4:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetOp4Ratio01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetOp4Index01(k2);
+                    break;
+                case FmParamPage::Tune:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetTuneSemitones01(k1);
+                    break;
+                case FmParamPage::ADSR:
+                    if(!fm_adsr_target_sr_)
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            fm_synth_->SetAttack01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            fm_synth_->SetDecay01(k2);
+                    }
+                    else
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            fm_synth_->SetSustain01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            fm_synth_->SetRelease01(k2);
+                    }
+                    break;
+                case FmParamPage::Chorus:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetChorusDepth01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetChorusRate01(k2);
+                    break;
+                case FmParamPage::Vibrato:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetVibratoDepth01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetVibratoRate01(k2);
+                    break;
+                case FmParamPage::Filter:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetFilterCutoff01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetFilterResonance01(k2);
+                    break;
+                case FmParamPage::Mix:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        fm_synth_->SetReverbSend01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        fm_synth_->SetOutputLevel01(k2);
+                    break;
+                case FmParamPage::ModAssign: break; // no knobs, Button1 cycles it
+                case FmParamPage::Preset:
+                {
+                    if(save_load_mode_ == SaveLoadMode::ChoosingSave)
+                    {
+                        // Overwrite is only a real option once a real
+                        // user slot (not a factory one) is loaded.
+                        save_as_new_ = fm_loaded_preset_slot_ <= FmSynth::kNumFactoryPresets
+                                           ? true
+                                           : k1 >= 0.5f;
+                        break;
+                    }
+                    if(save_load_mode_ != SaveLoadMode::BrowsingLoad)
+                        break;
+                    if(!load_browsing_files_)
+                    {
+                        // Top-level chooser (mirrors ChoosingSave's own
+                        // Overwrite/Save New pick above) -- factory
+                        // presets always exist, so "Files" is always a
+                        // real option here.
+                        load_new_selected_ = k1 >= 0.5f;
+                        break;
+                    }
+                    // One extra folder level versus Global:File/Pad's own
+                    // single numbered list (see fm_preset_folder_open_'s
+                    // own comment) -- K1 scrolls whichever of the two is
+                    // currently active, discretized/not pickup-tracked,
+                    // same idiom as Global:File's own file_cursor_.
+                    if(!fm_preset_folder_open_)
+                    {
+                        // Folder list -- kNumFactoryCategories named
+                        // categories plus one trailing "User" folder.
+                        int total = FmSynth::kNumFactoryCategories + 1;
+                        int idx   = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        if(idx >= total)
+                            idx = total - 1;
+                        fm_preset_folder_cursor_ = idx;
+                        break;
+                    }
+                    {
+                        // Inside a folder -- browsing either one factory
+                        // category's own presets, or (the trailing
+                        // folder) every user-saved slot.
+                        int total = fm_preset_folder_cursor_ < FmSynth::kNumFactoryCategories
+                                        ? FmSynth::GetFactoryCategoryCount(fm_preset_folder_cursor_)
+                                        : fm_preset_user_slot_count_;
+                        if(total <= 0)
+                            break;
+                        int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        if(idx >= total)
+                            idx = total - 1;
+                        // Browsing again -- clear the last save/load
+                        // result so the "Load:" line (which shows what
+                        // the knob is actually pointing at right now)
+                        // comes back instead of staying stuck on a
+                        // status message that never otherwise clears.
+                        if(idx != fm_preset_cursor_)
+                            fm_preset_status_[0] = '\0';
+                        fm_preset_cursor_ = idx;
+                    }
+                    break;
+                }
+                default: break;
+            }
+            break;
+
         case Screen::Pad:
             if(!pad_synth_)
                 break;
@@ -1933,6 +2396,7 @@ void Ui::Draw()
         case Screen::Home: DrawHome(); break;
         case Screen::Layer: DrawLayerScreen(); break;
         case Screen::Global: DrawGlobalScreen(); break;
+        case Screen::Fm: DrawFmScreen(); break;
         case Screen::Pad: DrawPadScreen(); break;
         case Screen::Granular: DrawGranularScreen(); break;
         case Screen::Mixer: DrawMixerScreen(); break;
@@ -2410,11 +2874,29 @@ void Ui::DrawGlobalScreen()
         DrawSpeedScreen();
         return;
     }
+    if(global_page_ == GlobalPage::Fm)
+    {
+        // Entry point into Screen::Fm, plus the on/off toggle -- mutually
+        // exclusive with Pad Synth (see IsFmEnabled()'s own comment), so
+        // "Enabled" here always means Pad Synth is currently off.
+        disp_->SetCursor(0, 0);
+        WriteUpper("Global:Fm");
+        DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+        disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+        disp_->SetCursor(0, 20);
+        WriteUpper(fm_enabled_ ? "Enabled" : "Disabled");
+        disp_->SetCursor(0, 30);
+        WriteUpper("Click to open Fm");
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Toggle On/Off", "", "", "");
+        return;
+    }
     if(global_page_ == GlobalPage::Pad)
     {
         // Entry point into Screen::Pad, plus the on/off toggle (see
         // IsPadEnabled()'s doc comment for why this was pulled forward
-        // from the original plan's Stage 4).
+        // from the original plan's Stage 4). Mutually exclusive with Fm
+        // (see IsFmEnabled()'s own comment).
         disp_->SetCursor(0, 0);
         WriteUpper("Global:Pad");
         DrawBeatIndicator(disp_->Width() - 41, 0, 3);
@@ -2724,6 +3206,7 @@ const char* Ui::SdMgmtFolderName(SdMgmtFolder f)
     {
         case SdMgmtFolder::Performances: return "Performances";
         case SdMgmtFolder::PadPresets: return "Pad Presets";
+        case SdMgmtFolder::FmPresets: return "Fm Presets";
         case SdMgmtFolder::GranularPresets: return "Grains Presets";
         default: return "?";
     }
@@ -3224,6 +3707,521 @@ void Ui::DrawPadScreen()
                     b2_label = "Load";
                 else if(choosing_save)
                     b2_label = "Hold=Save";
+                else if(can_hold_load)
+                    b2_label = "Hold=Load";
+                else
+                    b2_label = "";
+
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY,
+                                 (choosing_save || browsing_load) ? "Scroll" : "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, b1_label, "", "",
+                                 b2_label);
+            }
+            break;
+        }
+        default: break;
+    }
+}
+
+void Ui::DrawFmScreen()
+{
+    if(!fm_synth_)
+        return;
+
+    const char* page_name = "Ratio";
+    switch(fm_param_page_)
+    {
+        case FmParamPage::Algo: page_name = "Algo"; break;
+        case FmParamPage::Ratio: page_name = "Ratio"; break;
+        case FmParamPage::Index: page_name = "Index"; break;
+        case FmParamPage::Op4: page_name = "Op4"; break;
+        case FmParamPage::Tune: page_name = "Tune"; break;
+        case FmParamPage::ADSR: page_name = "ADSR"; break;
+        case FmParamPage::Chorus: page_name = "Chorus"; break;
+        case FmParamPage::Vibrato: page_name = "Vibrato"; break;
+        case FmParamPage::Filter: page_name = "Filter"; break;
+        case FmParamPage::Mix: page_name = "Mix"; break;
+        case FmParamPage::ModAssign: page_name = "Mod"; break;
+        case FmParamPage::Preset: page_name = "Preset"; break;
+        default: break;
+    }
+    char title[24];
+    snprintf(title, sizeof(title), "Fm:%s", page_name);
+    disp_->SetCursor(0, 0);
+    WriteUpper(title);
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    // Persistent status row, same idiom as Pad's own -- voice polyphony
+    // dots (FmSynth::kMaxVoices, dropped from 8 to 6 for CPU headroom,
+    // see that constant's own comment), a pitch-bend position tick, and
+    // the mod wheel's live value + destination.
+    const int kStatusY = 11;
+    for(int i = 0; i < FmSynth::kMaxVoices; i++)
+    {
+        // Same 3x3-box, 1px-gap idiom as Pad's own (pitch 4) -- the bend
+        // bar/mod readout below stay at their own fixed position
+        // regardless of voice count, same as when this was 8.
+        int x = 1 + i * 4;
+        disp_->DrawRect(x, kStatusY, x + 2, kStatusY + 2, true, fm_synth_->IsVoiceActive(i));
+    }
+
+    const int kBendX0 = 34, kBendX1 = 64, kBendMidY = kStatusY + 1;
+    disp_->DrawLine(kBendX0, kBendMidY, kBendX1, kBendMidY, true);
+    {
+        // +-2 semitones (see main.cpp's kPitchBendRangeSemis) maps to
+        // the full width of this little bar, centered = no bend -- same
+        // convention as Pad's own status row.
+        float bend01 = Clampf(fm_synth_->GetPitchBendSemis() / 2.f, -1.f, 1.f);
+        int   tick_x = kBendX0 + (kBendX1 - kBendX0) / 2
+                       + (int)(bend01 * (float)(kBendX1 - kBendX0) / 2.f);
+        disp_->DrawLine(tick_x, kStatusY, tick_x, kStatusY + 2, true);
+    }
+
+    const int kModRowY = 15;
+    char      mod_line[20];
+    snprintf(mod_line, sizeof(mod_line), "%s %d%%", ModDestName(fm_synth_->GetModDestination()),
+              (int)(fm_synth_->GetModWheel01() * 100.f + 0.5f));
+    TomThumbDrawText(disp_, kBendX1 + 4, kModRowY, mod_line, true);
+
+    const int kBandTop = 22, kBandBottom = 44;
+    switch(fm_param_page_)
+    {
+        case FmParamPage::Algo:
+        {
+            // Yamaha-style algorithm chart -- vertical chains (modulator
+            // above the operator it feeds), carriers dropping a stub down
+            // onto a shared "OUT" line, same convention DX7-family charts
+            // use (see FastFmVoice::Algorithm's own doc comment for what
+            // each shape sounds like). Box height is chosen so a TomThumb
+            // digit (5px tall) sits inside the 1px top/bottom border with
+            // no overlap -- 6px-tall boxes previously clipped the glyph
+            // against its own border, which read as "the number doesn't
+            // fit". Button1 cycles the algorithm (see
+            // Ui::OnButton1Short()'s Screen::Fm case); no knobs here.
+            const int kOpW = 11, kOpH = 7; // interior: 9x5, exactly the glyph's own 5px height
+            auto DrawOpBox = [&](int x0, int y0, const char* label) {
+                disp_->DrawRect(x0, y0, x0 + kOpW - 1, y0 + kOpH - 1, true, false);
+                // Baseline on the bottom border row -- TomThumb draws
+                // upward from it, landing the glyph exactly in the
+                // interior rows (y0+1 .. y0+kOpH-2) with no clipping.
+                TomThumbDrawText(disp_, x0 + 4, y0 + kOpH - 1, label, true);
+            };
+            const int kCenterX = disp_->Width() / 2;
+            const int kOutY    = kBandBottom;
+            // 1-row gap between vertically-stacked boxes -- a 2-box
+            // column at this step lands its bottom box's own bottom edge
+            // exactly on kBandBottom, no leftover/overflow.
+            const int kStep = kOpH + 1;
+            switch(fm_synth_->GetAlgorithm())
+            {
+                case (int)FastFmVoice::Algorithm::Stack:
+                {
+                    // Four operators is one column too tall for this
+                    // band at a legible box size, so the chain snakes
+                    // through a 2x2 grid instead -- exactly how real DX7
+                    // charts lay out their own longer chains: 4 -> 3
+                    // (top row, left to right), 3 -> 2 (down the right
+                    // column), 2 -> 1/carrier (bottom row, right to
+                    // left), then Op1 drops to OUT.
+                    const int kGapX = 8;
+                    const int xa = kCenterX - kOpW - kGapX / 2, xb = kCenterX + kGapX / 2;
+                    const int xac = xa + kOpW / 2, xbc = xb + kOpW / 2;
+                    const int y_top = kBandTop, y_bot = y_top + kStep;
+                    const int mid_top = y_top + kOpH / 2, mid_bot = y_bot + kOpH / 2;
+                    DrawOpBox(xa, y_top, "4");
+                    DrawOpBox(xb, y_top, "3");
+                    DrawOpBox(xb, y_bot, "2");
+                    DrawOpBox(xa, y_bot, "1");
+                    disp_->DrawLine(xa + kOpW - 1, mid_top, xb, mid_top, true);
+                    disp_->DrawLine(xbc, y_top + kOpH - 1, xbc, y_bot, true);
+                    disp_->DrawLine(xb, mid_bot, xa + kOpW - 1, mid_bot, true);
+                    disp_->DrawLine(xac, y_bot + kOpH - 1, xac, kOutY, true);
+                    break;
+                }
+                case (int)FastFmVoice::Algorithm::Parallel:
+                {
+                    // Three modulators (2, 3, 4) fork down into the one
+                    // carrier (1) below/between them, centered as a
+                    // group; carrier drops a stub to OUT.
+                    const int kGapX = 4;
+                    const int xa = kCenterX - kOpW - kOpW / 2 - kGapX,
+                              xb = kCenterX - kOpW / 2, xc = kCenterX + kOpW / 2 + kGapX;
+                    const int xac = xa + kOpW / 2, xbc = xb + kOpW / 2, xcc = xc + kOpW / 2;
+                    DrawOpBox(xa, kBandTop, "2");
+                    DrawOpBox(xb, kBandTop, "3");
+                    DrawOpBox(xc, kBandTop, "4");
+                    const int y1 = kBandTop + kOpH + 5, x1 = kCenterX - kOpW / 2;
+                    disp_->DrawLine(xac, kBandTop + kOpH - 1, kCenterX, y1, true);
+                    disp_->DrawLine(xbc, kBandTop + kOpH - 1, kCenterX, y1, true);
+                    disp_->DrawLine(xcc, kBandTop + kOpH - 1, kCenterX, y1, true);
+                    DrawOpBox(x1, y1, "1");
+                    disp_->DrawLine(kCenterX, y1 + kOpH - 1, kCenterX, kOutY, true);
+                    break;
+                }
+                case (int)FastFmVoice::Algorithm::DualStack:
+                {
+                    // Two independent 2-operator chains, both carriers,
+                    // centered as a pair: Op2->Op1 and Op4->Op3 -- both
+                    // stubs land on the same shared OUT line, same as a
+                    // real DX7 chart's shared output bus.
+                    const int kGapX = 16;
+                    const int xa = kCenterX - kOpW - kGapX / 2, xb = kCenterX + kGapX / 2;
+                    const int xac = xa + kOpW / 2, xbc = xb + kOpW / 2;
+                    const int y_top = kBandTop, y_bot = y_top + kStep;
+                    DrawOpBox(xa, y_top, "2");
+                    disp_->DrawLine(xac, y_top + kOpH - 1, xac, y_bot, true);
+                    DrawOpBox(xa, y_bot, "1");
+                    disp_->DrawLine(xac, y_bot + kOpH - 1, xac, kOutY, true);
+                    DrawOpBox(xb, y_top, "4");
+                    disp_->DrawLine(xbc, y_top + kOpH - 1, xbc, y_bot, true);
+                    DrawOpBox(xb, y_bot, "3");
+                    disp_->DrawLine(xbc, y_bot + kOpH - 1, xbc, kOutY, true);
+                    disp_->DrawLine(xac, kOutY, xbc, kOutY, true);
+                    break;
+                }
+                case (int)FastFmVoice::Algorithm::YBranch:
+                {
+                    // Op3 and Op4 fork down into Op2, which then chains
+                    // straight into Op1/carrier -- a fork feeding a
+                    // chain, centered on the display. Op1's own bottom
+                    // edge lands exactly on kBandBottom -- no separate
+                    // OUT stub needed.
+                    const int kGapX = 6;
+                    const int xa = kCenterX - kOpW - kGapX / 2, xb = kCenterX + kGapX / 2;
+                    const int xac = xa + kOpW / 2, xbc = xb + kOpW / 2;
+                    DrawOpBox(xa, kBandTop, "3");
+                    DrawOpBox(xb, kBandTop, "4");
+                    const int y2 = kBandTop + kOpH + 2, x2 = kCenterX - kOpW / 2;
+                    disp_->DrawLine(xac, kBandTop + kOpH - 1, kCenterX, y2, true);
+                    disp_->DrawLine(xbc, kBandTop + kOpH - 1, kCenterX, y2, true);
+                    DrawOpBox(x2, y2, "2");
+                    const int y1 = y2 + kOpH + 2;
+                    disp_->DrawLine(kCenterX, y2 + kOpH - 1, kCenterX, y1, true);
+                    DrawOpBox(x2, y1, "1");
+                    break;
+                }
+                default: break;
+            }
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Algo",
+                             FmAlgorithmName((FastFmVoice::Algorithm)fm_synth_->GetAlgorithm()), "",
+                             "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle", "", "", "");
+            break;
+        }
+        case FmParamPage::Ratio:
+        {
+            // Which stage each operator feeds changes per algorithm (Op2
+            // always feeds the carrier, but Op3/Op4's role doesn't) --
+            // same route-summary line/kBandTop+9 convention as Chorus/
+            // Vibrato's own "Mod wheel -> X" status line.
+            TomThumbDrawText(
+                disp_, 0, kBandTop,
+                FmAlgorithmRouteSummary((FastFmVoice::Algorithm)fm_synth_->GetAlgorithm()), true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            // The actual resolved multiplier (e.g. "1.5x"), not a percent
+            // -- Ratio is quantized to a small table of musical values
+            // (see FmSynth::SetOp2Ratio01()'s own doc comment), so a
+            // percentage of knob travel wouldn't mean anything useful
+            // here. Same fixed-point "%d.%dx" convention used for every
+            // other x-multiplier readout in this project (e.g. Layer/
+            // Global:Speed's own speed_val) -- this toolchain's
+            // snprintf() has no float support (--specs=nano.specs).
+            char op2_val[8], op3_val[8];
+            int  op2_x10 = (int)(fm_synth_->GetOp2Ratio() * 10.f + 0.5f);
+            int  op3_x10 = (int)(fm_synth_->GetOp3Ratio() * 10.f + 0.5f);
+            snprintf(op2_val, sizeof(op2_val), "%d.%dx", op2_x10 / 10, op2_x10 % 10);
+            snprintf(op3_val, sizeof(op3_val), "%d.%dx", op3_x10 / 10, op3_x10 % 10);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Op2", op2_val, op3_val, "Op3");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::Index:
+        {
+            TomThumbDrawText(
+                disp_, 0, kBandTop,
+                FmAlgorithmRouteSummary((FastFmVoice::Algorithm)fm_synth_->GetAlgorithm()), true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            char op2_val[8], op3_val[8];
+            snprintf(op2_val, sizeof(op2_val), "%d%%",
+                      (int)(fm_synth_->GetOp2Index01() * 100.f + 0.5f));
+            snprintf(op3_val, sizeof(op3_val), "%d%%",
+                      (int)(fm_synth_->GetOp3Index01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Op2", op2_val, op3_val, "Op3");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::Op4:
+        {
+            // The 4th operator's own Ratio + Index, one knob each -- Op2/
+            // Op3 each got their own pair of knobs across the Ratio/Index
+            // pages above; Op4 only needs one page since there's just one
+            // of it.
+            TomThumbDrawText(
+                disp_, 0, kBandTop,
+                FmAlgorithmRouteSummary((FastFmVoice::Algorithm)fm_synth_->GetAlgorithm()), true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            char ratio_val[8], index_val[8];
+            int  op4_x10 = (int)(fm_synth_->GetOp4Ratio() * 10.f + 0.5f);
+            snprintf(ratio_val, sizeof(ratio_val), "%d.%dx", op4_x10 / 10, op4_x10 % 10);
+            snprintf(index_val, sizeof(index_val), "%d%%",
+                      (int)(fm_synth_->GetOp4Index01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Ratio", ratio_val, index_val,
+                             "Index");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::Tune:
+        {
+            DrawOscilloscope(kBandTop, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            char tune_val[8];
+            snprintf(tune_val, sizeof(tune_val), "%+d st", fm_synth_->GetTuneSemitones());
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Tune", tune_val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::ADSR:
+        {
+            DrawAdsrShape(kBandTop, kBandBottom, fm_synth_->GetAttackSeconds(),
+                          fm_synth_->GetDecaySeconds(), fm_synth_->GetSustain01(),
+                          fm_synth_->GetReleaseSeconds());
+            if(!fm_adsr_target_sr_)
+            {
+                char a_val[8], d_val[8];
+                snprintf(a_val, sizeof(a_val), "%d%%",
+                          (int)(fm_synth_->GetAttack01() * 100.f + 0.5f));
+                snprintf(d_val, sizeof(d_val), "%d%%",
+                          (int)(fm_synth_->GetDecay01() * 100.f + 0.5f));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Attack", a_val, d_val,
+                                 "Decay");
+            }
+            else
+            {
+                char s_val[8], r_val[8];
+                snprintf(s_val, sizeof(s_val), "%d%%",
+                          (int)(fm_synth_->GetSustain01() * 100.f + 0.5f));
+                snprintf(r_val, sizeof(r_val), "%d%%",
+                          (int)(fm_synth_->GetRelease01() * 100.f + 0.5f));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Sustain", s_val, r_val,
+                                 "Release");
+            }
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                             fm_adsr_target_sr_ ? "AD" : "AD*", "", "",
+                             fm_adsr_target_sr_ ? "SR*" : "SR");
+            break;
+        }
+        case FmParamPage::Chorus:
+        {
+            char mod_line2[24];
+            snprintf(mod_line2, sizeof(mod_line2), "Mod wheel -> %s",
+                      ModDestName(fm_synth_->GetModDestination()));
+            TomThumbDrawText(disp_, 0, kBandTop, mod_line2, true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            char depth_val[8], rate_val[8];
+            snprintf(depth_val, sizeof(depth_val), "%d%%",
+                      (int)(fm_synth_->GetChorusDepth01() * 100.f + 0.5f));
+            snprintf(rate_val, sizeof(rate_val), "%d%%",
+                      (int)(fm_synth_->GetChorusRate01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Depth", depth_val, rate_val,
+                             "Rate");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::Vibrato:
+        {
+            char mod_line2[24];
+            snprintf(mod_line2, sizeof(mod_line2), "Mod wheel -> %s",
+                      ModDestName(fm_synth_->GetModDestination()));
+            TomThumbDrawText(disp_, 0, kBandTop, mod_line2, true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+            char depth_val[8], rate_val[8];
+            snprintf(depth_val, sizeof(depth_val), "%d%%",
+                      (int)(fm_synth_->GetVibratoDepth01() * 100.f + 0.5f));
+            snprintf(rate_val, sizeof(rate_val), "%d%%",
+                      (int)(fm_synth_->GetVibratoRate01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Depth", depth_val, rate_val,
+                             "Rate");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::Filter:
+        {
+            char mode_line[20];
+            snprintf(mode_line, sizeof(mode_line), "Mode: %s",
+                      FilterModeName(fm_synth_->GetFilterMode()));
+            TomThumbDrawText(disp_, 0, kBandTop, mode_line, true);
+            DrawOscilloscope(kBandTop + 9, kBandBottom, fm_scope_buf_, fm_scope_capacity_);
+
+            char cutoff_val[8], res_val[8];
+            snprintf(cutoff_val, sizeof(cutoff_val), "%d%%",
+                      (int)(fm_synth_->GetFilterCutoff01() * 100.f + 0.5f));
+            snprintf(res_val, sizeof(res_val), "%d%%",
+                      (int)(fm_synth_->GetFilterResonance01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Cutoff", cutoff_val, res_val,
+                             "Res");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle mode", "", "", "");
+            break;
+        }
+        case FmParamPage::Mix:
+        {
+            char send_val[8], out_val[8];
+            snprintf(send_val, sizeof(send_val), "%d%%",
+                      (int)(fm_synth_->GetReverbSend01() * 100.f + 0.5f));
+            snprintf(out_val, sizeof(out_val), "%d%%",
+                      (int)(fm_synth_->GetOutputLevel01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, out_val,
+                             "Output");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case FmParamPage::ModAssign:
+        {
+            char dest_line[24];
+            snprintf(dest_line, sizeof(dest_line), "Mod Dest: %s",
+                      ModDestName(fm_synth_->GetModDestination()));
+            TomThumbDrawText(disp_, 0, kBandTop, dest_line, true);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle dest", "", "", "");
+            break;
+        }
+        case FmParamPage::Preset:
+        {
+            if(!PerformanceStore::IsCardPresent())
+            {
+                disp_->SetCursor(0, 20);
+                WriteUpper("No card");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
+                break;
+            }
+            if(fm_preset_slots_dirty_)
+                RefreshFmPresetSlots();
+
+            bool choosing_save    = save_load_mode_ == SaveLoadMode::ChoosingSave;
+            bool browsing_load    = save_load_mode_ == SaveLoadMode::BrowsingLoad;
+            bool load_chooser     = browsing_load && !load_browsing_files_;
+            bool browsing_folders = browsing_load && load_browsing_files_ && !fm_preset_folder_open_;
+            // A folder name isn't a preset -- nothing to confirm-load
+            // until "New" is picked at the top chooser, or a folder is
+            // actually open onto a real preset (see
+            // fm_preset_folder_open_'s own comment).
+            bool can_hold_load = browsing_load
+                                  && (load_new_selected_
+                                      || (load_browsing_files_ && fm_preset_folder_open_));
+
+            // Same bigger Font_6x8/WriteUpper convention as Global:File's
+            // own Preset page (see Pad/Grains' own Preset pages' comments).
+            if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
+            {
+                float       held     = pod_->button2.TimeHeldMs();
+                int         w        = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+                const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
+                disp_->SetCursor(0, 20);
+                WriteUpper(hold_msg);
+                disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
+                if(w > 0)
+                    disp_->DrawRect(1, 31, w, 33, true, true);
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+                break;
+            }
+
+            if(choosing_save)
+            {
+                bool can_overwrite = fm_loaded_preset_slot_ > FmSynth::kNumFactoryPresets;
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Overwrite%s", !save_as_new_ ? '>' : ' ',
+                          can_overwrite ? "" : " (n/a)");
+                snprintf(line2, sizeof(line2), "%c Save New", save_as_new_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(load_chooser)
+            {
+                // Same shape as ChoosingSave's own Overwrite/Save New --
+                // "Files" is always available here (factory presets
+                // always exist).
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Files", !load_new_selected_ ? '>' : ' ');
+                snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(browsing_folders)
+            {
+                // Folder list -- named factory categories, then the
+                // trailing "User" folder, K1 scrolling
+                // fm_preset_folder_cursor_ directly (see
+                // fm_preset_folder_open_'s own comment).
+                int  count = fm_preset_folder_cursor_ < FmSynth::kNumFactoryCategories
+                                 ? FmSynth::GetFactoryCategoryCount(fm_preset_folder_cursor_)
+                                 : fm_preset_user_slot_count_;
+                char line2[24];
+                snprintf(line2, sizeof(line2), "Folder: %s (%d)",
+                          FmFolderName(fm_preset_folder_cursor_), count);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else if(browsing_load) // load_browsing_files_ && fm_preset_folder_open_
+            {
+                // Drilled into the currently open folder -- factory name
+                // if it's one of the named categories, plain slot number
+                // for the User folder.
+                int  browsed_slot = ResolveFmPresetSlot();
+                char line2[24];
+                if(browsed_slot < 0)
+                    snprintf(line2, sizeof(line2), "(empty)");
+                else if(browsed_slot <= FmSynth::kNumFactoryPresets)
+                    snprintf(line2, sizeof(line2), "Load: %s",
+                              FmSynth::GetFactoryPresetName(browsed_slot - 1));
+                else
+                    snprintf(line2, sizeof(line2), "Load: %d", browsed_slot);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else
+            {
+                char line1[24];
+                if(fm_loaded_preset_slot_ <= 0)
+                    snprintf(line1, sizeof(line1), "Now: (custom)");
+                else if(fm_loaded_preset_slot_ <= FmSynth::kNumFactoryPresets)
+                    snprintf(line1, sizeof(line1), "Now: %s",
+                              FmSynth::GetFactoryPresetName(fm_loaded_preset_slot_ - 1));
+                else
+                    snprintf(line1, sizeof(line1), "Now: %d", fm_loaded_preset_slot_);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line1);
+                if(fm_preset_status_[0] != '\0')
+                {
+                    disp_->SetCursor(0, 32);
+                    WriteUpper(fm_preset_status_);
+                }
+            }
+
+            {
+                const char* b1_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b1_label = "Save";
+                else if(load_chooser && !load_new_selected_)
+                    b1_label = "Select";
+                else if(browsing_folders)
+                    b1_label = "Open"; // opens the highlighted folder
+                else
+                    b1_label = "Back"; // folder open -- back to the folder list
+                const char* b2_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b2_label = "Load";
+                else if(choosing_save)
+                    b2_label = "Hold=Save";
+                else if(load_browsing_files_ && fm_preset_folder_open_)
+                    // Short tap previews it live without leaving the
+                    // browser (see HandleButton2()'s own comment); hold
+                    // still commits it and exits back to Idle.
+                    b2_label = "Prev./Hold=Load";
                 else if(can_hold_load)
                     b2_label = "Hold=Load";
                 else
@@ -3785,7 +4783,12 @@ const char* Ui::MixerChannelName(int ch) const
         case 1: return "L2";
         case 2: return "L3";
         case 3: return "L4";
-        case 4: return "PL";
+        // Whichever of Pad/Fm is currently enabled (mutually exclusive,
+        // see IsFmEnabled()'s own comment) occupies this one slot rather
+        // than each getting a separate channel -- defaults to "PL" when
+        // neither is enabled, same as the fallback the Get*() accessors
+        // below use.
+        case 4: return fm_enabled_ ? "FM" : "PL";
         case 5: return "GR";
         case 6: return "BYP";
         case 7: return "MAS";
@@ -3798,7 +4801,9 @@ float Ui::MixerGetVolume01(int ch) const
     switch(ch)
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetVolume01();
-        case 4: return pad_synth_ ? pad_synth_->GetOutputLevel01() : 0.f;
+        case 4:
+            return fm_enabled_ ? (fm_synth_ ? fm_synth_->GetOutputLevel01() : 0.f)
+                                 : (pad_synth_ ? pad_synth_->GetOutputLevel01() : 0.f);
         case 5: return granular_ ? granular_->GetOutputLevel01() : 0.f;
         case 6: return bypass_mix_volume01_;
         case 7: return master_volume01_;
@@ -3811,7 +4816,9 @@ float Ui::MixerGetPan01(int ch) const
     switch(ch)
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetPan01();
-        case 4: return pad_synth_ ? pad_synth_->GetPan01() : 0.5f;
+        case 4:
+            return fm_enabled_ ? (fm_synth_ ? fm_synth_->GetPan01() : 0.5f)
+                                 : (pad_synth_ ? pad_synth_->GetPan01() : 0.5f);
         case 5: return granular_ ? granular_->GetPan01() : 0.5f;
         case 6: return bypass_pan01_;
         default: return 0.5f; // Master has no Pan
@@ -3823,7 +4830,9 @@ float Ui::MixerGetSend01(int ch) const
     switch(ch)
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetReverbSend01();
-        case 4: return pad_synth_ ? pad_synth_->GetReverbSend01() : 0.f;
+        case 4:
+            return fm_enabled_ ? (fm_synth_ ? fm_synth_->GetReverbSend01() : 0.f)
+                                 : (pad_synth_ ? pad_synth_->GetReverbSend01() : 0.f);
         case 5: return granular_ ? granular_->GetReverbSend01() : 0.f;
         case 6: return bypass_reverb_send01_;
         default: return 0.f; // Master uses Reverb Size instead (see reverb_size01_)
@@ -3835,7 +4844,10 @@ void Ui::MixerSetVolume01(int ch, float v01)
     switch(ch)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetVolume01(v01); break;
-        case 4: if(pad_synth_) pad_synth_->SetOutputLevel01(v01); break;
+        case 4:
+            if(fm_enabled_) { if(fm_synth_) fm_synth_->SetOutputLevel01(v01); }
+            else if(pad_synth_) pad_synth_->SetOutputLevel01(v01);
+            break;
         case 5: if(granular_) granular_->SetOutputLevel01(v01); break;
         case 6: SetBypassMixVolume01(v01); break;
         case 7:
@@ -3853,7 +4865,10 @@ void Ui::MixerSetPan01(int ch, float v01)
     switch(ch)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetPan01(v01); break;
-        case 4: if(pad_synth_) pad_synth_->SetPan01(v01); break;
+        case 4:
+            if(fm_enabled_) { if(fm_synth_) fm_synth_->SetPan01(v01); }
+            else if(pad_synth_) pad_synth_->SetPan01(v01);
+            break;
         case 5: if(granular_) granular_->SetPan01(v01); break;
         case 6: SetBypassPan01(v01); break;
         default: break; // Master has no Pan
@@ -3865,7 +4880,10 @@ void Ui::MixerSetSend01(int ch, float v01)
     switch(ch)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetReverbSend01(v01); break;
-        case 4: if(pad_synth_) pad_synth_->SetReverbSend01(v01); break;
+        case 4:
+            if(fm_enabled_) { if(fm_synth_) fm_synth_->SetReverbSend01(v01); }
+            else if(pad_synth_) pad_synth_->SetReverbSend01(v01);
+            break;
         case 5: if(granular_) granular_->SetReverbSend01(v01); break;
         case 6: bypass_reverb_send01_ = Clampf(v01, 0.f, 1.f); break;
         default: break; // Master uses Reverb Size instead, set directly in ApplyKnobs()
@@ -4118,15 +5136,12 @@ void Ui::TriggerSave(bool force_new)
         return;
     }
 
-    PadSynth::PadPresetData pad_preset = pad_synth_ ? pad_synth_->CapturePreset()
-                                                      : PadSynth::PadPresetData{};
-
     g_progress_disp      = disp_;
     file_op_in_progress_ = true;
     bool ok = PerformanceStore::Save(slot, *tempo_, layers_, num_layers_, master_volume01_,
                                        bypass_, master_filter_mode_, master_filter_cutoff01_,
                                        master_filter_res01_, reverb_size01_,
-                                       bypass_reverb_send01_, pad_preset, &Ui::OnSaveLoadProgress);
+                                       bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
 
@@ -4174,20 +5189,13 @@ void Ui::TriggerLoad()
     g_audio_suspended    = true;
     g_progress_disp      = disp_;
     file_op_in_progress_ = true;
-    PadSynth::PadPresetData pad_preset;
     bool ok = PerformanceStore::Load(slot, *tempo_, layers_, num_layers_, &master_volume01_,
                                        &bypass_, &master_filter_mode_, &master_filter_cutoff01_,
                                        &master_filter_res01_, &reverb_size01_,
-                                       &bypass_reverb_send01_, &pad_preset, &Ui::OnSaveLoadProgress);
+                                       &bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
     g_audio_suspended     = false; // every layer + tempo phase is consistent now
-
-    if(ok && pad_synth_)
-    {
-        pad_synth_->ApplyPreset(pad_preset);
-        pad_loaded_preset_slot_ = -1; // this performance's pad sound, not a named preset
-    }
 
     // Project vari-speed is a live-performance control, not part of a
     // saved performance (same rule as master volume) -- always back to
@@ -4226,6 +5234,11 @@ const int* Ui::SdMgmtSlots(int* out_count)
                 RefreshPadPresetSlots();
             *out_count = pad_preset_user_slot_count_;
             return pad_preset_user_slots_;
+        case SdMgmtFolder::FmPresets:
+            if(fm_preset_slots_dirty_)
+                RefreshFmPresetSlots();
+            *out_count = fm_preset_user_slot_count_;
+            return fm_preset_user_slots_;
         case SdMgmtFolder::GranularPresets:
             if(granular_preset_slots_dirty_)
                 RefreshGranularPresetSlots();
@@ -4255,6 +5268,9 @@ void Ui::TriggerSdMgmtDuplicate()
         case SdMgmtFolder::PadPresets:
             ok = PerformanceStore::DuplicatePadPreset(slot, &new_slot, &Ui::OnSaveLoadProgress);
             break;
+        case SdMgmtFolder::FmPresets:
+            ok = PerformanceStore::DuplicateFmPreset(slot, &new_slot, &Ui::OnSaveLoadProgress);
+            break;
         case SdMgmtFolder::GranularPresets:
             ok = PerformanceStore::DuplicateGranularPreset(slot, &new_slot,
                                                               &Ui::OnSaveLoadProgress);
@@ -4270,6 +5286,7 @@ void Ui::TriggerSdMgmtDuplicate()
         {
             case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
             case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+            case SdMgmtFolder::FmPresets: fm_preset_slots_dirty_ = true; break;
             case SdMgmtFolder::GranularPresets: granular_preset_slots_dirty_ = true; break;
             default: break;
         }
@@ -4303,6 +5320,9 @@ void Ui::TriggerSdMgmtDelete()
         case SdMgmtFolder::PadPresets:
             ok = PerformanceStore::DeletePadPreset(slot, &pad_loaded_preset_slot_);
             break;
+        case SdMgmtFolder::FmPresets:
+            ok = PerformanceStore::DeleteFmPreset(slot, &fm_loaded_preset_slot_);
+            break;
         case SdMgmtFolder::GranularPresets:
             ok = PerformanceStore::DeleteGranularPreset(slot, &granular_loaded_preset_slot_);
             break;
@@ -4316,6 +5336,7 @@ void Ui::TriggerSdMgmtDelete()
         {
             case SdMgmtFolder::Performances: file_slots_dirty_ = true; break;
             case SdMgmtFolder::PadPresets: pad_preset_slots_dirty_ = true; break;
+            case SdMgmtFolder::FmPresets: fm_preset_slots_dirty_ = true; break;
             case SdMgmtFolder::GranularPresets: granular_preset_slots_dirty_ = true; break;
             default: break;
         }
@@ -4420,6 +5441,111 @@ void Ui::TriggerLoadPadPreset()
     else
     {
         snprintf(pad_preset_status_, sizeof(pad_preset_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
+void Ui::RefreshFmPresetSlots()
+{
+    fm_preset_user_slot_count_
+        = PerformanceStore::ListFmPresets(fm_preset_user_slots_, kMaxFmPresetSlots);
+    // fm_preset_cursor_ is an index WITHIN the current folder (see its
+    // own comment), so it's clamped against that folder's own count, not
+    // a flat total across every preset.
+    int folder_count = fm_preset_folder_cursor_ < FmSynth::kNumFactoryCategories
+                            ? FmSynth::GetFactoryCategoryCount(fm_preset_folder_cursor_)
+                            : fm_preset_user_slot_count_;
+    if(fm_preset_cursor_ >= folder_count)
+        fm_preset_cursor_ = folder_count > 0 ? folder_count - 1 : 0;
+    fm_preset_slots_dirty_ = false;
+}
+
+int Ui::ResolveFmPresetSlot() const
+{
+    if(fm_preset_folder_cursor_ < FmSynth::kNumFactoryCategories)
+        return FmSynth::GetFactoryCategorySlot(fm_preset_folder_cursor_, fm_preset_cursor_);
+    if(fm_preset_cursor_ < 0 || fm_preset_cursor_ >= fm_preset_user_slot_count_)
+        return -1;
+    return fm_preset_user_slots_[fm_preset_cursor_];
+}
+
+void Ui::TriggerSaveFmPreset(bool force_new)
+{
+    if(!fm_synth_)
+        return;
+    // Smart save (force_new=false): overwrite fm_loaded_preset_slot_ if
+    // it's a real, writable user slot; a factory preset
+    // (1..kNumFactoryPresets) or nothing loaded (-1) has no valid slot to
+    // overwrite, so fall back to a new one automatically -- same
+    // reasoning TriggerSavePadPreset() uses for its own loaded-slot
+    // tracking.
+    int slot = (!force_new && fm_loaded_preset_slot_ > FmSynth::kNumFactoryPresets)
+                   ? fm_loaded_preset_slot_
+                   : PerformanceStore::NextFreeFmPresetSlot();
+    if(slot < 0)
+    {
+        snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Card full/missing");
+        return;
+    }
+
+    bool ok = PerformanceStore::SaveFmPreset(slot, fm_synth_->CapturePreset());
+    if(ok)
+    {
+        fm_loaded_preset_slot_ = slot;
+        snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Saved %d", slot);
+        fm_preset_slots_dirty_ = true; // a new slot may now exist
+    }
+    else
+    {
+        snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
+void Ui::TriggerNewFmPreset()
+{
+    if(!fm_synth_)
+        return;
+    // The Load chooser's "New" pick (see ApplyKnobs()'s BrowsingLoad
+    // handling) -- resets to the first factory patch, same fresh-start
+    // spirit as Global:File's own TriggerNew().
+    fm_synth_->ApplyPreset(FmSynth::GetFactoryPreset(0));
+    fm_loaded_preset_slot_ = 1;
+    snprintf(fm_preset_status_, sizeof(fm_preset_status_), "New (%s)",
+              FmSynth::GetFactoryPresetName(0));
+}
+
+void Ui::TriggerLoadFmPreset()
+{
+    if(!fm_synth_)
+        return;
+    // !load_browsing_files_ means the top-level chooser confirmed with
+    // "New" highlighted (can_confirm_load only allows a confirm here when
+    // that's the case -- see HandleButton2()).
+    if(!load_browsing_files_)
+    {
+        TriggerNewFmPreset();
+        return;
+    }
+    int slot = ResolveFmPresetSlot();
+    if(slot < 0)
+        return;
+
+    FmSynth::FmPresetData preset;
+    bool ok = PerformanceStore::LoadFmPreset(slot, &preset);
+    if(ok)
+    {
+        fm_synth_->ApplyPreset(preset);
+        fm_loaded_preset_slot_ = slot;
+        if(slot <= FmSynth::kNumFactoryPresets)
+            snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Loaded %s",
+                      FmSynth::GetFactoryPresetName(slot - 1));
+        else
+            snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Loaded %d", slot);
+    }
+    else
+    {
+        snprintf(fm_preset_status_, sizeof(fm_preset_status_), "Fail:%s",
                   PerformanceStore::GetLastError());
     }
 }

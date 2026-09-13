@@ -93,9 +93,11 @@ The name, general concept, and file organization are based on
 
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
-  setting, including the current Pad Synth sound) to an SD card, up to 99
-  slots. Pad Synth and Grains also have their own independent preset
-  systems (see above), saved/loaded separately from performances.
+  looper/tempo/global setting) to an SD card, up to 99 slots. Pad Synth,
+  Fm Synth, and Grains each have their own fully independent preset
+  systems (see above) — a performance deals only with the looper, and
+  never embeds any instrument's sound, so switching/tweaking a synth's
+  patch never disturbs a saved performance and vice versa.
 - Saving always offers a choice between Overwrite (the currently loaded
   file) and Save New; loading shows the same style of choice between
   browsing existing files or starting fresh with New — identical
@@ -110,12 +112,29 @@ The name, general concept, and file organization are based on
   vari-speed is currently dialed in gets baked into the export on
   purpose, so you can capture a deliberate vari-speed effect to a file
 
+**Fm Synth** — a MIDI-played, 6-voice, 4-operator FM instrument running
+alongside the looper (`Global:Fm`, opened by clicking the encoder there),
+mutually exclusive with Pad Synth (enabling one turns the other off,
+since they share one "melodic voice" role and one Mixer channel). Four
+selectable operator-routing algorithms (Stack, Parallel, DualStack,
+YBranch — shown as a small Yamaha-style routing diagram on its own page),
+each operator's ratio quantized to a table of musically-clean multipliers
+so it always sounds in tune, plus depth/index per operator, coarse tune,
+a full ADSR, chorus, mod-wheel-assignable vibrato, its own filter, reverb
+send, output level, and pan. 36 built-in factory patches across 8 named
+categories (E.Piano, Bells, Mallets, Bass, Brass, Pad, Lead, plus a Basic
+category) browsed as folders — rotate to scroll, Button 1 opens a folder
+or backs out of one — with a short Button 2 tap previewing the
+highlighted patch live without leaving the browser, and up to 99 of your
+own on the SD card. Can be switched off entirely from `Global:Fm` to
+reclaim its CPU share.
+
 **Pad Synth** — a MIDI-played, 6-voice pad instrument running alongside
 the looper (`Global:Pad`, opened by clicking the encoder there). Tone
 (a dark↔bright oscillator registration morph) and gain, coarse tune
 (±24 semitones), a full Attack/Decay/Sustain/Release envelope, chorus,
 mod-wheel-assignable vibrato, its own filter (Off/Low/High/Band), reverb
-send, output level, and pan — plus a save/load preset system with ~10
+send, output level, and pan — plus a save/load preset system with ~14
 built-in factory patches and up to 99 of your own on the SD card. Can be
 switched off entirely from `Global:Pad` to reclaim its CPU share.
 
@@ -132,16 +151,18 @@ parameter, so loading one restores the exact sound, not just settings.
 Also switchable off from `Global:Granular` to free its CPU share.
 
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
-there) with Volume/Pan/Reverb-Send for all 4 loop layers, Pad Synth,
-Grains, and Bypass, plus Volume/Reverb-Size for the final Master bus,
-ending in a live oscilloscope of the actual output mix. Rotate the
-encoder to step through each channel in turn; `Global:Mixer` itself shows
-an at-a-glance overview grid of all 8 channels' levels.
+there) with Volume/Pan/Reverb-Send for all 4 loop layers, Pad Synth (or
+Fm Synth, whichever's currently enabled — they share this one channel
+since only one is ever live at a time), Grains, and Bypass, plus
+Volume/Reverb-Size for the final Master bus, ending in a live
+oscilloscope of the actual output mix. Rotate the encoder to step through
+each channel in turn; `Global:Mixer` itself shows an at-a-glance overview
+grid of all 8 channels' levels.
 
-**SD card management** — `Global:SdMgmt` lets you browse any of the 3
-save categories (Performances/Pad Presets/Grains Presets) and Duplicate
-or Delete individual files directly on the card, without needing a
-computer. Deleting a file automatically closes the gap left behind —
+**SD card management** — `Global:SdMgmt` lets you browse any of the 4
+save categories (Performances/Pad Presets/Fm Presets/Grains Presets) and
+Duplicate or Delete individual files directly on the card, without
+needing a computer. Deleting a file automatically closes the gap left behind —
 every higher-numbered file in that category shifts down to keep the
 numbering contiguous, so a later Save New always continues right after
 the last real file instead of quietly reusing whatever number you just
@@ -162,14 +183,14 @@ freed.
 - **Rotate** the encoder: on Home, moves between layers; on any other
   page, cycles through that page's sub-pages.
 - **Click** the encoder: from Home, opens the selected layer's pages; on
-  `Global:Pad`/`Global:Granular`/`Global:Mixer`, drills into that
-  instrument/mixer's own screen; on any Pad Synth or Grains page, mutes/
-  unmutes all 4 loop layers, same as every other Global page's click. On
-  the Mixer screen itself, rotate steps through channels instead of
-  pages (see below).
+  `Global:Fm`/`Global:Pad`/`Global:Granular`/`Global:Mixer`, drills into
+  that instrument/mixer's own screen; on any Fm Synth, Pad Synth, or
+  Grains page, mutes/unmutes all 4 loop layers, same as every other
+  Global page's click. On the Mixer screen itself, rotate steps through
+  channels instead of pages (see below).
 - **Long-press** the encoder: from Home, opens Global settings; from
-  anywhere else (including Pad Synth, Grains, and Mixer), goes back to
-  Home.
+  anywhere else (including Fm Synth, Pad Synth, Grains, and Mixer), goes
+  back to Home.
 
 Both knobs and both buttons are "soft" — what they do depends on which
 page is open, and it's always shown on screen: each footer row has a
@@ -234,10 +255,34 @@ hit Export gets baked into the file on purpose.
 | Global: File | Choosing Save: Overwrite/Save New; Browsing Load: scroll files | — | Save / Select file list (Load) / Back | Hold 800ms = Save or Load, whichever's open |
 | Global: SD Mgmt | Scroll (folder or file list) | — | Tap = drill in/back, Hold 800ms = Duplicate | Hold 1500ms = Delete |
 | Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
-| Global: Pad | — | — | Toggle Pad Synth on/off | — |
+| Global: Fm | — | — | Toggle Fm Synth on/off (also turns Pad off, they're mutually exclusive) | — |
+| Global: Pad | — | — | Toggle Pad Synth on/off (also turns Fm off) | — |
 | Global: Granular | — | — | Toggle Grains on/off | — |
 | Global: Looper | — | — | Toggle the whole 4-layer looper on/off | — |
 | Global: Mixer | — | — | — | — (push encoder to enter the Mixer screen) |
+
+**Fm Synth (`Screen::Fm`, rotate to cycle pages)**
+
+| Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
+|---|---|---|---|---|
+| Algo | — | — | Cycle algorithm (Stack/Parallel/DualStack/YBranch) | — |
+| Ratio | Op2 ratio | Op3 ratio | — | — |
+| Index | Op2 index | Op3 index | — | — |
+| Op4 | Op4 ratio | Op4 index | — | — |
+| Tune | Coarse tune, ±24 semitones | — | — | — |
+| ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
+| Chorus | Depth | Rate | — | — |
+| Vibrato | Depth | Rate | — | — |
+| Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Mix | Reverb send | Output level | — | — |
+| Mod Assign | — | — | Cycle mod wheel destination | — |
+| Preset | Rotate = scroll folders/presets | — | Save / Open folder / Back | Tap = preview, Hold 800ms = confirm |
+
+The Ratio, Index, and Op4 pages each show a small "Route:" line above the
+scope reflecting the *current* algorithm (e.g. `4>3>2>1` for Stack), since
+which operator feeds what changes depending on which algorithm is active.
+Clicking the encoder on any Fm Synth page mutes/unmutes all 4 loop
+layers, same as every Global page.
 
 **Pad Synth (`Screen::Pad`, rotate to cycle pages)**
 
@@ -275,13 +320,16 @@ layers.
 
 **Mixer (`Screen::Mixer`, rotate to step through channels)**
 
-Each of the 8 channels (Layer 1–4, Pad Synth, Grains, Bypass, Master)
-gets its own stop; rotating past the last one shows a live oscilloscope
-of the final output mix, then wraps back to Layer 1.
+Each of the 8 channels (Layer 1–4, Pad Synth/Fm Synth, Grains, Bypass,
+Master) gets its own stop; rotating past the last one shows a live
+oscilloscope of the final output mix, then wraps back to Layer 1. The
+4th channel shows whichever of Pad/Fm is currently enabled (labeled "PL"
+or "FM" on screen) — they share this one channel since only one is ever
+live at a time.
 
 | Channel | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
-| Layer 1–4 / Pad / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Layer 1–4 / Pad-or-Fm / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
 | Master | Volume | Reverb size | — | — |
 
 ## Building and flashing

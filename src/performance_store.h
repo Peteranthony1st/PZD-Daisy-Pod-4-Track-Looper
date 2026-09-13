@@ -5,6 +5,7 @@
 #include "looper_layer.h"
 #include "pad_synth.h"
 #include "granular_engine.h"
+#include "fm_synth.h"
 
 // SD card save/load for a whole "performance" (all layers' audio plus
 // tempo/global/per-layer settings) as one flat binary file per slot.
@@ -74,6 +75,11 @@ bool DeleteSlot(int slot, int* loaded_slot_inout = nullptr);
 // Save()/Load() do. *out_new_slot is set to the slot actually used.
 bool DuplicateSlot(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
 
+// Deals ONLY with the looper (all layers' audio plus tempo/global/per-
+// layer settings) -- Pad/Fm/Grains each have their own fully independent
+// save/load systems (SavePadPreset()/SaveFmPreset()/SaveGranularPreset()
+// below), never embedded into a performance file. Keeps every
+// instrument's saves in its own separate "bubble", performances included.
 bool Save(int                slot,
           TempoClock&        tempo,
           LooperLayer*       layers,
@@ -85,7 +91,6 @@ bool Save(int                slot,
           float              master_filter_res01,
           float              reverb_size01,
           float              bypass_reverb_send01,
-          const PadSynth::PadPresetData& pad_preset,
           ProgressFn         on_progress = nullptr);
 
 bool Load(int          slot,
@@ -99,7 +104,6 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
           float*       out_bypass_reverb_send01,
-          PadSynth::PadPresetData* out_pad_preset,
           ProgressFn   on_progress = nullptr);
 
 // Pad synth presets: parameters only, no audio -- a real snapshot (via
@@ -127,6 +131,22 @@ int  NextFreePadPresetSlot();
 // loaded_slot_inout follow-along.
 bool DeletePadPreset(int slot, int* loaded_slot_inout = nullptr);
 bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Fm synth presets: parameters only, no audio -- same shape as Pad
+// presets above, including the same factory range: 1..FmSynth::
+// kNumFactoryPresets are the permanently read-only, firmware-embedded
+// factory presets (see FmSynth::GetFactoryPreset()) -- LoadFmPreset()
+// serves those directly without touching the card, and SaveFmPreset()/
+// NextFreeFmPresetSlot() never target them. User saves start right after
+// that range.
+constexpr int kMaxFmPresets = 99;
+
+bool SaveFmPreset(int slot, const FmSynth::FmPresetData& preset);
+bool LoadFmPreset(int slot, FmSynth::FmPresetData* out_preset);
+int  ListFmPresets(int* out_numbers, int max_out);
+int  NextFreeFmPresetSlot();
+bool DeleteFmPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicateFmPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
 
 // Grains (GranularEngine) presets: parameters AND the captured audio
 // itself (unlike Pad presets above, which are parameters only) -- a

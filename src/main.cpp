@@ -10,6 +10,7 @@
 #include "itcm.h"
 #include "pad_synth.h"
 #include "granular_engine.h"
+#include "fm_synth.h"
 
 using namespace daisy;
 
@@ -95,6 +96,12 @@ PadSynth pad_synth;
 // g_granular_source_l/r below).
 GranularEngine granular;
 
+// The MIDI-played FM pad instrument (see fm_synth.h) -- Pad Synth's
+// sibling, mutually exclusive with it (see Ui::IsFmEnabled()/
+// IsPadEnabled()'s own mutex comment). Same "plain-SRAM-sized, no big
+// internal buffer" reasoning as pad_synth/granular above.
+FmSynth fm_synth;
+
 // See audio_engine.h.
 volatile bool g_audio_suspended = false;
 
@@ -130,6 +137,11 @@ static size_t      g_pad_scope_write_pos = 0;
 constexpr size_t kGranularScopeSamples = 1024;
 static float      g_granular_scope_l[kGranularScopeSamples];
 static size_t      g_granular_scope_write_pos = 0;
+
+// Same convention, for FmParamPage::Filter's own live oscilloscope.
+constexpr size_t kFmScopeSamples = 1024;
+static float      g_fm_scope_l[kFmScopeSamples];
+static size_t      g_fm_scope_write_pos = 0;
 
 // Same convention, for Screen::Mixer's own oscilloscope page -- captures
 // the actual final post-fader mix (after reverb/bypass/master filter/
@@ -188,7 +200,8 @@ void ControlTimerCallback(void*)
         {
             NoteOnEvent noteon = event.AsNoteOn();
             pad_synth.NoteOn(noteon.note, noteon.velocity);
-            // TEMPORARY (Stage 1) -- same MIDI stream drives both engines
+            fm_synth.NoteOn(noteon.note, noteon.velocity);
+            // TEMPORARY (Stage 1) -- same MIDI stream drives every engine
             // for now, no channel/screen-based routing yet.
             granular.NoteOn(noteon.note, noteon.velocity);
         }
@@ -196,19 +209,26 @@ void ControlTimerCallback(void*)
         {
             NoteOffEvent noteoff = event.AsNoteOff();
             pad_synth.NoteOff(noteoff.note);
+            fm_synth.NoteOff(noteoff.note);
             granular.NoteOff(noteoff.note);
         }
         else if(event.type == PitchBend)
         {
             constexpr float kPitchBendRangeSemis = 2.f; // standard default
             PitchBendEvent  pb                   = event.AsPitchBend();
-            pad_synth.SetPitchBendSemis((pb.value / 8192.f) * kPitchBendRangeSemis);
+            float           semis = (pb.value / 8192.f) * kPitchBendRangeSemis;
+            pad_synth.SetPitchBendSemis(semis);
+            fm_synth.SetPitchBendSemis(semis);
         }
         else if(event.type == ControlChange)
         {
             ControlChangeEvent cc = event.AsControlChange();
             if(cc.control_number == 1) // mod wheel
-                pad_synth.SetModWheel01(cc.value / 127.f);
+            {
+                float wheel01 = cc.value / 127.f;
+                pad_synth.SetModWheel01(wheel01);
+                fm_synth.SetModWheel01(wheel01);
+            }
         }
     }
 }
@@ -230,6 +250,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     static float pad_r[256];
     static float gran_l[256];
     static float gran_r[256];
+    static float fm_l[256];
+    static float fm_r[256];
 
     if(g_audio_suspended)
     {
@@ -331,6 +353,21 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
 
+    // Mutually exclusive with Pad Synth (see Ui::IsFmEnabled()'s own
+    // mutex comment) -- same real CPU-saving skip-the-call pattern.
+    if(ui.IsFmEnabled())
+    {
+        fm_synth.Process(size, fm_l, fm_r, reverb_send_l, reverb_send_r);
+    }
+    else
+    {
+        for(size_t i = 0; i < size; i++)
+        {
+            fm_l[i] = 0.f;
+            fm_r[i] = 0.f;
+        }
+    }
+
     // Feed the pad's own oscilloscope ring buffer (Ui::DrawPadScreen()'s
     // live waveform trace) -- same "write every block, wrap" pattern as
     // every other capture buffer in this project.
@@ -348,18 +385,27 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             = (g_granular_scope_write_pos + 1) % kGranularScopeSamples;
     }
 
-    // Recording input is live input PLUS the pad, summed -- so playing
-    // the pad synth while a layer is actively recording captures both
-    // together, same "always summed, no toggle" decision this project
-    // already made for its granular engine (since removed/shelved, but
-    // the same reasoning applies here: a live+synth mix is what someone
-    // pressing record while playing a MIDI keyboard actually wants).
+    // Same for Fm's own oscilloscope (FmParamPage::Filter).
+    for(size_t i = 0; i < size; i++)
+    {
+        g_fm_scope_l[g_fm_scope_write_pos] = fm_l[i];
+        g_fm_scope_write_pos               = (g_fm_scope_write_pos + 1) % kFmScopeSamples;
+    }
+
+    // Recording input is live input PLUS Pad/Fm (mutually exclusive, so
+    // at most one of pad_l/r or fm_l/r is ever nonzero), summed -- so
+    // playing either synth while a layer is actively recording captures
+    // it together with the live input, same "always summed, no toggle"
+    // decision this project already made for its granular engine (since
+    // removed/shelved, but the same reasoning applies here: a live+synth
+    // mix is what someone pressing record while playing a MIDI keyboard
+    // actually wants).
     static float mixed_in_l[256];
     static float mixed_in_r[256];
     for(size_t i = 0; i < size; i++)
     {
-        mixed_in_l[i] = in[0][i] + pad_l[i];
-        mixed_in_r[i] = in[1][i] + pad_r[i];
+        mixed_in_l[i] = in[0][i] + pad_l[i] + fm_l[i];
+        mixed_in_r[i] = in[1][i] + pad_r[i] + fm_r[i];
     }
     const float* const       mixed_ptr_arr[2] = {mixed_in_l, mixed_in_r};
     AudioHandle::InputBuffer mixed_in         = mixed_ptr_arr;
@@ -399,6 +445,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[1][i] += pad_r[i];
         out[0][i] += gran_l[i];
         out[1][i] += gran_r[i];
+        out[0][i] += fm_l[i];
+        out[1][i] += fm_r[i];
     }
 
     const float mv           = ui.GetMasterVolume();
@@ -586,6 +634,7 @@ int main(void)
 
     pad_synth.Init(hw.AudioSampleRate()); // applies its own hardcoded defaults, see pad_synth.h
     granular.Init(hw.AudioSampleRate());
+    fm_synth.Init(hw.AudioSampleRate());
     // The Stage-1 diagnostic overrides that used to force max Fill/zero
     // Gap/an always-on Scan sweep (needed back when there were no real
     // knobs to test with) are gone now that the Grain page is fully
@@ -632,7 +681,7 @@ int main(void)
             kPadScopeSamples, &granular, g_granular_scope_l, kGranularScopeSamples,
             g_granular_capture_l, g_granular_capture_r, kGranularCaptureSamples,
             &g_granular_capturing, &g_granular_capture_write_pos, g_master_scope_l,
-            kMasterScopeSamples);
+            kMasterScopeSamples, &fm_synth, g_fm_scope_l, kFmScopeSamples);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();

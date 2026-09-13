@@ -71,6 +71,12 @@ void GranularPresetFilename(int slot, char* out, size_t out_size)
     snprintf(out, out_size, "GRNP/PRES%03d.DAT", slot);
 }
 
+// Own subfolder/numbering, same reasoning as PadPresetFilename() above.
+void FmPresetFilename(int slot, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "FMP/PRES%03d.DAT", slot);
+}
+
 // Own subfolder for user-supplied WAV files to import as Grains capture
 // audio -- unlike every other subfolder here, filenames underneath this
 // one are arbitrary (whatever the user named the file on their
@@ -324,28 +330,14 @@ struct FileHeader
     // every layer's own Send.
     float    bypass_reverb_send01;
 
-    // Pad synth settings (added in version 7) -- flattened copy of
-    // PadSynth::PadPresetData's fields, same "plain fields written as one
-    // raw block" treatment as everything else in this header.
-    float   pad_registration01;
-    float   pad_osc_gain01;
-    float   pad_attack01;
-    float   pad_decay01;
-    float   pad_sustain01;
-    float   pad_release01;
-    float   pad_chorus_depth01;
-    float   pad_chorus_rate01;
-    int32_t pad_filter_mode;
-    float   pad_filter_cutoff01;
-    float   pad_filter_res01;
-    float   pad_reverb_send01;
-    float   pad_output_level01;
-    int32_t pad_mod_destination;
-    // Added in version 8, alongside PadParamPage::Vibrato.
-    float   pad_vibrato_depth01;
-    float   pad_vibrato_rate01;
-    // Added in version 9, alongside PadParamPage::Tune.
-    float   pad_tune01;
+    // Pad synth settings (added in version 7, removed in version 10) --
+    // a performance now deals ONLY with the looper (audio + tempo/global/
+    // per-layer settings) -- Pad/Fm/Grains each own their fully
+    // independent save/load systems instead (see SavePadPreset()/
+    // SaveFmPreset()/SaveGranularPreset()), with no cross-embedding into
+    // a performance file. Keeps the model symmetric across all 3
+    // instruments now that Fm exists too, rather than only Pad getting
+    // silently bundled in.
 };
 
 struct LayerHeader
@@ -364,13 +356,13 @@ struct LayerHeader
     float    reverb_send01; // Size is now a global FileHeader field, not per-layer
 };
 
-// Bumped 1 -> 2 -> 3 -> 4 -> 5 -> 6 -> 7 -> 8 -> 9 as FileHeader/
-// LayerHeader's layout changed (most recently: added the pad synth's
-// Tune) -- Load() already rejects a version mismatch cleanly (see
-// below), so a performance saved under an older version will correctly
-// fail to load rather than being misread. Same accepted tradeoff as
-// every past bump.
-constexpr uint32_t kFileVersion = 9;
+// Bumped 1 -> 2 -> ... -> 9 -> 10 as FileHeader/LayerHeader's layout
+// changed (most recently: removed every pad_* field -- a performance now
+// deals only with the looper, see FileHeader's own comment) -- Load()
+// already rejects a version mismatch cleanly (see below), so a
+// performance saved under an older version will correctly fail to load
+// rather than being misread. Same accepted tradeoff as every past bump.
+constexpr uint32_t kFileVersion = 10;
 
 } // namespace
 
@@ -612,7 +604,6 @@ bool Save(int                slot,
           float              master_filter_res01,
           float              reverb_size01,
           float              bypass_reverb_send01,
-          const PadSynth::PadPresetData& pad_preset,
           ProgressFn         on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -669,23 +660,6 @@ bool Save(int                slot,
     hdr.master_filter_res01     = master_filter_res01;
     hdr.reverb_size01           = reverb_size01;
     hdr.bypass_reverb_send01    = bypass_reverb_send01;
-    hdr.pad_registration01      = pad_preset.registration01;
-    hdr.pad_osc_gain01          = pad_preset.osc_gain01;
-    hdr.pad_attack01            = pad_preset.attack01;
-    hdr.pad_decay01             = pad_preset.decay01;
-    hdr.pad_sustain01           = pad_preset.sustain01;
-    hdr.pad_release01           = pad_preset.release01;
-    hdr.pad_chorus_depth01      = pad_preset.chorus_depth01;
-    hdr.pad_chorus_rate01       = pad_preset.chorus_rate01;
-    hdr.pad_filter_mode         = pad_preset.filter_mode;
-    hdr.pad_filter_cutoff01     = pad_preset.filter_cutoff01;
-    hdr.pad_filter_res01        = pad_preset.filter_res01;
-    hdr.pad_reverb_send01       = pad_preset.reverb_send01;
-    hdr.pad_output_level01      = pad_preset.output_level01;
-    hdr.pad_mod_destination     = pad_preset.mod_destination;
-    hdr.pad_vibrato_depth01     = pad_preset.vibrato_depth01;
-    hdr.pad_vibrato_rate01      = pad_preset.vibrato_rate01;
-    hdr.pad_tune01              = pad_preset.tune01;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -774,7 +748,6 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
           float*       out_bypass_reverb_send01,
-          PadSynth::PadPresetData* out_pad_preset,
           ProgressFn   on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -839,26 +812,6 @@ bool Load(int          slot,
         *out_master_filter_res01     = hdr.master_filter_res01;
         *out_reverb_size01           = hdr.reverb_size01;
         *out_bypass_reverb_send01    = hdr.bypass_reverb_send01;
-        if(out_pad_preset)
-        {
-            out_pad_preset->registration01  = hdr.pad_registration01;
-            out_pad_preset->osc_gain01      = hdr.pad_osc_gain01;
-            out_pad_preset->attack01        = hdr.pad_attack01;
-            out_pad_preset->decay01         = hdr.pad_decay01;
-            out_pad_preset->sustain01       = hdr.pad_sustain01;
-            out_pad_preset->release01       = hdr.pad_release01;
-            out_pad_preset->chorus_depth01  = hdr.pad_chorus_depth01;
-            out_pad_preset->chorus_rate01   = hdr.pad_chorus_rate01;
-            out_pad_preset->filter_mode     = hdr.pad_filter_mode;
-            out_pad_preset->filter_cutoff01 = hdr.pad_filter_cutoff01;
-            out_pad_preset->filter_res01    = hdr.pad_filter_res01;
-            out_pad_preset->reverb_send01   = hdr.pad_reverb_send01;
-            out_pad_preset->output_level01  = hdr.pad_output_level01;
-            out_pad_preset->mod_destination = hdr.pad_mod_destination;
-            out_pad_preset->vibrato_depth01 = hdr.pad_vibrato_depth01;
-            out_pad_preset->vibrato_rate01  = hdr.pad_vibrato_rate01;
-            out_pad_preset->tune01          = hdr.pad_tune01;
-        }
     }
 
     int n = ok ? (int)hdr.num_layers : 0;
@@ -954,6 +907,14 @@ struct PadPresetFileHeader
 // would already catch this, but bumping the version keeps the failure
 // explicit rather than incidental).
 constexpr uint32_t kPadPresetFileVersion = 3;
+
+// Same shape as PadPresetFileHeader above, own magic/version.
+struct FmPresetFileHeader
+{
+    char     magic[4]; // "FMPS"
+    uint32_t version;
+};
+constexpr uint32_t kFmPresetFileVersion = 2; // bumped: FmPresetData grew Op4 ratio/index fields
 
 // Header + one raw GranularPresetData block + audio_len samples each of
 // L then R (float32, chunked -- see kChunkSamples), same shape as Save()'s
@@ -1144,6 +1105,187 @@ bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress)
     }
     char dst[24];
     PadPresetFilename(new_slot, dst, sizeof(dst));
+    if(!CopyFileChunked(src, dst, on_progress))
+        return false;
+    *out_new_slot = new_slot;
+    return true;
+}
+
+bool SaveFmPreset(int slot, const FmSynth::FmPresetData& preset)
+{
+    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
+        return false;
+
+    char fname[24];
+    FmPresetFilename(slot, fname, sizeof(fname));
+
+    FRESULT mkdir_res = f_mkdir("FMP");
+    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
+    {
+        SetError("mkdir", mkdir_res);
+        return false;
+    }
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    static FmPresetFileHeader hdr;
+    hdr = FmPresetFileHeader{};
+    memcpy(hdr.magic, "FMPS", 4);
+    hdr.version = kFmPresetFileVersion;
+
+    static FmSynth::FmPresetData data;
+    data = preset;
+
+    UINT bw;
+    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
+    bool ok = fr == FR_OK && bw == sizeof(hdr);
+    if(ok)
+    {
+        fr = f_write(&file, &data, sizeof(data), &bw);
+        ok = fr == FR_OK && bw == sizeof(data);
+    }
+    if(!ok)
+        SetError("data", fr);
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK)
+        SetError("close", close_res);
+    return ok && close_res == FR_OK;
+}
+
+bool LoadFmPreset(int slot, FmSynth::FmPresetData* out_preset)
+{
+    if(slot < 1 || slot > kMaxFmPresets || !out_preset)
+        return false;
+    if(slot <= FmSynth::kNumFactoryPresets)
+    {
+        *out_preset = FmSynth::GetFactoryPreset(slot - 1);
+        return true;
+    }
+    if(!card_ready)
+        return false;
+
+    char fname[24];
+    FmPresetFilename(slot, fname, sizeof(fname));
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_READ);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    static FmPresetFileHeader hdr;
+    hdr = FmPresetFileHeader{};
+    UINT br;
+    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
+    bool ok = fr == FR_OK && br == sizeof(hdr);
+    if(ok && (memcmp(hdr.magic, "FMPS", 4) != 0 || hdr.version != kFmPresetFileVersion))
+    {
+        ok = false;
+        SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
+    }
+    else if(!ok)
+    {
+        SetError("hdr", fr);
+    }
+
+    static FmSynth::FmPresetData data;
+    data = FmSynth::FmPresetData{};
+    if(ok)
+    {
+        fr = f_read(&file, &data, sizeof(data), &br);
+        ok = fr == FR_OK && br == sizeof(data);
+        if(!ok)
+            SetError("data", fr);
+    }
+    if(ok)
+        *out_preset = data;
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK)
+        SetError("close", close_res);
+    return ok && close_res == FR_OK;
+}
+
+int ListFmPresets(int* out_numbers, int max_out)
+{
+    if(!card_ready)
+        return 0;
+    int count = 0;
+    for(int slot = FmSynth::kNumFactoryPresets + 1; slot <= kMaxFmPresets && count < max_out;
+        slot++)
+    {
+        char    fname[24];
+        FILINFO fno;
+        FmPresetFilename(slot, fname, sizeof(fname));
+        if(f_stat(fname, &fno) == FR_OK)
+            out_numbers[count++] = slot;
+    }
+    return count;
+}
+
+int NextFreeFmPresetSlot()
+{
+    if(!card_ready)
+        return -1;
+    for(int slot = FmSynth::kNumFactoryPresets + 1; slot <= kMaxFmPresets; slot++)
+    {
+        char    fname[24];
+        FILINFO fno;
+        FmPresetFilename(slot, fname, sizeof(fname));
+        if(f_stat(fname, &fno) != FR_OK)
+            return slot;
+    }
+    return -1;
+}
+
+bool DeleteFmPreset(int slot, int* loaded_slot_inout)
+{
+    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
+        return false;
+    char fname[24];
+    FmPresetFilename(slot, fname, sizeof(fname));
+    if(!DeleteFileGeneric(fname))
+        return false;
+    if(loaded_slot_inout && *loaded_slot_inout == slot)
+        *loaded_slot_inout = 0;
+    CompactSlotsAfterDelete(slot, kMaxFmPresets, FmPresetFilename, loaded_slot_inout);
+    return true;
+}
+
+bool DuplicateFmPreset(int slot, int* out_new_slot, ProgressFn on_progress)
+{
+    if(!out_new_slot)
+        return false;
+    *out_new_slot = -1;
+    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
+        return false;
+    char    src[24];
+    FILINFO fno;
+    FmPresetFilename(slot, src, sizeof(src));
+    if(f_stat(src, &fno) != FR_OK)
+    {
+        SetError("dupsrc", FR_NO_FILE);
+        return false;
+    }
+    int new_slot = NextFreeFmPresetSlot();
+    if(new_slot < 0)
+    {
+        SetError("dupslot", FR_OK);
+        return false;
+    }
+    char dst[24];
+    FmPresetFilename(new_slot, dst, sizeof(dst));
     if(!CopyFileChunked(src, dst, on_progress))
         return false;
     *out_new_slot = new_slot;
