@@ -3,9 +3,7 @@
 #include <cstdint>
 #include "tempo_clock.h"
 #include "looper_layer.h"
-#include "pad_synth.h"
 #include "granular_engine.h"
-#include "fm_synth.h"
 
 // SD card save/load for a whole "performance" (all layers' audio plus
 // tempo/global/per-layer settings) as one flat binary file per slot.
@@ -76,10 +74,10 @@ bool DeleteSlot(int slot, int* loaded_slot_inout = nullptr);
 bool DuplicateSlot(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
 
 // Deals ONLY with the looper (all layers' audio plus tempo/global/per-
-// layer settings) -- Pad/Fm/Grains each have their own fully independent
-// save/load systems (SavePadPreset()/SaveFmPreset()/SaveGranularPreset()
-// below), never embedded into a performance file. Keeps every
-// instrument's saves in its own separate "bubble", performances included.
+// layer settings) -- Grains has its own fully independent save/load
+// system (SaveGranularPreset() below), never embedded into a performance
+// file. Keeps every instrument's saves in its own separate "bubble",
+// performances included.
 bool Save(int                slot,
           TempoClock&        tempo,
           LooperLayer*       layers,
@@ -106,55 +104,12 @@ bool Load(int          slot,
           float*       out_bypass_reverb_send01,
           ProgressFn   on_progress = nullptr);
 
-// Pad synth presets: parameters only, no audio -- a real snapshot (via
-// PadSynth::CapturePreset()/ApplyPreset()), not a reference to whatever
-// performance it originally came from, so a later Save/Load of a
-// DIFFERENT performance can never invalidate an already-saved preset.
-// Numbered 1..kMaxPadPresets; 1..PadSynth::kNumFactoryPresets are the
-// permanently read-only, firmware-embedded factory presets (see
-// PadSynth::GetFactoryPreset()) -- LoadPadPreset() serves those directly
-// without touching the card, and SavePadPreset()/NextFreePadPresetSlot()
-// never target them. User saves start right after that range.
-constexpr int kMaxPadPresets = 99;
-
-bool SavePadPreset(int slot, const PadSynth::PadPresetData& preset);
-bool LoadPadPreset(int slot, PadSynth::PadPresetData* out_preset);
-// Lists existing USER slots only (ascending) -- factory presets are
-// always available and aren't part of this scan. Same shape as
-// ListSlots().
-int  ListPadPresets(int* out_numbers, int max_out);
-// Lowest free USER slot, or -1 if the whole range is full/no card.
-int  NextFreePadPresetSlot();
-// Refuses factory slots (1..PadSynth::kNumFactoryPresets aren't files at
-// all) same as SavePadPreset() -- see DeleteSlot()/DuplicateSlot() above
-// for the general shape, including the same gap-closing renumbering and
-// loaded_slot_inout follow-along.
-bool DeletePadPreset(int slot, int* loaded_slot_inout = nullptr);
-bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
-
-// Fm synth presets: parameters only, no audio -- same shape as Pad
-// presets above, including the same factory range: 1..FmSynth::
-// kNumFactoryPresets are the permanently read-only, firmware-embedded
-// factory presets (see FmSynth::GetFactoryPreset()) -- LoadFmPreset()
-// serves those directly without touching the card, and SaveFmPreset()/
-// NextFreeFmPresetSlot() never target them. User saves start right after
-// that range.
-constexpr int kMaxFmPresets = 99;
-
-bool SaveFmPreset(int slot, const FmSynth::FmPresetData& preset);
-bool LoadFmPreset(int slot, FmSynth::FmPresetData* out_preset);
-int  ListFmPresets(int* out_numbers, int max_out);
-int  NextFreeFmPresetSlot();
-bool DeleteFmPreset(int slot, int* loaded_slot_inout = nullptr);
-bool DuplicateFmPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
-
 // Grains (GranularEngine) presets: parameters AND the captured audio
-// itself (unlike Pad presets above, which are parameters only) -- a
-// Grains preset IS a specific captured sound plus how it's being played
-// back, so loading one needs to restore both. No factory range (there's
-// no hand-tuned-patch equivalent for a captured sample), so every slot
-// 1..kMaxGranularPresets is a normal user save. Numbered/found the same
-// way as PadPreset's own user range.
+// itself -- a Grains preset IS a specific captured sound plus how it's
+// being played back, so loading one needs to restore both. No factory
+// range (there's no hand-tuned-patch equivalent for a captured sample),
+// so every slot 1..kMaxGranularPresets is a normal user save. Numbered/
+// found the same way as ListSlots()'s own range.
 constexpr int kMaxGranularPresets = 99;
 
 // audio_l/audio_r: whatever GranularEngine::GetSourceL()/R() currently

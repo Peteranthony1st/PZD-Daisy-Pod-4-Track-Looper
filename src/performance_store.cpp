@@ -58,23 +58,11 @@ void SlotFilename(int slot, char* out, size_t out_size)
 }
 
 // Own subfolder/numbering, same reasoning as SlotFilename()'s own split
-// from the SD root -- a pad preset is never targeted by ListSlots() this
-// way either.
-void PadPresetFilename(int slot, char* out, size_t out_size)
-{
-    snprintf(out, out_size, "PADP/PRES%03d.DAT", slot);
-}
-
-// Own subfolder/numbering, same reasoning as PadPresetFilename() above.
+// from the SD root -- a Grains preset is never targeted by ListSlots()
+// this way either.
 void GranularPresetFilename(int slot, char* out, size_t out_size)
 {
     snprintf(out, out_size, "GRNP/PRES%03d.DAT", slot);
-}
-
-// Own subfolder/numbering, same reasoning as PadPresetFilename() above.
-void FmPresetFilename(int slot, char* out, size_t out_size)
-{
-    snprintf(out, out_size, "FMP/PRES%03d.DAT", slot);
 }
 
 // Own subfolder for user-supplied WAV files to import as Grains capture
@@ -330,14 +318,12 @@ struct FileHeader
     // every layer's own Send.
     float    bypass_reverb_send01;
 
-    // Pad synth settings (added in version 7, removed in version 10) --
-    // a performance now deals ONLY with the looper (audio + tempo/global/
-    // per-layer settings) -- Pad/Fm/Grains each own their fully
-    // independent save/load systems instead (see SavePadPreset()/
-    // SaveFmPreset()/SaveGranularPreset()), with no cross-embedding into
-    // a performance file. Keeps the model symmetric across all 3
-    // instruments now that Fm exists too, rather than only Pad getting
-    // silently bundled in.
+    // Pad synth settings (added in version 7, removed in version 10 when
+    // Pad synth itself was removed from the project) -- a performance
+    // deals ONLY with the looper (audio + tempo/global/per-layer
+    // settings); Grains owns its own fully independent save/load system
+    // instead (see SaveGranularPreset()), with no cross-embedding into a
+    // performance file.
 };
 
 struct LayerHeader
@@ -524,8 +510,8 @@ bool CopyFileChunked(const char* src_path, const char* dst_path, ProgressFn on_p
 // any gap rather than stopping at the first one, so it also repairs any
 // non-contiguous numbering left over from before this existed.
 //
-// filename_fn must match SlotFilename()/PadPresetFilename()/
-// GranularPresetFilename()'s own signature. If loaded_slot_inout is
+// filename_fn must match SlotFilename()/GranularPresetFilename()'s own
+// signature. If loaded_slot_inout is
 // non-null and currently names a slot this moves, it's updated in place
 // to follow that file to wherever it actually ends up.
 void CompactSlotsAfterDelete(int  deleted_slot,
@@ -892,30 +878,6 @@ bool Load(int          slot,
 
 namespace
 {
-// Small fixed header (own magic/version, independent of FileHeader's own
-// -- these are a different file format, not a sub-section of it) plus
-// one raw PadPresetData block. No audio, so no chunked streaming/
-// progress callback needed -- this is a single small f_write()/f_read().
-struct PadPresetFileHeader
-{
-    char     magic[4]; // "PPST"
-    uint32_t version;
-};
-// Bumped 1 -> 2 -> 3 alongside PadPresetData's own Vibrato Depth/Rate and
-// (most recently) Tune fields -- same accepted "cleanly refuses instead
-// of misreading" tradeoff as kFileVersion above (the size check alone
-// would already catch this, but bumping the version keeps the failure
-// explicit rather than incidental).
-constexpr uint32_t kPadPresetFileVersion = 3;
-
-// Same shape as PadPresetFileHeader above, own magic/version.
-struct FmPresetFileHeader
-{
-    char     magic[4]; // "FMPS"
-    uint32_t version;
-};
-constexpr uint32_t kFmPresetFileVersion = 2; // bumped: FmPresetData grew Op4 ratio/index fields
-
 // Header + one raw GranularPresetData block + audio_len samples each of
 // L then R (float32, chunked -- see kChunkSamples), same shape as Save()'s
 // own per-layer audio. audio_len lives in the header (not implied by file
@@ -929,368 +891,6 @@ struct GranularPresetFileHeader
 };
 constexpr uint32_t kGranularPresetFileVersion = 1;
 } // namespace
-
-bool SavePadPreset(int slot, const PadSynth::PadPresetData& preset)
-{
-    if(!card_ready || slot <= PadSynth::kNumFactoryPresets || slot > kMaxPadPresets)
-        return false;
-
-    char fname[24];
-    PadPresetFilename(slot, fname, sizeof(fname));
-
-    FRESULT mkdir_res = f_mkdir("PADP");
-    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
-    {
-        SetError("mkdir", mkdir_res);
-        return false;
-    }
-
-    ClearError();
-    static FIL file; // see the DTCMRAM/DMA comment on Save() above
-    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
-    if(fr != FR_OK)
-    {
-        SetError("open", fr);
-        return false;
-    }
-
-    static PadPresetFileHeader hdr;
-    hdr = PadPresetFileHeader{};
-    memcpy(hdr.magic, "PPST", 4);
-    hdr.version = kPadPresetFileVersion;
-
-    static PadSynth::PadPresetData data;
-    data = preset;
-
-    UINT bw;
-    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
-    bool ok = fr == FR_OK && bw == sizeof(hdr);
-    if(ok)
-    {
-        fr = f_write(&file, &data, sizeof(data), &bw);
-        ok = fr == FR_OK && bw == sizeof(data);
-    }
-    if(!ok)
-        SetError("data", fr);
-
-    FRESULT close_res = f_close(&file);
-    if(close_res != FR_OK)
-        SetError("close", close_res);
-    return ok && close_res == FR_OK;
-}
-
-bool LoadPadPreset(int slot, PadSynth::PadPresetData* out_preset)
-{
-    if(slot < 1 || slot > kMaxPadPresets || !out_preset)
-        return false;
-    if(slot <= PadSynth::kNumFactoryPresets)
-    {
-        *out_preset = PadSynth::GetFactoryPreset(slot - 1);
-        return true;
-    }
-    if(!card_ready)
-        return false;
-
-    char fname[24];
-    PadPresetFilename(slot, fname, sizeof(fname));
-
-    ClearError();
-    static FIL file; // see the DTCMRAM/DMA comment on Save() above
-    FRESULT    fr = f_open(&file, fname, FA_READ);
-    if(fr != FR_OK)
-    {
-        SetError("open", fr);
-        return false;
-    }
-
-    static PadPresetFileHeader hdr;
-    hdr = PadPresetFileHeader{};
-    UINT br;
-    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
-    bool ok = fr == FR_OK && br == sizeof(hdr);
-    if(ok && (memcmp(hdr.magic, "PPST", 4) != 0 || hdr.version != kPadPresetFileVersion))
-    {
-        ok = false;
-        SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
-    }
-    else if(!ok)
-    {
-        SetError("hdr", fr);
-    }
-
-    static PadSynth::PadPresetData data;
-    data = PadSynth::PadPresetData{};
-    if(ok)
-    {
-        fr = f_read(&file, &data, sizeof(data), &br);
-        ok = fr == FR_OK && br == sizeof(data);
-        if(!ok)
-            SetError("data", fr);
-    }
-    if(ok)
-        *out_preset = data;
-
-    FRESULT close_res = f_close(&file);
-    if(close_res != FR_OK)
-        SetError("close", close_res);
-    return ok && close_res == FR_OK;
-}
-
-int ListPadPresets(int* out_numbers, int max_out)
-{
-    if(!card_ready)
-        return 0;
-    int count = 0;
-    for(int slot = PadSynth::kNumFactoryPresets + 1; slot <= kMaxPadPresets && count < max_out;
-        slot++)
-    {
-        char    fname[24];
-        FILINFO fno;
-        PadPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) == FR_OK)
-            out_numbers[count++] = slot;
-    }
-    return count;
-}
-
-int NextFreePadPresetSlot()
-{
-    if(!card_ready)
-        return -1;
-    for(int slot = PadSynth::kNumFactoryPresets + 1; slot <= kMaxPadPresets; slot++)
-    {
-        char    fname[24];
-        FILINFO fno;
-        PadPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) != FR_OK)
-            return slot;
-    }
-    return -1;
-}
-
-bool DeletePadPreset(int slot, int* loaded_slot_inout)
-{
-    if(!card_ready || slot <= PadSynth::kNumFactoryPresets || slot > kMaxPadPresets)
-        return false;
-    char fname[24];
-    PadPresetFilename(slot, fname, sizeof(fname));
-    if(!DeleteFileGeneric(fname))
-        return false;
-    if(loaded_slot_inout && *loaded_slot_inout == slot)
-        *loaded_slot_inout = 0;
-    CompactSlotsAfterDelete(slot, kMaxPadPresets, PadPresetFilename, loaded_slot_inout);
-    return true;
-}
-
-bool DuplicatePadPreset(int slot, int* out_new_slot, ProgressFn on_progress)
-{
-    if(!out_new_slot)
-        return false;
-    *out_new_slot = -1;
-    if(!card_ready || slot <= PadSynth::kNumFactoryPresets || slot > kMaxPadPresets)
-        return false;
-    char    src[24];
-    FILINFO fno;
-    PadPresetFilename(slot, src, sizeof(src));
-    if(f_stat(src, &fno) != FR_OK)
-    {
-        SetError("dupsrc", FR_NO_FILE);
-        return false;
-    }
-    int new_slot = NextFreePadPresetSlot();
-    if(new_slot < 0)
-    {
-        SetError("dupslot", FR_OK);
-        return false;
-    }
-    char dst[24];
-    PadPresetFilename(new_slot, dst, sizeof(dst));
-    if(!CopyFileChunked(src, dst, on_progress))
-        return false;
-    *out_new_slot = new_slot;
-    return true;
-}
-
-bool SaveFmPreset(int slot, const FmSynth::FmPresetData& preset)
-{
-    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
-        return false;
-
-    char fname[24];
-    FmPresetFilename(slot, fname, sizeof(fname));
-
-    FRESULT mkdir_res = f_mkdir("FMP");
-    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
-    {
-        SetError("mkdir", mkdir_res);
-        return false;
-    }
-
-    ClearError();
-    static FIL file; // see the DTCMRAM/DMA comment on Save() above
-    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
-    if(fr != FR_OK)
-    {
-        SetError("open", fr);
-        return false;
-    }
-
-    static FmPresetFileHeader hdr;
-    hdr = FmPresetFileHeader{};
-    memcpy(hdr.magic, "FMPS", 4);
-    hdr.version = kFmPresetFileVersion;
-
-    static FmSynth::FmPresetData data;
-    data = preset;
-
-    UINT bw;
-    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
-    bool ok = fr == FR_OK && bw == sizeof(hdr);
-    if(ok)
-    {
-        fr = f_write(&file, &data, sizeof(data), &bw);
-        ok = fr == FR_OK && bw == sizeof(data);
-    }
-    if(!ok)
-        SetError("data", fr);
-
-    FRESULT close_res = f_close(&file);
-    if(close_res != FR_OK)
-        SetError("close", close_res);
-    return ok && close_res == FR_OK;
-}
-
-bool LoadFmPreset(int slot, FmSynth::FmPresetData* out_preset)
-{
-    if(slot < 1 || slot > kMaxFmPresets || !out_preset)
-        return false;
-    if(slot <= FmSynth::kNumFactoryPresets)
-    {
-        *out_preset = FmSynth::GetFactoryPreset(slot - 1);
-        return true;
-    }
-    if(!card_ready)
-        return false;
-
-    char fname[24];
-    FmPresetFilename(slot, fname, sizeof(fname));
-
-    ClearError();
-    static FIL file; // see the DTCMRAM/DMA comment on Save() above
-    FRESULT    fr = f_open(&file, fname, FA_READ);
-    if(fr != FR_OK)
-    {
-        SetError("open", fr);
-        return false;
-    }
-
-    static FmPresetFileHeader hdr;
-    hdr = FmPresetFileHeader{};
-    UINT br;
-    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
-    bool ok = fr == FR_OK && br == sizeof(hdr);
-    if(ok && (memcmp(hdr.magic, "FMPS", 4) != 0 || hdr.version != kFmPresetFileVersion))
-    {
-        ok = false;
-        SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
-    }
-    else if(!ok)
-    {
-        SetError("hdr", fr);
-    }
-
-    static FmSynth::FmPresetData data;
-    data = FmSynth::FmPresetData{};
-    if(ok)
-    {
-        fr = f_read(&file, &data, sizeof(data), &br);
-        ok = fr == FR_OK && br == sizeof(data);
-        if(!ok)
-            SetError("data", fr);
-    }
-    if(ok)
-        *out_preset = data;
-
-    FRESULT close_res = f_close(&file);
-    if(close_res != FR_OK)
-        SetError("close", close_res);
-    return ok && close_res == FR_OK;
-}
-
-int ListFmPresets(int* out_numbers, int max_out)
-{
-    if(!card_ready)
-        return 0;
-    int count = 0;
-    for(int slot = FmSynth::kNumFactoryPresets + 1; slot <= kMaxFmPresets && count < max_out;
-        slot++)
-    {
-        char    fname[24];
-        FILINFO fno;
-        FmPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) == FR_OK)
-            out_numbers[count++] = slot;
-    }
-    return count;
-}
-
-int NextFreeFmPresetSlot()
-{
-    if(!card_ready)
-        return -1;
-    for(int slot = FmSynth::kNumFactoryPresets + 1; slot <= kMaxFmPresets; slot++)
-    {
-        char    fname[24];
-        FILINFO fno;
-        FmPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) != FR_OK)
-            return slot;
-    }
-    return -1;
-}
-
-bool DeleteFmPreset(int slot, int* loaded_slot_inout)
-{
-    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
-        return false;
-    char fname[24];
-    FmPresetFilename(slot, fname, sizeof(fname));
-    if(!DeleteFileGeneric(fname))
-        return false;
-    if(loaded_slot_inout && *loaded_slot_inout == slot)
-        *loaded_slot_inout = 0;
-    CompactSlotsAfterDelete(slot, kMaxFmPresets, FmPresetFilename, loaded_slot_inout);
-    return true;
-}
-
-bool DuplicateFmPreset(int slot, int* out_new_slot, ProgressFn on_progress)
-{
-    if(!out_new_slot)
-        return false;
-    *out_new_slot = -1;
-    if(!card_ready || slot <= FmSynth::kNumFactoryPresets || slot > kMaxFmPresets)
-        return false;
-    char    src[24];
-    FILINFO fno;
-    FmPresetFilename(slot, src, sizeof(src));
-    if(f_stat(src, &fno) != FR_OK)
-    {
-        SetError("dupsrc", FR_NO_FILE);
-        return false;
-    }
-    int new_slot = NextFreeFmPresetSlot();
-    if(new_slot < 0)
-    {
-        SetError("dupslot", FR_OK);
-        return false;
-    }
-    char dst[24];
-    FmPresetFilename(new_slot, dst, sizeof(dst));
-    if(!CopyFileChunked(src, dst, on_progress))
-        return false;
-    *out_new_slot = new_slot;
-    return true;
-}
 
 bool SaveGranularPreset(int                                       slot,
                         const GranularEngine::GranularPresetData& preset,

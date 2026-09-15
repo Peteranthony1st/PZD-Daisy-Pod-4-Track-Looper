@@ -5,9 +5,7 @@
 #include "looper_layer.h"
 #include "font_tomthumb.h"
 
-class PadSynth;
 class GranularEngine;
-class FmSynth;
 
 // The whole "one encoder + push button, two knobs, two buttons, one small
 // OLED" menu system.
@@ -75,9 +73,6 @@ class Ui
               TempoClock*                   tempo,
               LooperLayer*                  layers,
               int                           num_layers,
-              PadSynth*                     pad_synth,
-              const float*                  pad_scope_buf,
-              size_t                        pad_scope_capacity,
               GranularEngine*               granular,
               const float*                  granular_scope_buf,
               size_t                        granular_scope_capacity,
@@ -87,10 +82,7 @@ class Ui
               volatile bool*                granular_capturing,
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
-              size_t                        master_scope_capacity,
-              FmSynth*                      fm_synth,
-              const float*                  fm_scope_buf,
-              size_t                        fm_scope_capacity);
+              size_t                        master_scope_capacity);
 
     // Call once from main(), right after Init() -- applies the user's
     // saved startup defaults (see PerformanceStore::LoadPrefs()) on top
@@ -140,15 +132,15 @@ class Ui
     // Defaults to 0.8f (matching every other engine's own Output Level
     // default in this codebase) since this is a brand new control with
     // no prior loudness to preserve -- same curve as every other Volume-
-    // type knob (LooperLayer::SetVolume01(), PadSynth/GranularEngine's
-    // own SetOutputLevel01()).
+    // type knob (LooperLayer::SetVolume01(), GranularEngine's own
+    // SetOutputLevel01()).
     float GetBypassMixVolume01() const { return bypass_mix_volume01_; }
     float GetBypassMixVolume() const { return bypass_mix_volume_; }
     // Defined in ui.cpp, not inline here -- needs powf(), same reasoning
     // every other curved setter in this header already avoids inlining.
     void  SetBypassMixVolume01(float v01);
     // Linear pan law, same as every other engine's own Pan (see
-    // PadSynth::SetPan01()'s comment) -- main.cpp computes panL/panR
+    // GranularEngine::SetPan01()'s comment) -- main.cpp computes panL/panR
     // from this directly (0.5 = center), same "no cached gain members
     // needed, this is UI-owned global state not a DSP object" treatment
     // as GetMasterVolume()'s own curve being applied inline there.
@@ -163,25 +155,20 @@ class Ui
     // 1.0 (default) = normal.
     float GetProjectSpeed() const { return project_speed_; }
 
-    // Per-engine on/off (Global:Pad / Global:Granular, Button1 tap) --
-    // pulled forward from the granular-rewrite plan's Stage 4 once real
-    // hardware measurement (4 layers + full 8-voice Pad + Granular, all
-    // active) showed CPU headroom was tight enough (~89% worst case) that
-    // a real way to free up budget was needed now, not just once
-    // Granular's own UI/persistence stages were done. main.cpp's
-    // AudioCallback() skips a disabled engine's Process() call entirely
-    // (writing silence instead) -- a real CPU saving, not just a mute.
-    // Pad Synth and Fm Synth are mutually exclusive -- both are full
-    // polyphonic instruments occupying the same conceptual "melodic
-    // voice" slot and the same Mixer channel (see MixerChannelName()'s
-    // own comment), and running both at once was never the point (Fm was
-    // built specifically to replace Pad Synth, see fm_synth.h's own doc
-    // comment) -- so enabling one from its own Global page (Button1 tap)
-    // forces the other off, rather than letting the worst-case CPU sum
-    // of both grow unbounded. Granular stays independent of this pair.
-    bool IsPadEnabled() const { return pad_enabled_; }
-    bool IsFmEnabled() const { return fm_enabled_; }
+    // Per-engine on/off (Global:Granular, Button1 tap) -- pulled forward
+    // from the granular-rewrite plan's Stage 4 once real hardware
+    // measurement showed CPU headroom was tight enough that a real way
+    // to free up budget was needed now, not just once Granular's own UI/
+    // persistence stages were done. main.cpp's AudioCallback() skips a
+    // disabled engine's Process() call entirely (writing silence
+    // instead) -- a real CPU saving, not just a mute.
     bool IsGranularEnabled() const { return granular_enabled_; }
+    // Same real-CPU-saving on/off gate as Granular's own, for the new
+    // Dexed engine (see main.cpp's AudioCallback()) -- no mutex with any
+    // other instrument needed (unlike the old Pad/Fm pairing), Dexed is
+    // independent of Granular the same way Granular is independent of
+    // the looper.
+    bool IsDexedEnabled() const { return dexed_enabled_; }
     // Global:Looper, Button1 tap -- a REAL stop, not TogglePauseAll()'s
     // own phase-locked pause: main.cpp's AudioCallback() skips every
     // LooperLayer::Process() call entirely while this is false, so
@@ -197,20 +184,13 @@ class Ui
         Home,
         Layer,
         Global,
-        // Same treatment as Pad below, entered from Global:Fm -- Pad
-        // Synth's sibling/replacement, mutually exclusive with it (see
-        // IsFmEnabled()/IsPadEnabled()). See FmParamPage for its own
-        // pages.
-        Fm,
         // A real top-level screen, not a Global page -- entered from
-        // Global's own Pad entry-point page (encoder click), exits back
-        // to Home via the same long-press-from-any-non-Home-screen path
-        // every other screen uses. See PadParamPage for its own pages.
-        Pad,
-        // Same treatment as Pad above, entered from Global:Granular. See
-        // GranularParamPage for its own pages.
+        // Global's own Granular entry-point page (encoder click), exits
+        // back to Home via the same long-press-from-any-non-Home-screen
+        // path every other screen uses. See GranularParamPage for its
+        // own pages.
         Granular,
-        // Same treatment as Pad/Granular above, entered from Global:Mixer.
+        // Same treatment as Granular above, entered from Global:Mixer.
         // Unlike every other screen, encoder rotate here doesn't select a
         // page -- it scrolls through one continuous, endlessly-wrapping
         // sequence of "stops" (see mixer_position_): the 8 real channels
@@ -256,24 +236,15 @@ class Ui
         Reverb,
         Speed,
         File,
-        // File management: Knob1 picks which of the 3 save folders
-        // (Performances/Pad Presets/Grains Presets) then Button1 tap
-        // drills in; once inside, Knob1 browses that folder's own files
-        // (reusing the exact same list Global:File/Pad Preset/Grains
-        // Preset already scan and cache), Button1 tap goes back up,
-        // Button1 hold Duplicates the browsed file, Button2 hold Deletes
-        // it. See SdMgmtFolder/sd_mgmt_in_folder_.
+        // File management: Knob1 picks which of the 2 save folders
+        // (Performances/Grains Presets) then Button1 tap drills in; once
+        // inside, Knob1 browses that folder's own files (reusing the
+        // exact same list Global:File/Grains Preset already scan and
+        // cache), Button1 tap goes back up, Button1 hold Duplicates the
+        // browsed file, Button2 hold Deletes it. See
+        // SdMgmtFolder/sd_mgmt_in_folder_.
         SdMgmt,
         Export,
-        // Entry point into Screen::Fm only -- Pad Synth's sibling/
-        // replacement (see IsFmEnabled()/IsPadEnabled()'s own mutex
-        // comment), placed before Pad/Granular so it's found first when
-        // rotating through Global. Same "no continuous knobs of its own"
-        // treatment as every other screen's Global entry page.
-        Fm,
-        // Entry point into Screen::Pad only -- no continuous knobs of its
-        // own, same treatment as every other screen's Global entry page.
-        Pad,
         // Entry point into Screen::Granular (not built yet -- Stage 2 of
         // the granular rewrite). For now this page only exposes the
         // on/off toggle pulled forward from Stage 4, same idiom as Pad's
@@ -296,55 +267,7 @@ class Ui
     enum class SdMgmtFolder
     {
         Performances,
-        PadPresets,
-        FmPresets,
         GranularPresets,
-        kCount
-    };
-
-    // Screen::Pad's own pages, cycled by encoder rotate while there (same
-    // convention as LayerPage/GlobalPage).
-    enum class PadParamPage
-    {
-        Tone,      // Registration (tone morph) + Osc Gain
-        Tune,      // Coarse transpose, -24..+24 semitones -- single knob
-        // Attack/Decay/Sustain/Release graph, all four stages always
-        // shown together -- Button1 maps the knobs to Attack+Decay,
-        // Button2 maps them to Sustain+Release (see pad_adsr_target_sr_).
-        ADSR,
-        Chorus,    // Depth + Rate
-        Vibrato,   // Depth + Rate -- ceiling the mod wheel scales up to (see ModDestination)
-        Filter,    // Cutoff + Resonance, mode cycled by Button1
-        Mix,       // Reverb Send + Output Level -- also reachable from Global:Mixer,
-                   // same underlying pad_synth_ value either way, so changing it in
-                   // either place updates the other with no extra sync needed.
-        ModAssign, // Button1 cycles PadSynth::ModDestination; no knobs
-        Preset,    // Save/Load the whole pad sound as a preset
-        kCount
-    };
-
-    // Screen::Fm's own pages -- deliberately mirrors PadParamPage's own
-    // shape/order (ADSR/Chorus/Vibrato/Filter/Mix/ModAssign/Preset are
-    // identical in spirit, just reading FmSynth's own getters/setters)
-    // so its screens/knob conventions carry over with minimal changes.
-    // Only Ratio/Index/Tune differ from Pad's own Tone/Tune, since FM's
-    // "tone" controls are per-operator rather than a single registration
-    // knob -- see FmSynth's own doc comment for why algorithm/routing
-    // selection isn't part of this page set yet.
-    enum class FmParamPage
-    {
-        Algo,      // Button1 cycles FastFmVoice::Algorithm; no knobs
-        Ratio,     // Op2 Ratio + Op3 Ratio (relative to the carrier)
-        Index,     // Op2 Index (-> carrier) + Op3 Index (-> Op2)
-        Op4,       // Op4 Ratio + Op4 Index -- the 4th operator's own pair
-        Tune,      // Coarse transpose, -24..+24 semitones -- single knob
-        ADSR,      // Same merged Attack/Decay/Sustain/Release idiom as Pad's own
-        Chorus,    // Depth + Rate
-        Vibrato,   // Depth + Rate -- ceiling the mod wheel scales up to (see ModDestination)
-        Filter,    // Cutoff + Resonance, mode cycled by Button1
-        Mix,       // Reverb Send + Output Level -- also reachable from Global:Mixer
-        ModAssign, // Button1 cycles FmSynth::ModDestination; no knobs
-        Preset,    // Save/Load the whole FM sound as a preset
         kCount
     };
 
@@ -418,35 +341,10 @@ class Ui
         GlobalSpeed,
         GlobalFile,
         GlobalExport,
-        GlobalFm, // entry point only -- see Screen::Fm instead
-        GlobalPad, // entry point only -- see Screen::Pad instead
         GlobalGranular, // entry point only -- see Screen::Granular instead
         GlobalLooper, // no continuous knobs -- Button1 toggle only
         GlobalMixer, // entry point only -- see Screen::Mixer instead
         GlobalSdMgmt, // browses a list directly, no pickup used -- see GlobalPage::SdMgmt
-        FmAlgo, // no continuous knobs -- Button1 cycles it
-        FmRatio,
-        FmIndex,
-        FmOp4, // Op4 Ratio + Op4 Index
-        FmTune,
-        FmEnvAD,
-        FmEnvSR,
-        FmChorus,
-        FmVibrato,
-        FmFilter,
-        FmMix,
-        FmModAssign,
-        FmPreset, // browses a list directly, no pickup used
-        PadTone,
-        PadTune,
-        PadEnvAD,
-        PadEnvSR,
-        PadChorus,
-        PadVibrato,
-        PadFilter,
-        PadMix,
-        PadModAssign,
-        PadPreset,
         // Screen::Granular's Grain page -- Button1/Button2 toggle which
         // pair the knobs reach (see granular_grain_target_gap_scan_).
         GranularGrainSizeFill,
@@ -527,17 +425,15 @@ class Ui
     static const char* SdMgmtFolderName(SdMgmtFolder f);
     void DrawExportScreen();
     void DrawSpeedScreen();
-    void DrawFmScreen();
-    void DrawPadScreen();
     void DrawGranularScreen();
     void DrawMixerScreen();
     // Screen::Mixer's own per-channel accessors -- channel index 0..3 is
-    // Layer 1..4, 4 is Plaits, 5 is Grains, 6 is Bypass, 7 is Master.
+    // Layer 1..4, 4 is Grains, 5 is Bypass, 6 is Master.
     // Kept as small indexed switches rather than a polymorphic interface
-    // since there are only 8 cases and they already read/write each
+    // since there are only 7 cases and they already read/write each
     // engine's own real getters/setters directly -- no new state of its
     // own, this is purely another view onto values that already exist.
-    static constexpr int kNumMixerChannels = 8;
+    static constexpr int kNumMixerChannels = 7;
     // Total encoder "stops" in Screen::Mixer -- the 8 real channels above
     // plus the Scope stop (mixer_position_ == kNumMixerChannels). See
     // Screen::Mixer's own comment.
@@ -558,10 +454,10 @@ class Ui
     void DrawMixerOverviewGrid(int top_y);
     // Attack/decay/sustain/release graph, four fixed-equal-width zones
     // (so turning one knob never visibly shifts another stage that
-    // didn't change) -- shared by PadParamPage::EnvAD/EnvSR, given the
-    // actual curved seconds (see PadSynth::GetAttackSeconds() etc.) and
-    // sustain01 rather than reading an engine pointer directly, so this
-    // stays reusable if anything else ever wants the same graph.
+    // didn't change) -- shared by GranularParamPage::EnvAD/EnvSR, given
+    // the actual curved seconds and sustain01 rather than reading an
+    // engine pointer directly, so this stays reusable if anything else
+    // ever wants the same graph.
     void DrawAdsrShape(int   top,
                         int   bottom,
                         float attack_s,
@@ -569,11 +465,10 @@ class Ui
                         float sustain01,
                         float release_s);
     // Live auto-scaled waveform trace from a small ring buffer -- shared
-    // by whichever PadParamPage wants a live timbre reference (Tone/
-    // Chorus/Filter all show the pad's actual output changing as you
-    // turn their knobs). Takes the buffer/capacity explicitly rather
-    // than reading a fixed member, same reusability reasoning as
-    // DrawAdsrShape above.
+    // by whichever page wants a live timbre reference (Grains' own
+    // Filter page shows its actual output changing as you turn its
+    // knobs). Takes the buffer/capacity explicitly rather than reading a
+    // fixed member, same reusability reasoning as DrawAdsrShape above.
     void DrawOscilloscope(int top, int bottom, const float* buf, size_t capacity);
     // Downsampled peak-bar waveform + optional moving playhead, shared by
     // Layer:Status (one layer's own GetWaveformPeaks()/GetPlayPos01()) and
@@ -638,10 +533,9 @@ class Ui
     void TriggerLoad();
 
     // --- SD MGMT (Global:SdMgmt page) ------------------------------------
-    // Returns whichever of file_slots_/pad_preset_user_slots_/
-    // granular_preset_user_slots_ applies to sd_mgmt_folder_ (refreshing
-    // it first if that folder's own dirty flag is set) and writes its
-    // count to *out_count.
+    // Returns whichever of file_slots_/granular_preset_user_slots_
+    // applies to sd_mgmt_folder_ (refreshing it first if that folder's
+    // own dirty flag is set) and writes its count to *out_count.
     const int* SdMgmtSlots(int* out_count);
     // Button1 hold (800ms) while browsing a folder's files: duplicates
     // the browsed file via PerformanceStore::Duplicate*() -- same
@@ -675,49 +569,6 @@ class Ui
     void TriggerExportMicroDexed();
     static void OnSaveLoadProgress(float progress01); // PerformanceStore::ProgressFn
 
-    // --- Pad presets (Screen::Pad, PadParamPage::Preset) ----------------
-    // Refreshes pad_preset_user_slots_/pad_preset_user_slot_count_ from
-    // the card -- same RefreshFileSlots() convention, called on entry to
-    // this page and after a save. The kNumFactoryPresets factory presets
-    // are always available regardless of card state and aren't part of
-    // this scan.
-    void RefreshPadPresetSlots();
-    // Button1 short: same "smart save" idiom as TriggerSave() -- overwrite
-    // pad_loaded_preset_slot_ if it's a user slot, otherwise (nothing
-    // loaded, or a read-only factory preset is current) save to a new
-    // user slot instead. Button2 short (force_new=true): always a new
-    // user slot, same non-destructive reasoning as TriggerSave's own
-    // force_new.
-    void TriggerSavePadPreset(bool force_new = false);
-    // Button2 long-hold (800ms): confirms whatever the Load chooser has
-    // settled on -- delegates to TriggerNewPadPreset() if "New" is
-    // highlighted, otherwise loads whichever preset pad_preset_cursor_ is
-    // currently browsing (factory or user, drilled into via Button1, see
-    // load_browsing_files_'s own comment), replacing every live pad
-    // setting.
-    void TriggerLoadPadPreset();
-    // Pad Preset's own Load chooser confirmed with "New" highlighted --
-    // resets to the first factory patch, same fresh-start spirit as
-    // Global:File's own TriggerNew().
-    void TriggerNewPadPreset();
-
-    // --- Fm presets (Screen::Fm, FmParamPage::Preset) -- same base shape
-    // as Pad's own (factory-preset range included), browsed through an
-    // extra folder layer -- see fm_preset_folder_open_'s own comment ----
-    void RefreshFmPresetSlots();
-    void TriggerSaveFmPreset(bool force_new = false);
-    void TriggerLoadFmPreset();
-    // Fm Preset's own Load chooser confirmed with "New" highlighted --
-    // resets to the first factory patch, same fresh-start spirit as
-    // Global:File's own TriggerNew().
-    void TriggerNewFmPreset();
-    // Resolves (fm_preset_folder_cursor_, fm_preset_cursor_) to an actual
-    // 1-based slot -- a factory category's local index via
-    // FmSynth::GetFactoryCategorySlot(), or fm_preset_user_slots_[cursor]
-    // for the trailing "User" folder -- or -1 if nothing valid is
-    // selected. Shared by DrawFmScreen()'s own "Load: X" line and
-    // TriggerLoadFmPreset() so both always agree on what's highlighted.
-    int ResolveFmPresetSlot() const;
     // Instant copy of whichever loop layer granular_capture_source_
     // currently names (independent of Home's own cursor_layer_) into
     // Grains' own capture buffer, up to granular_capture_capacity_, then
@@ -758,7 +609,7 @@ class Ui
     // one. Button2 short tap (force_new=true): always a new slot. Both
     // save the CURRENTLY LOADED capture audio (via granular_->GetSourceL/
     // R()/GetSourceLen()) alongside the parameters -- same non-destructive
-    // reasoning as TriggerSave()/TriggerSavePadPreset()'s own force_new.
+    // reasoning as TriggerSave()'s own force_new.
     void TriggerSaveGranularPreset(bool force_new = false);
     // Button2 long-hold (800ms): confirms whatever the Load chooser has
     // settled on -- delegates to TriggerNewGranularPreset() if "New" is
@@ -892,20 +743,20 @@ class Ui
 
     bool loop_paused_ = false; // see TogglePauseAll()
 
-    // --- Per-engine on/off (see IsPadEnabled()/IsFmEnabled()/
-    // IsGranularEnabled()) -- pad_enabled_/fm_enabled_ are mutually
-    // exclusive, enforced in OnButton1Short()'s own Global:Pad/Global:Fm
-    // toggle handling, not here (both simply default false, same as
-    // Granular's own).
-    bool pad_enabled_      = false;
-    bool fm_enabled_       = false;
+    // --- Per-engine on/off (see IsGranularEnabled()).
     bool granular_enabled_ = false;
     bool looper_enabled_   = true; // see IsLooperEnabled()'s own comment for why true
+    // Defaults true (unlike Granular's own false default) since there's
+    // no UI toggle for this yet (Phase 5 adds Screen::Dexed and a real
+    // Global:Dexed on/off page, matching Global:Granular's own Button1-
+    // tap convention) -- without this defaulting on, Phase 4's own real
+    // MIDI dispatch would have no way to actually be heard yet.
+    bool dexed_enabled_    = true;
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
 
-    // See SaveLoadMode's own comment -- shared by Global:File, Pad
-    // Preset, and Grains Preset. Reset to Idle whenever the page/screen
+    // See SaveLoadMode's own comment -- shared by Global:File and Grains
+    // Preset. Reset to Idle whenever the page/screen
     // changes (see HandleEncoder()'s rotate handling), so leaving one of
     // these three pages never leaves it stuck mid-flow for the next visit.
     SaveLoadMode save_load_mode_ = SaveLoadMode::Idle;
@@ -942,9 +793,9 @@ class Ui
     char file_status_[24]           = {};    // last result, shown briefly on the page
 
     // --- SD MGMT (Global:SdMgmt page) ------------------------------------
-    // Reuses file_slots_/pad_preset_user_slots_/granular_preset_user_slots_
-    // (and their own dirty flags/Refresh*() calls) as the file list for
-    // whichever folder is selected -- no separate copy of the same scan.
+    // Reuses file_slots_/granular_preset_user_slots_ (and their own dirty
+    // flags/Refresh*() calls) as the file list for whichever folder is
+    // selected -- no separate copy of the same scan.
     // Delete gets a longer hold than every other confirm gesture in this
     // project (800ms elsewhere) -- unlike an overwrite or a wipe, there's
     // no "just re-save/re-load" undo for it.
@@ -960,62 +811,6 @@ class Ui
 
     // --- Startup defaults (Global:Tempo page) -------------------------
     char tempo_status_[24]          = {};    // last "save as default" result, shown briefly here
-
-    // --- Pad synth (Screen::Pad) ---------------------------------------
-    PadSynth*    pad_synth_          = nullptr;
-    const float* pad_scope_buf_      = nullptr;
-    size_t       pad_scope_capacity_ = 0;
-    PadParamPage pad_param_page_     = PadParamPage::Tone;
-    // false = knobs control Attack+Decay, true = Sustain+Release -- see
-    // PadParamPage::ADSR's Button1/Button2 handling.
-    bool pad_adsr_target_sr_ = false;
-
-    // --- Fm synth (Screen::Fm) -------------------------------------------
-    FmSynth*    fm_synth_          = nullptr;
-    const float* fm_scope_buf_     = nullptr;
-    size_t       fm_scope_capacity_ = 0;
-    FmParamPage  fm_param_page_     = FmParamPage::Ratio;
-    // false = knobs control Attack+Decay, true = Sustain+Release -- see
-    // FmParamPage::ADSR's Button1/Button2 handling.
-    bool fm_adsr_target_sr_ = false;
-    // FM presets (FmParamPage::Preset) -- same base shape as Pad Synth's
-    // own (factory-preset range, see FmSynth::kNumFactoryPresets), but
-    // browsed through a folder layer on top: factory presets are grouped
-    // into named categories (FmSynth::kNumFactoryCategories) plus one
-    // trailing synthetic "User" folder holding every SD-saved slot, so
-    // there's always somewhere for a saved preset to live even though it
-    // doesn't belong to a hand-authored category.
-    static constexpr int kMaxFmPresetSlots = 99; // must match PerformanceStore::kMaxFmPresets
-    int  fm_preset_user_slots_[kMaxFmPresetSlots] = {};
-    int  fm_preset_user_slot_count_               = 0;
-    // Which folder is highlighted (browsing the folder list) or open
-    // (browsing presets inside it) -- 0..kNumFactoryCategories-1 name a
-    // factory category, kNumFactoryCategories itself names the trailing
-    // "User" folder. Reset to the folder list (fm_preset_folder_open_ =
-    // false) every time BrowsingLoad is freshly entered (see
-    // HandleButton2()'s own Screen::Fm case) so Load always starts at the
-    // top of the folder list, never wherever it was last left drilled into.
-    int  fm_preset_folder_cursor_ = 0;
-    // false = K1 scrolls fm_preset_folder_cursor_ over folder names,
-    // Button1 opens the highlighted one (see OnButton1Short()'s own
-    // Screen::Fm case). true = K1 scrolls fm_preset_cursor_ (below) over
-    // the presets INSIDE that folder, Button1 backs out to the folder
-    // list instead.
-    bool fm_preset_folder_open_   = false;
-    // Index WITHIN the currently open folder (fm_preset_folder_cursor_) --
-    // NOT a flat index across every preset, unlike pad_preset_cursor_'s
-    // own single-level browse. Resolved to an actual 1-based slot via
-    // FmSynth::GetFactoryCategorySlot() (factory folders) or
-    // fm_preset_user_slots_[fm_preset_cursor_] (the User folder) -- see
-    // TriggerLoadFmPreset()'s own comment.
-    int  fm_preset_cursor_                        = 0;
-    bool fm_preset_slots_dirty_                   = true;
-    // Which slot the live FM settings currently correspond to. Starts at
-    // 1 ("Init", factory preset index 0) since that's exactly what
-    // FmSynth::Init() applies at boot -- same convention as
-    // pad_loaded_preset_slot_.
-    int  fm_loaded_preset_slot_ = 1;
-    char fm_preset_status_[24]  = {}; // last save/load result, shown briefly here
 
     // --- Granular engine (Screen::Granular) -----------------------------
     GranularEngine*    granular_             = nullptr;
@@ -1083,8 +878,7 @@ class Ui
     // 61, matching PerformanceStore::kMaxImportWavNameLen+1 -- can't
     // reference that constant directly here since this header doesn't
     // include performance_store.h (only ui.cpp does, same reasoning as
-    // GranularEngine/PadSynth being forward-declared instead of fully
-    // included).
+    // GranularEngine being forward-declared instead of fully included).
     char granular_import_names_[kMaxImportFiles][61] = {};
     int  granular_import_file_count_ = 0;
     // Same "no factory range, browses a list directly" idiom as
@@ -1114,31 +908,11 @@ class Ui
     static constexpr int kMaxGranularPresetSlots = 99; // must match PerformanceStore::kMaxGranularPresets
     int  granular_preset_user_slots_[kMaxGranularPresetSlots] = {}; // SD user slots, ascending
     int  granular_preset_user_slot_count_                      = 0;
-    // No factory range (unlike pad_preset_cursor_) -- every listed slot
-    // is a real user save, so this browses granular_preset_user_slots_
-    // directly rather than needing PadPresetCursorToSlot()'s own
-    // factory/user split.
+    // No factory range -- every listed slot is a real user save, so this
+    // browses granular_preset_user_slots_ directly.
     int  granular_preset_cursor_       = 0;
     bool granular_preset_slots_dirty_  = true; // forces one RefreshGranularPresetSlots() on entry
-    // -1 = nothing loaded yet / current sound doesn't match a saved slot
-    // (no factory-preset-0 equivalent here, unlike pad_loaded_preset_slot_).
+    // -1 = nothing loaded yet / current sound doesn't match a saved slot.
     int  granular_loaded_preset_slot_  = -1;
     char granular_preset_status_[24]   = {}; // last save/load result
-
-    // --- Pad presets (PadParamPage::Preset) -----------------------------
-    static constexpr int kMaxPadPresetSlots = 99; // must match PerformanceStore::kMaxPadPresets
-    int  pad_preset_user_slots_[kMaxPadPresetSlots] = {}; // SD user slots, ascending
-    int  pad_preset_user_slot_count_                 = 0;
-    // Browses the WHOLE list -- factory presets first (index
-    // 0..kNumFactoryPresets-1), then user slots
-    // (kNumFactoryPresets..kNumFactoryPresets+pad_preset_user_slot_count_-1).
-    int  pad_preset_cursor_          = 0;
-    bool pad_preset_slots_dirty_     = true; // forces one RefreshPadPresetSlots() on first entry
-    // Which slot the live pad settings currently correspond to, or -1 if
-    // they've been tweaked since the last load/save (or never loaded at
-    // all this session) -- same "unsaved" semantics as loaded_slot_.
-    // Starts at 1 ("New", factory preset index 0) since that's exactly
-    // what PadSynth::Init() actually applies at boot.
-    int  pad_loaded_preset_slot_     = 1;
-    char pad_preset_status_[24]      = {}; // last save/load result, shown briefly here
 };

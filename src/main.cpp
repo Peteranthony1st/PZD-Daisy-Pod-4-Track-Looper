@@ -8,9 +8,8 @@
 #include "performance_store.h"
 #include "audio_engine.h"
 #include "itcm.h"
-#include "pad_synth.h"
 #include "granular_engine.h"
-#include "fm_synth.h"
+#include "dexed_synth.h"
 
 using namespace daisy;
 
@@ -82,13 +81,6 @@ daisysp::ReverbSc DSY_SDRAM_BSS fx_reverb_shared;
 // per-layer effects above) instead of needing SDRAM placement.
 daisysp::Svf fx_master_filter_l, fx_master_filter_r;
 
-// The MIDI-played pad synth (see pad_synth.h for the CPU-budget story
-// behind its OscillatorBank/Adsr/Chorus architecture). Small enough
-// (Svf/Chorus/OscillatorBank/Adsr are all plain-SRAM-sized, no big
-// internal buffer like fx_phaser/fx_reverb_shared) to live directly in
-// ordinary SRAM, same reasoning fx_master_filter_l/r's own comment gives.
-PadSynth pad_synth;
-
 // The MIDI-played granular voice (see granular_engine.h -- monophonic,
 // two overlapping-grain layers). Small enough (Grain/Adsr/Svf state, no
 // big internal buffer of its own) to live in ordinary SRAM -- it doesn't
@@ -96,11 +88,11 @@ PadSynth pad_synth;
 // g_granular_source_l/r below).
 GranularEngine granular;
 
-// The MIDI-played FM pad instrument (see fm_synth.h) -- Pad Synth's
-// sibling, mutually exclusive with it (see Ui::IsFmEnabled()/
-// IsPadEnabled()'s own mutex comment). Same "plain-SRAM-sized, no big
-// internal buffer" reasoning as pad_synth/granular above.
-FmSynth fm_synth;
+// The MIDI-played 6-operator/10-voice DX7 clone (see dexed_synth.h --
+// real msfa engine underneath, own oldest-note-steal voice pool). Small
+// enough (Dx7Note is ~700 bytes/voice per Synth_Dexed's own build) to
+// live in ordinary SRAM.
+DexedSynth dexed;
 
 // See audio_engine.h.
 volatile bool g_audio_suspended = false;
@@ -125,23 +117,10 @@ volatile uint32_t g_btn2_releases       = 0;
 volatile float    g_btn1_held_ms        = 0.f;
 volatile float    g_btn2_held_ms        = 0.f;
 
-// Small ring buffer the pad synth's dry output is copied into every
-// block, purely for Ui::DrawOscilloscope()'s live trace on the Pad
-// screen -- same "engine writes samples, main.cpp owns the buffer"
-// convention used for the looper's own scope-style visuals elsewhere.
-constexpr size_t kPadScopeSamples = 1024;
-static float      g_pad_scope_l[kPadScopeSamples];
-static size_t      g_pad_scope_write_pos = 0;
-
 // Same convention, for GranularParamPage::Filter's own live oscilloscope.
 constexpr size_t kGranularScopeSamples = 1024;
 static float      g_granular_scope_l[kGranularScopeSamples];
 static size_t      g_granular_scope_write_pos = 0;
-
-// Same convention, for FmParamPage::Filter's own live oscilloscope.
-constexpr size_t kFmScopeSamples = 1024;
-static float      g_fm_scope_l[kFmScopeSamples];
-static size_t      g_fm_scope_write_pos = 0;
 
 // Same convention, for Screen::Mixer's own oscilloscope page -- captures
 // the actual final post-fader mix (after reverb/bypass/master filter/
@@ -199,35 +178,39 @@ void ControlTimerCallback(void*)
         if(event.type == NoteOn)
         {
             NoteOnEvent noteon = event.AsNoteOn();
-            pad_synth.NoteOn(noteon.note, noteon.velocity);
-            fm_synth.NoteOn(noteon.note, noteon.velocity);
             // TEMPORARY (Stage 1) -- same MIDI stream drives every engine
             // for now, no channel/screen-based routing yet.
             granular.NoteOn(noteon.note, noteon.velocity);
+            dexed.NoteOn(noteon.note, noteon.velocity);
         }
         else if(event.type == NoteOff)
         {
             NoteOffEvent noteoff = event.AsNoteOff();
-            pad_synth.NoteOff(noteoff.note);
-            fm_synth.NoteOff(noteoff.note);
             granular.NoteOff(noteoff.note);
+            dexed.NoteOff(noteoff.note);
         }
         else if(event.type == PitchBend)
         {
-            constexpr float kPitchBendRangeSemis = 2.f; // standard default
-            PitchBendEvent  pb                   = event.AsPitchBend();
-            float           semis = (pb.value / 8192.f) * kPitchBendRangeSemis;
-            pad_synth.SetPitchBendSemis(semis);
-            fm_synth.SetPitchBendSemis(semis);
+            // Grains has no pitch bend input (see DESIGN.md's own MIDI
+            // section) -- Dexed is the only engine that reads this.
+            // PitchBendEvent::value is already roughly centered near 0
+            // (see MidiEvent::AsPitchBend()'s own -8192 offset), not the
+            // raw 0..16383 CC value Dx7Note::compute() itself expects
+            // (see SetPitchBend14bit()'s own doc comment) -- re-center
+            // and clamp back to that range here.
+            PitchBendEvent pb  = event.AsPitchBend();
+            int32_t        raw = (int32_t)pb.value + 8192;
+            raw                = raw < 0 ? 0 : (raw > 16383 ? 16383 : raw);
+            dexed.SetPitchBend14bit((uint16_t)raw);
         }
         else if(event.type == ControlChange)
         {
             ControlChangeEvent cc = event.AsControlChange();
             if(cc.control_number == 1) // mod wheel
             {
-                float wheel01 = cc.value / 127.f;
-                pad_synth.SetModWheel01(wheel01);
-                fm_synth.SetModWheel01(wheel01);
+                // Grains has no mod-wheel input -- Dexed is the only
+                // engine that reads this (see SetModWheel01()).
+                dexed.SetModWheel01((float)cc.value / 127.f);
             }
         }
     }
@@ -246,12 +229,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // not once per layer any more, see fx_reverb_shared's comment.
     static float reverb_send_l[256];
     static float reverb_send_r[256];
-    static float pad_l[256];
-    static float pad_r[256];
     static float gran_l[256];
     static float gran_r[256];
-    static float fm_l[256];
-    static float fm_r[256];
+    static float dexed_l[256];
+    static float dexed_r[256];
 
     if(g_audio_suspended)
     {
@@ -314,32 +295,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
 
-    // Renders the pad synth's own dry stereo signal (post-chorus/filter/
-    // output-level) and adds its Send-scaled contribution into
-    // reverb_send_l/r -- see PadSynth::Process()'s own doc comment for
-    // why this writes pad_l/r rather than adding directly into out[]
-    // (main.cpp needs this exact signal for three separate consumers).
-    //
-    // Skipped entirely when disabled from Global:Pad -- see
-    // Ui::IsPadEnabled()'s doc comment. Real hardware measurement (4
-    // layers + full 8-voice Pad + Granular, all active) showed only
-    // ~11% CPU headroom left in the worst case, so this needs to be a
-    // genuine compute saving, not just muting pad_l/r after the fact.
-    if(ui.IsPadEnabled())
-    {
-        pad_synth.Process(size, pad_l, pad_r, reverb_send_l, reverb_send_r);
-    }
-    else
-    {
-        for(size_t i = 0; i < size; i++)
-        {
-            pad_l[i] = 0.f;
-            pad_r[i] = 0.f;
-        }
-    }
-
-    // Skipped entirely when disabled from Global:Granular -- same real
-    // CPU-saving reasoning as kDiagSkipPad's replacement above.
+    // Skipped entirely when disabled from Global:Granular -- a real
+    // compute saving, not just muting: gran_l/r stay at zero instead of
+    // GranularEngine::Process() ever running.
     if(ui.IsGranularEnabled())
     {
         granular.Process(size, gran_l, gran_r, reverb_send_l, reverb_send_r);
@@ -353,30 +311,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
 
-    // Mutually exclusive with Pad Synth (see Ui::IsFmEnabled()'s own
-    // mutex comment) -- same real CPU-saving skip-the-call pattern.
-    if(ui.IsFmEnabled())
-    {
-        fm_synth.Process(size, fm_l, fm_r, reverb_send_l, reverb_send_r);
-    }
-    else
-    {
-        for(size_t i = 0; i < size; i++)
-        {
-            fm_l[i] = 0.f;
-            fm_r[i] = 0.f;
-        }
-    }
-
-    // Feed the pad's own oscilloscope ring buffer (Ui::DrawPadScreen()'s
-    // live waveform trace) -- same "write every block, wrap" pattern as
-    // every other capture buffer in this project.
-    for(size_t i = 0; i < size; i++)
-    {
-        g_pad_scope_l[g_pad_scope_write_pos] = pad_l[i];
-        g_pad_scope_write_pos                = (g_pad_scope_write_pos + 1) % kPadScopeSamples;
-    }
-
     // Same for Granular's own oscilloscope (GranularParamPage::Filter).
     for(size_t i = 0; i < size; i++)
     {
@@ -384,31 +318,6 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         g_granular_scope_write_pos
             = (g_granular_scope_write_pos + 1) % kGranularScopeSamples;
     }
-
-    // Same for Fm's own oscilloscope (FmParamPage::Filter).
-    for(size_t i = 0; i < size; i++)
-    {
-        g_fm_scope_l[g_fm_scope_write_pos] = fm_l[i];
-        g_fm_scope_write_pos               = (g_fm_scope_write_pos + 1) % kFmScopeSamples;
-    }
-
-    // Recording input is live input PLUS Pad/Fm (mutually exclusive, so
-    // at most one of pad_l/r or fm_l/r is ever nonzero), summed -- so
-    // playing either synth while a layer is actively recording captures
-    // it together with the live input, same "always summed, no toggle"
-    // decision this project already made for its granular engine (since
-    // removed/shelved, but the same reasoning applies here: a live+synth
-    // mix is what someone pressing record while playing a MIDI keyboard
-    // actually wants).
-    static float mixed_in_l[256];
-    static float mixed_in_r[256];
-    for(size_t i = 0; i < size; i++)
-    {
-        mixed_in_l[i] = in[0][i] + pad_l[i] + fm_l[i];
-        mixed_in_r[i] = in[1][i] + pad_r[i] + fm_r[i];
-    }
-    const float* const       mixed_ptr_arr[2] = {mixed_in_l, mixed_in_r};
-    AudioHandle::InputBuffer mixed_in         = mixed_ptr_arr;
 
     // Each layer mixes its own dry signal directly into out[], and adds
     // its Reverb Send contribution into reverb_send_l/r (see above --
@@ -418,35 +327,42 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // not TogglePauseAll()'s own phase-locked pause: no layer's Process()
     // runs at all (no recording, no playback, no reverb-send
     // contribution), same "skip the call outright" CPU-saving pattern as
-    // ui.IsPadEnabled()/IsGranularEnabled() above.
+    // ui.IsGranularEnabled() above.
     if(looper_enabled)
     {
         float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
         for(int L = 0; L < kNumLayers; L++)
         {
-            LayerState st = layers[L].GetState();
-            bool        is_recording_ish = st == LayerState::Recording
-                                            || st == LayerState::Overdubbing
-                                            || st == LayerState::ArmedCountIn;
-            AudioHandle::InputBuffer layer_in = is_recording_ish ? mixed_in : in;
-            layers[L].Process(layer_in, out, reverb_send_ptrs, size, ticks, tempo,
+            layers[L].Process(in, out, reverb_send_ptrs, size, ticks, tempo,
                                project_speed);
         }
     }
 
-    // Pad's own dry signal into the master mix -- unconditional, same
+    // Skipped entirely when disabled from Global:Dexed -- same real
+    // CPU-saving pattern as ui.IsGranularEnabled()/IsLooperEnabled()
+    // above (a plain "don't call Process() at all", not just a mute).
+    if(ui.IsDexedEnabled())
+    {
+        dexed.Process(size, dexed_l, dexed_r, reverb_send_l, reverb_send_r);
+    }
+    else
+    {
+        for(size_t i = 0; i < size; i++)
+        {
+            dexed_l[i] = 0.f;
+            dexed_r[i] = 0.f;
+        }
+    }
+
+    // Grains' own dry signal into the master mix -- unconditional, same
     // position (before the shared reverb Process() call and the master
-    // filter) so both apply to the pad equally alongside the loops.
-    // (kDiagSkipPad above zeroes pad_l/r for this test, so this add is a
-    // harmless no-op rather than needing its own separate mute.)
+    // filter) so it applies equally alongside the loops. (Disabled above
+    // already zeroed gran_l/r, so this add is a harmless no-op rather
+    // than needing its own separate mute.)
     for(size_t i = 0; i < size; i++)
     {
-        out[0][i] += pad_l[i];
-        out[1][i] += pad_r[i];
-        out[0][i] += gran_l[i];
-        out[1][i] += gran_r[i];
-        out[0][i] += fm_l[i];
-        out[1][i] += fm_r[i];
+        out[0][i] += gran_l[i] + dexed_l[i];
+        out[1][i] += gran_r[i] + dexed_r[i];
     }
 
     const float mv           = ui.GetMasterVolume();
@@ -632,9 +548,9 @@ int main(void)
     fx_master_filter_l.Init(hw.AudioSampleRate());
     fx_master_filter_r.Init(hw.AudioSampleRate());
 
-    pad_synth.Init(hw.AudioSampleRate()); // applies its own hardcoded defaults, see pad_synth.h
     granular.Init(hw.AudioSampleRate());
-    fm_synth.Init(hw.AudioSampleRate());
+    dexed.Init(hw.AudioSampleRate());
+
     // The Stage-1 diagnostic overrides that used to force max Fill/zero
     // Gap/an always-on Scan sweep (needed back when there were no real
     // knobs to test with) are gone now that the Grain page is fully
@@ -677,11 +593,10 @@ int main(void)
 
     PerformanceStore::Init(); // mounts the SD card if one is present
 
-    ui.Init(&hw, &display, &tempo, layers, kNumLayers, &pad_synth, g_pad_scope_l,
-            kPadScopeSamples, &granular, g_granular_scope_l, kGranularScopeSamples,
-            g_granular_capture_l, g_granular_capture_r, kGranularCaptureSamples,
-            &g_granular_capturing, &g_granular_capture_write_pos, g_master_scope_l,
-            kMasterScopeSamples, &fm_synth, g_fm_scope_l, kFmScopeSamples);
+    ui.Init(&hw, &display, &tempo, layers, kNumLayers, &granular, g_granular_scope_l,
+            kGranularScopeSamples, g_granular_capture_l, g_granular_capture_r,
+            kGranularCaptureSamples, &g_granular_capturing, &g_granular_capture_write_pos,
+            g_master_scope_l, kMasterScopeSamples);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();
