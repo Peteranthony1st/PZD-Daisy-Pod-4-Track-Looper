@@ -244,24 +244,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         return;
     }
 
-    // Grains' Direct Record capture -- see g_granular_capturing's own
-    // comment above. Writes raw live input straight in, unmixed with
-    // anything else (no pad/click/reverb), same "what you'd actually
-    // plug in and pluck" intent as a sampler's own direct record.
-    if(g_granular_capturing)
-    {
-        for(size_t i = 0; i < size; i++)
-        {
-            if(g_granular_capture_write_pos >= kGranularCaptureSamples)
-            {
-                g_granular_capturing = false;
-                break;
-            }
-            g_granular_capture_l[g_granular_capture_write_pos] = in[0][i];
-            g_granular_capture_r[g_granular_capture_write_pos] = in[1][i];
-            g_granular_capture_write_pos++;
-        }
-    }
+    // Grains' Direct Record capture is applied further below, after
+    // dexed_l/r are computed -- see g_granular_capturing's own comment
+    // there for why.
 
     // Block-rate: tape-style multiplier on top of every layer's own Speed
     // and the tempo clock's own tick rate -- see Ui::GetProjectSpeed(),
@@ -319,6 +304,64 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             = (g_granular_scope_write_pos + 1) % kGranularScopeSamples;
     }
 
+    // Skipped entirely when disabled from Global:Dexed -- same real
+    // CPU-saving pattern as ui.IsGranularEnabled()/IsLooperEnabled()
+    // above (a plain "don't call Process() at all", not just a mute).
+    // Computed here, before the loop-layer block below, so dexed_l/r
+    // are already valid when mixed_in is built from them.
+    if(ui.IsDexedEnabled())
+    {
+        dexed.Process(size, dexed_l, dexed_r, reverb_send_l, reverb_send_r);
+    }
+    else
+    {
+        for(size_t i = 0; i < size; i++)
+        {
+            dexed_l[i] = 0.f;
+            dexed_r[i] = 0.f;
+        }
+    }
+
+    // Grains' Direct Record capture -- see g_granular_capturing's own
+    // comment above. Writes live input PLUS Dexed's own generated audio
+    // (not Grains' own gran_l/r -- that would be a self-capture feedback
+    // loop, capturing Grains' output back into the very buffer it's
+    // about to grain from) -- same "internally-generated audio should be
+    // capturable, not just a physical patch cable" reasoning as
+    // mixed_in below, just for Grains' own capture buffer instead of a
+    // loop layer.
+    if(g_granular_capturing)
+    {
+        for(size_t i = 0; i < size; i++)
+        {
+            if(g_granular_capture_write_pos >= kGranularCaptureSamples)
+            {
+                g_granular_capturing = false;
+                break;
+            }
+            g_granular_capture_l[g_granular_capture_write_pos] = in[0][i] + dexed_l[i];
+            g_granular_capture_r[g_granular_capture_write_pos] = in[1][i] + dexed_r[i];
+            g_granular_capture_write_pos++;
+        }
+    }
+
+    // Recording input is live input PLUS Grains/Dexed's own generated
+    // audio, summed -- so playing either instrument while a layer is
+    // actively recording captures it together with the live input, same
+    // "always summed, no toggle" decision this project already made
+    // before (Pad/Fm's own equivalent construct, since removed along
+    // with those instruments): a live+synth mix is what someone pressing
+    // record while playing a MIDI keyboard actually wants.
+    static float mixed_in_l[256];
+    static float mixed_in_r[256];
+    for(size_t i = 0; i < size; i++)
+    {
+        mixed_in_l[i] = in[0][i] + gran_l[i] + dexed_l[i];
+        mixed_in_r[i] = in[1][i] + gran_r[i] + dexed_r[i];
+    }
+    const float* const       mixed_ptr_arr[2] = {mixed_in_l, mixed_in_r};
+    AudioHandle::InputBuffer mixed_in         = mixed_ptr_arr;
+
     // Each layer mixes its own dry signal directly into out[], and adds
     // its Reverb Send contribution into reverb_send_l/r (see above --
     // the actual shared ReverbSc runs once per sample further down).
@@ -333,24 +376,14 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
         for(int L = 0; L < kNumLayers; L++)
         {
-            layers[L].Process(in, out, reverb_send_ptrs, size, ticks, tempo,
-                               project_speed);
-        }
-    }
-
-    // Skipped entirely when disabled from Global:Dexed -- same real
-    // CPU-saving pattern as ui.IsGranularEnabled()/IsLooperEnabled()
-    // above (a plain "don't call Process() at all", not just a mute).
-    if(ui.IsDexedEnabled())
-    {
-        dexed.Process(size, dexed_l, dexed_r, reverb_send_l, reverb_send_r);
-    }
-    else
-    {
-        for(size_t i = 0; i < size; i++)
-        {
-            dexed_l[i] = 0.f;
-            dexed_r[i] = 0.f;
+            LayerState st = layers[L].GetState();
+            bool       is_recording_ish = st == LayerState::Recording
+                                           || st == LayerState::Overdubbing
+                                           || st == LayerState::ArmedCountIn;
+            AudioHandle::InputBuffer layer_in
+                = is_recording_ish ? mixed_in : in;
+            layers[L].Process(layer_in, out, reverb_send_ptrs, size, ticks,
+                               tempo, project_speed);
         }
     }
 
@@ -596,7 +629,7 @@ int main(void)
     ui.Init(&hw, &display, &tempo, layers, kNumLayers, &granular, g_granular_scope_l,
             kGranularScopeSamples, g_granular_capture_l, g_granular_capture_r,
             kGranularCaptureSamples, &g_granular_capturing, &g_granular_capture_write_pos,
-            g_master_scope_l, kMasterScopeSamples);
+            g_master_scope_l, kMasterScopeSamples, &dexed);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();

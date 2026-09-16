@@ -14,6 +14,14 @@ everything else from scratch: per-layer filter/effect/reverb,
 tempo-locked count-in, a live waveform display, the whole OLED menu/UI
 layer, and SD card save/load, none of which exist in the original.
 
+**Dexed** (see its own section below) is built around **msfa**, Google's
+own real DX7 emulation core, released under the Apache License 2.0 —
+vendored unmodified into `src/msfa/` except two small additive
+introspection helpers. Its 961 factory presets are sourced from the
+official **[MicroDexed](https://codeberg.org/dcoredump/MicroDexed)**
+project's own freely-distributed SD card patch banks, the same project
+msfa's own lineage already traces through.
+
 See **Known limitations & assumptions** below for the handful of things
 that deliberately differ from the original pedal's behaviour.
 
@@ -62,18 +70,18 @@ One consistent grammar everywhere:
   (see its own section below) since there's no page-switching job left
   for it there.
 - **Click** the encoder: on Home, drills into the layer under the cursor.
-  On `Global:Fm`/`Global:Pad`/`Global:Granular`/`Global:Mixer`
+  On `Global:Dexed`/`Global:Granular`/`Global:Mixer`
   specifically, it's instead this Global page's own entry point into a
-  real top-level screen (`Screen::Fm`/`Screen::Pad`/`Screen::Granular`/
+  real top-level screen (`Screen::Dexed`/`Screen::Granular`/
   `Screen::Mixer`) — the same encoder-click gesture, just repurposed
   per-page since Home's own drill-in doesn't apply outside Home. On
-  `Screen::Fm`/`Screen::Pad`/`Screen::Granular` themselves (and every
+  `Screen::Dexed`/`Screen::Granular` themselves (and every
   other Global page), a click mutes/unmutes all 4 loop layers
   (`Ui::TogglePauseAll()`) — there's no drill-in job left for it on those
   screens, so it's free for the same mute Global pages already use.
   Unused on `Screen::Mixer` (rotate already picks the stop).
 - **Long-press** the encoder (~600ms): from Home, opens Global settings;
-  from anywhere else — including `Screen::Fm`/`Screen::Pad`/
+  from anywhere else — including `Screen::Dexed`/
   `Screen::Granular`/`Screen::Mixer` — goes back to Home.
 
 ```
@@ -81,18 +89,13 @@ Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Spee
   │                                             Effect / Reverb / Gain
   │                                                     (long-press ⤴ back to Home)
   └──(long-press)──► Global ──(rotate)──► Tempo / Filter / Reverb / File /
-       │                                    SdMgmt / Export / Fm / Pad /
+       │                                    SdMgmt / Export / Dexed /
        │                                    Granular / Looper / Mixer
        │                                       (long-press ⤴ back to Home)
-       ├──(click on Global:Fm)──► Screen::Fm ──(rotate)──► Algo / Ratio / Index /
-       │                                                   Op4 / Tune / ADSR /
-       │                                                   Chorus / Vibrato / Filter /
-       │                                                   Mix / ModAssign / Preset
-       │                                                        (click ⤴ mute loop layers)
-       │                                                        (long-press ⤴ back to Home)
-       ├──(click on Global:Pad)──► Screen::Pad ──(rotate)──► Tone / Tune / ADSR /
-       │                                                     Chorus / Vibrato / Filter /
-       │                                                     Mix / ModAssign / Preset
+       ├──(click on Global:Dexed)──► Screen::Dexed ──(rotate)──► Algo / Feedback /
+       │                                                   Vibrato / Brightness /
+       │                                                   EnvSpeed / Filter /
+       │                                                   Mix / Preset
        │                                                        (click ⤴ mute loop layers)
        │                                                        (long-press ⤴ back to Home)
        ├──(click on Global:Granular)──► Screen::Granular ──(rotate)──► Grain / Position /
@@ -105,10 +108,9 @@ Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Spee
                                                                      (long-press ⤴ back to Home)
 ```
 
-Fm and Pad are mutually exclusive (see *Per-engine on/off* below) — both
-have their own Global page and full screen, but enabling one always
-disables the other, since they fill the same "melodic voice" role and
-share one Mixer channel.
+Dexed and Grains are fully independent (see *Per-engine on/off* below) —
+each has its own Global page, full screen, and Mixer channel, and either
+can be switched on/off without affecting the other.
 
 Both knobs and both buttons are "soft" — their function depends on
 whichever page is open, and it's always shown on the OLED's footer: two
@@ -141,32 +143,18 @@ Full control map:
 | Global: File | Idle: nothing. ChoosingSave: Overwrite/Save New. BrowsingLoad chooser: Files/New, drilled-in: browse files | — | Idle: tap = reveal Save; chooser: tap = drill into file list (Files) or Back (New); elsewhere: tap = Back | Idle: tap = reveal Load; ChoosingSave/drilled-into-Load: hold 800ms = confirm |
 | Global: SD Mgmt | Folder select / file browse (same list, always "Scroll") | — | Tap = drill into folder / back up a level; hold 800ms = Duplicate the browsed file | Hold `kSdMgmtDeleteHoldMs` (1500ms) = Delete the browsed file |
 | Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
-| Global: Fm | — | — | Toggle Fm Synth on/off (mutex with Pad, see *Per-engine on/off* below) | — |
-| Global: Pad | — | — | Toggle Pad Synth on/off (mutex with Fm, see *Per-engine on/off* below) | — |
+| Global: Dexed | — | — | Toggle Dexed on/off | — |
 | Global: Granular | — | — | Toggle Grains on/off | — |
 | Global: Looper | — | — | Toggle the whole 4-layer loop system on/off (also resets `TempoClock`'s phase) | — |
 | Global: Mixer | — (entry point + at-a-glance overview grid, see *Screen::Mixer* below) | — | — | — |
-| Fm: Algo | — | — | Cycle `FastFmVoice::Algorithm` (Stack/Parallel/DualStack/YBranch) | — |
-| Fm: Ratio | Op2 ratio (quantized) | Op3 ratio (quantized) | — | — |
-| Fm: Index | Op2 index | Op3 index | — | — |
-| Fm: Op4 | Op4 ratio (quantized) | Op4 index | — | — |
-| Fm: Tune | Coarse tune, ±24 semitones | — | — | — |
-| Fm: ADSR | Attack (or Sustain) | Decay (or Release) | Knobs → Attack+Decay | Knobs → Sustain+Release |
-| Fm: Chorus | Depth | Rate | — | — |
-| Fm: Vibrato | Depth | Rate (ceiling the mod wheel scales up to, see *ModDestination*) | — | — |
-| Fm: Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Fm: Mix | Reverb send | Output level | — | — |
-| Fm: Mod Assign | — | — | Cycle `ModDestination` (Vibrato/FilterCutoff/ChorusDepth) | — |
-| Fm: Preset | Folder list: scroll folders. Inside a folder: scroll presets | — | Save / Open folder (or Select at top chooser) / Back | Tap = preview live (stays in browser); Hold 800ms = confirm + exit |
-| Pad: Tone | Registration (dark↔bright oscillator morph) | Osc gain | — | — |
-| Pad: Tune | Coarse tune, ±24 semitones | — | — | — |
-| Pad: ADSR | Attack (or Sustain) | Decay (or Release) | Knobs → Attack+Decay | Knobs → Sustain+Release |
-| Pad: Chorus | Depth | Rate | — | — |
-| Pad: Vibrato | Depth | Rate (ceiling the mod wheel scales up to, see *ModDestination*) | — | — |
-| Pad: Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Pad: Mix | Reverb send | Output level | — | — |
-| Pad: Mod Assign | — | — | Cycle `ModDestination` (Vibrato/FilterCutoff/ChorusDepth) | — |
-| Pad: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File |
+| Dexed: Algo | Cycle algorithm (quantized bucket selection, all 32) | — | Cycle algorithm back | Cycle algorithm forward |
+| Dexed: Feedback | Feedback amount (0-7) | — | — | — |
+| Dexed: Vibrato | LFO speed | LFO pitch-mod depth | — | — |
+| Dexed: Brightness | Modulator level scale (0x..2x, center = as saved) | — | — | — |
+| Dexed: EnvSpeed | All-operator envelope rate scale (0x..2x, center = as saved) | — | — | — |
+| Dexed: Filter | Cutoff | Resonance | Cycle filter mode | — |
+| Dexed: Mix | Reverb send | Output level | — | — |
+| Dexed: Preset | Folder list: scroll folders. Inside a folder: scroll presets | — | Save / Open folder (or Select at top chooser) / Back | Tap = preview live (stays in browser); Hold 800ms = confirm + exit |
 | Granular: Grain | Size (or Gap) | Fill (or Scan) | Knobs → Size+Fill | Knobs → Gap+Scan |
 | Granular: Position | Position (Grain layer's fixed anchor) | — | — | — |
 | Granular: TuneDirection | Tune (grain pitch, ±24 semitones) | Direction (Forward/Reverse/Random) | Toggle Map-to-Note | — |
@@ -176,7 +164,8 @@ Full control map:
 | Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
 | Granular: Trim | Trim start | Trim end | — | — |
 | Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
-| Mixer: Layer/Pad-or-Fm/Grains/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Mixer: Layer/Grains/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Mixer: DXD (Dexed) | Volume | — (no Pan control yet) | Knobs → Volume (no Pan to toggle) | Knobs → Reverb send |
 | Mixer: Master | Volume | Reverb size | — | — |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
@@ -418,8 +407,8 @@ center) on boot and after `Load()`, never persisted to `PERF/*.DAT`.
 
 ## MIDI
 
-Two MIDI-played instruments — Pad Synth and Grains, both described below
-— run alongside the looper, driven by the Pod's built-in MIDI IN jack
+Two MIDI-played instruments — Dexed and Grains, both described below —
+run alongside the looper, driven by the Pod's built-in MIDI IN jack
 (`hw.midi`, a `MidiUartHandler` on the Pod's UART). One real hardware
 quirk this needed working around: libDaisy's default MIDI transport
 config claims the same physical pin as the encoder's own click button
@@ -439,366 +428,285 @@ audio block ever seeing the note as held — a silent note instead of a
 short blip. Pitch bend updates read more naturally at this steady rate
 too, for the same reason.
 
-- **NoteOn/NoteOff** currently drive **both** Pad Synth and Grains from
+- **NoteOn/NoteOff** currently drive **both** Dexed and Grains from
   the same incoming stream — there's no per-engine MIDI channel or
   screen-based routing yet (flagged in `main.cpp` as a temporary,
   first-pass simplification). Playing a note plays it on whichever
-  engines are enabled (see *Per-engine on/off* below) — Pad Synth and
-  Fm Synth both receive it (only one is ever actually enabled at a time,
-  see their mutex), and so does Grains.
-- **Pitch bend** (±2 semitones, the MIDI standard default) feeds Pad
-  Synth and Fm Synth (`SetPitchBendSemis()` on each) — Grains has no
-  pitch bend input.
-- **Mod wheel** (CC1) feeds Pad Synth's and Fm Synth's own mod-wheel-
-  assignable destination (Vibrato/FilterCutoff/ChorusDepth, see below,
-  each engine has its own independent assignment) — Grains has no mod
-  wheel input.
+  engines are enabled (see *Per-engine on/off* below).
+- **Pitch bend** (±2 semitones, the MIDI standard default) feeds Dexed
+  — Grains has no pitch bend input.
+- **Mod wheel** (CC1) feeds Dexed's own vibrato (real DX7 LFO pitch-mod
+  depth, gated by the wheel same as real DX7 hardware) — Grains has no
+  mod wheel input.
 
 ## Per-engine on/off
 
-`Global:Fm`/`Global:Pad`/`Global:Granular`/`Global:Looper` each carry a
-plain Button-1-tap on/off toggle (`fm_enabled_`/`pad_enabled_`/
-`granular_enabled_`/`looper_enabled_`) — a real CPU lever, not just a
-mute: `AudioCallback()` skips calling that engine's `Process()` entirely
-while disabled and writes silence instead, so someone using only Grains
-(say) genuinely gets the other engines' CPU share back, not just their
-silence. Switching the looper off also resets `TempoClock`'s phase
-(bar/beat position, count-in state, click envelope) back to bar 1 beat 1,
-so turning it back on always resumes cleanly rather than picking up
-mid-phase from wherever it happened to be frozen.
+`Global:Dexed`/`Global:Granular`/`Global:Looper` each carry a plain
+Button-1-tap on/off toggle (`dexed_enabled_`/`granular_enabled_`/
+`looper_enabled_`) — a real CPU lever, not just a mute:
+`AudioCallback()` skips calling that engine's `Process()` entirely while
+disabled and writes silence instead, so someone using only Grains (say)
+genuinely gets Dexed's own CPU share back, not just its silence.
+Switching the looper off also resets `TempoClock`'s phase (bar/beat
+position, count-in state, click envelope) back to bar 1 beat 1, so
+turning it back on always resumes cleanly rather than picking up
+mid-phase from wherever it happened to be frozen. Both default **off** on
+boot — a real toggle exists for each, so there's no reason for either to
+be making sound before it's asked to.
 
-**Fm and Pad are mutually exclusive** — `fm_enabled_`/`pad_enabled_` are
-enforced as a real mutex, not just two independent toggles that happen to
-usually be used one at a time: toggling either one's Button 1 on
-`Global:Fm`/`Global:Pad` forces the other off. They fill the same
-"melodic voice" role and share one Mixer channel (see *Screen::Mixer*
-below), so there's no meaningful case for both being live simultaneously
-— unlike Grains, which is independent of both and can run alongside
-either.
+Dexed and Grains are fully independent — no mutex, unlike the earlier
+Pad Synth/Fm Synth pair they replaced (which shared one "melodic voice"
+role and one Mixer channel, and were kept mutually exclusive as a
+result). Dexed's own real 6-operator DX7 emulation made both of those
+from-scratch approximations redundant at once rather than needing a
+third alongside them, so there's no remaining case where two competing
+melodic engines need to be kept from overlapping.
 
-## Fm Synth (Screen::Fm)
+## Dexed (Screen::Dexed)
 
-A MIDI-played, polyphonic FM instrument (`fast_fm_voice.h`, `fm_synth.h/
-.cpp`) built as Pad Synth's sibling and eventual CPU-cheaper alternative,
-not a full replacement — see *Per-engine on/off* above for how the two
-coexist via a mutex. Ownership model, page/knob conventions, and most
-member names are deliberately mirrored 1:1 from `pad_synth.h` so its own
-Ui pages/`KnobContext`/save-load plumbing carry over with minimal
-changes (ModDestination routing, curved-seconds ADSR, linear pan law,
-etc.) — not repeated here where they're identical.
+A MIDI-played, real 6-operator, 10-voice DX7 clone (`dexed_synth.h/.cpp`)
+built around a vendored copy of Google's own **msfa** (`src/msfa/`,
+Apache-2.0 — the same DX7 emulation core Google's official open-source
+`dexed`-lineage synths trace back to), replacing both Pad Synth and Fm
+Synth outright rather than sitting alongside either — a real DX7 clone
+makes both of those earlier from-scratch approximations redundant at
+once, and unlike them, Dexed and Grains are fully independent (no mutex
+— Dexed's own on/off toggle doesn't touch Grains' or vice versa).
 
-**Why FM, and why it took several real-hardware measurement rounds to
-get right**: the motivating question was whether FM synthesis could
-support more simultaneous voices than Pad Synth's own divide-down
-oscillator-bank approach for the same CPU budget. The honest answer
-turned out to be "yes, but only once two real bugs were found and fixed,
-and the answer isn't a big margin" — worth recording in full since the
-same class of bug (code silently landing in slow QSPI flash instead of
-fast ITCM memory) has now bitten this project twice.
+**Why msfa, not another from-scratch FM voice**: after building and
+tuning two increasingly-elaborate custom FM engines in turn (Pad Synth's
+oscillator-bank approach, then Fm Synth's own lookup-table 4-operator
+voice — see project history for both), the real DX7's own operator
+algorithms, envelope behavior, and parameter ranges turned out to be
+worth having exactly right rather than approximated again a third time.
+msfa is the genuine article: the same 32 real algorithms, the same
+per-operator envelope/keyboard-scaling/velocity-sensitivity model, real
+patch data ported directly from real DX7 SysEx dumps rather than
+hand-guessed. No GPL'd decoder/UI code was ported alongside it — msfa's
+own `synth.h` deliberately excludes the packed-SysEx conversion and
+patch-editor logic that lived in the original (GPLv3) Dexed plugin, so
+everything UI/preset/SysEx-adjacent in this project (`dexed_sysex.h/
+.cpp`'s packed↔unpacked converter, the whole preset/macro/UI layer
+below) is this project's own, written directly from the public 1993
+Yamaha MIDI SysEx spec.
 
-1. **Stock `daisysp::Fm2` measured worse than Pad Synth, not better** —
-   32% CPU for 6 voices in isolation (vs Pad's own 25% for 6), because
-   `Fm2`'s `Oscillator` calls `sinf()` twice per sample per voice with no
-   hardware transcendental unit backing it on this chip.
-2. **A custom lookup-table sine oscillator (`FastFmVoice`)**, table size
-   256 with linear interpolation (same idiom as Grains' own Hann window),
-   measured 10% for a 2-operator/6-voice version — confirming `sinf()`
-   was the real cost, not FM synthesis itself.
-3. **Voice/operator count was tuned by direct measurement, not
-   estimation** — 4 operators at 6 voices measured 21%, at 8 voices 28%;
-   2 operators at 12 voices measured 28% with unclear polyphony value.
-   **8 voices × 3 operators, at 20%**, was settled on as the balance
-   (more voices AND still cheaper than Pad Synth's own 6-voice engine) —
-   until operator count later grew to 4 (see point 5 below) and the
-   voice count was revisited (point 6).
-4. **A real cache-thrashing bug, found via the CPU number itself
-   spiking** (measured ~21% cold, climbing to 57-64% after Pad Synth had
-   also run for a while): each `FastFmVoice` instance originally owned
-   its own private ~1KB sine table, so 6-8 separate copies were scattered
-   through memory. Every time Pad Synth's own `Process()` (touching
-   plenty of its own SRAM state) ran in the same audio block, it evicted
-   those tables from cache, forcing the FM loop to reload from a
-   different location per voice on the next block. Fixed by making the
-   table a single shared function-local `static` array
-   (`FastFmVoice::SineTable()`), built lazily once across every instance
-   — single-core, so no thread-safety concern, since `Init()`/`Process()`
-   only ever run from the same audio context.
-5. **A 4th operator, and a genuinely richer algorithm set, added once 3
-   operators felt musically thin** (see *Algorithms* below) — measured
-   safe to add given the 8-voice/3-op number's own headroom, at the cost
-   of revisiting the voice count once more (point 6).
-6. **A second real ITCM/QSPI placement bug, found from a user report of
-   "the screen goes sluggish when Fm is active"**, not a proactive
-   measurement this time. `FmSynth::Process()` is tagged `DSY_ITCM_TEXT`
-   (see *Boot process* below for what that means and why it matters), but
-   the actual hot inner loop it calls — `FastFmVoice::Process()`,
-   `ReadTable()`, `WrapPhase()`, `SineTable()`, and `SetFrequency()` —
-   are all defined inline in a header and were relying on the compiler
-   choosing to inline them into that one ITCM-tagged function. Once the
-   4th operator and 4 algorithm branches (point 5) grew `Process()`
-   enough, the compiler evidently stopped inlining all of it, and any
-   call left out-of-line silently fell back to QSPIFLASH — dramatically
-   slower per-instruction than ITCM. The tell: Fm's own measured CPU cost
-   stayed high (~50%+) even with **no notes held**, which only makes
-   sense if the cost is in how slowly the code executes rather than how
-   much DSP work it's doing, since every voice always runs its full
-   operator math regardless of note state. Fixed with
-   `__attribute__((always_inline))` on the small helpers (a plain
-   `DSY_ITCM_TEXT` tag on them directly hits a *different* real GCC
-   error — "section type conflict" — since mixing a `static` and a
-   non-`static` member function, or a header-inline function and a
-   regular out-of-line one, under the same explicit linker section gets
-   different COMDAT/linkage treatment that GCC refuses to merge; forcing
-   inlining sidesteps this by leaving no separate out-of-line symbol at
-   all). This recovered a real, measured ~30% relative reduction in Fm's
-   own CPU share (worst-case ~51-59% down to ~40-45%) with zero behavior
-   change — pure code-placement, same lesson as the original `BOOT_QSPI`
-   migration's own `PitchShifter` gap (see *Boot process* below).
-7. **Voice count dropped from 8 to 6** after the above, once real
-   hardware testing showed the screen was "a little less sluggish" but
-   not fully back to normal even with both ITCM fixes in — the same
-   voice-for-headroom trade already made once for the original balance,
-   just re-applied now that 4 operators cost more per voice than 3 did.
-   Measured **~52-57% Fm-alone CPU** (idle/playing) at 6 voices, and
-   **~63% total with 3 loop layers actively playing back alongside it**
-   — confirmed on hardware as "much better."
+**Voice architecture**: `kMaxVoices = 10`, oldest-note-steal (matching
+every other engine's own voice-stealing convention), each backed by
+msfa's own `Dx7Note`. `patch_[156]` (msfa's unpacked patch layout) is
+shared by every voice — there's no per-voice patch copy — so switching
+or previewing a preset is a single write that every currently-held note
+picks up on its next `update()` call, not a per-voice re-copy.
 
-**Algorithms** (`FastFmVoice::Algorithm`, cycled on the dedicated Algo
-page, shown as a small Yamaha-DX7-style routing diagram): every algorithm
-runs the exact same 4 operators' worth of table-lookup-and-phase-math per
-sample regardless of which is selected (`Process()` always does exactly
-4 `ReadTable()` calls and 4 phase advances), so switching is a real,
-essentially-free sound-design choice, not a CPU trade-off.
+**A real cross-ISR race condition, found from real-hardware note
+dropouts during fast playing**: `NoteOn()`/`NoteOff()` are called from
+`ControlTimerCallback` (TIM5, a genuinely lower NVIC priority than the
+audio DMA ISR), and perform real multi-step, non-atomic mutations to a
+voice's `Dx7Note` state (`init()`/`keyup()`). `RenderQuantum()`, running
+from the higher-priority audio ISR, reads that same voice state every 64-
+sample quantum and can genuinely preempt a `NoteOn()`/`NoteOff()` call
+mid-mutation — dropping or corrupting a note when playing fast enough
+for the two to actually collide. Fixed with tight `__disable_irq()`/
+`__enable_irq()` critical sections around just the actual voice-mutating
+calls (not the surrounding voice-search logic) in `NoteOn()`, `NoteOff()`,
+and `ApplyPatchToHeldVoices()` (also reachable from the equally-
+preemptable main-loop context via the UI's own knob-driven setters).
 
-- **Stack**: Op4 → Op3 → Op2 → Op1/carrier, one deep serial chain — the
-  most complex/evolving single-path timbre.
-- **Parallel**: Op2, Op3, and Op4 all modulate the carrier directly and
-  independently, summed — the widest/densest single-carrier tone
-  available.
-- **DualStack**: two fully independent 2-operator chains, both carriers,
-  summed and halved (Op2→Op1 and Op4→Op3) — more additive/detuned-pair
-  character than a single modulated carrier. Real classic FM electric
-  pianos use close to this shape (two "towers," one warm/lightly
-  modulated for the sustained body, one bright/heavily modulated for the
-  struck transient) — see *Presets* below.
-- **YBranch**: Op3 and Op4 both modulate Op2 in parallel, and Op2's own
-  (doubly-modulated) output then modulates Op1/carrier — a fork feeding a
-  chain, richer than Stack's single-modulator-per-stage without the
-  extra carrier Parallel/DualStack add.
+**A follow-on regression from that same fix**: `Ui::KnobPickUp()` has no
+"did this actually change" check of its own — once engaged, it
+unconditionally re-applies the setter on every single main-loop tick,
+harmless for every other engine's own cheap float-assignment setters, but
+this meant `ApplyPatchToHeldVoices()`'s new critical section was firing
+at the full main-loop tick rate for as long as any Dexed knob stayed
+engaged, and with several notes held, the cumulative disabled-interrupt
+time was enough to cause fresh dropouts. Fixed with explicit "value
+actually changed" guards in `Ui::ApplyKnobs()` specifically for Dexed's
+expensive setters (Feedback/Vibrato compare the resolved byte value;
+Brightness/EnvSpeed use a small float epsilon) — Filter/Mix's own
+setters are left unguarded, since those are cheap plain-float
+assignments like every other engine's.
 
-The Algo page's diagram lays these out vertically (modulator above the
-operator it feeds, carriers dropping a stub onto a shared "OUT" line),
-matching the actual convention real DX7-family charts use — Stack's
-4-deep chain snakes through a 2x2 grid rather than one tall column, since
-a single column of legibly-sized boxes doesn't fit this display's height,
-which turns out to be exactly how real charts handle their own longer
-chains too. The Ratio/Index/Op4 pages each additionally show a compact
-one-line routing summary (e.g. `Route: 4>3>2>1` for Stack) above their
-oscilloscope, since which stage Op2/Op3/Op4 actually feed changes
-per-algorithm and the static "Op2"/"Op3"/"Op4" labels alone don't convey
-that.
+**Output level, headroom, and the post-mix filter**: `Process()` reads
+msfa's own Q24 fixed-point render output (`kQ24Scale = 1/(1<<24)`), then
+an empirically-measured `kHeadroomScale` correction — a single hand-tuned
+worst-case test patch first suggested `1/4.41`, but real hardware testing
+with actual factory patches (several using feedback, and real chords
+beyond 3 notes) showed that margin was still too tight, engaging the
+final `tanhf()` soft limiter hard enough to audibly compress even a
+single patch played alone; doubled to `1/8.82`, confirmed clean up to
+full master volume. A `daisysp::Svf` pair (mirroring `GranularEngine`'s
+own bus-filter shape) sits post-mix, pre-limiter, so a resonant peak is
+still caught by the safety net rather than clipping past it. Dexed has
+no Pan control yet (see *Screen::Mixer* below for what that means for
+its own Mixer channel) — a later increment.
 
-**Ratio quantization**: Op2/3/4's ratio (relative to the carrier, which
-is always fixed at 1:1 with the held note) is quantized to a 10-entry
-table of musically-clean multipliers (0.5, 1, 1.5, 2, 3, 4, 5, 6, 7, 8x),
-not a continuous sweep — a real, user-reported bug ("sounds quite out of
-tune") traced to exactly this: FM only sounds harmonic when a
-modulator's frequency is a clean multiple of the carrier's, and a
-continuous knob almost never lands on one, producing inharmonic,
-clangorous overtones by default. Real FM hardware avoids this with a
-stepped "coarse" ratio control rather than a sweep, for the same reason.
-`SetOp2Ratio01()` etc. still take a plain 0..1 knob position, quantizing
-to the nearest table entry with the project's usual bucket-center
-rounding convention; `GetOp2Ratio()` etc. return the resolved multiplier
-for display. Fixing this also surfaced a genuine pre-existing type bug:
-`op2_ratio_idx_`/`op2_ratio_` had been declared on one shared `int, int`
-multi-declarator line, silently truncating every fractional ratio to its
-integer part.
+**Macros — Brightness and Envelope Speed**: both bipolar, knob-center
+(0.5) = "exactly as the loaded preset stored it," scaling relative to a
+`patch_baseline_[156]` snapshot taken whenever a preset actually loads
+(not relative to whatever the knob did last, so repeatedly nudging
+Brightness back to center always returns to the *preset's own* sound,
+not some drifted intermediate state). Both use
+`FmCore::get_operator_routing()`/`get_carrier_operators()` to identify
+which operators to scale generically for whichever of the 32 algorithms
+is loaded, rather than 32 hand-authored per-algorithm tables:
+- **Brightness** scales every non-carrier (modulator) operator's output-
+  level byte together, carriers untouched — 0x at the bottom of its
+  range, unchanged at center, 2x at the top.
+- **Envelope Speed** scales all 6 operators' 4 rate bytes together, same
+  0x/1x/2x curve.
 
-**Index/depth**: mapped linearly 0..5 per operator (matching
-`daisysp::Fm2`'s own "5 = a full 2π radians of phase excursion"
-convention) — depth/amount has no "in tune" concept the way ratio does,
-so a continuous sweep is correct here.
+Both call `Dx7Note::update()` (never `init()`) on every currently-held
+voice after writing the scaled bytes into `patch_` — genuinely
+click-free, confirmed on real hardware: `update()`'s own `Env::update()`
+doesn't reset the envelope's `level_` or restart the attack, it only
+retargets from wherever the envelope already is.
 
-**Presets** (`FmSynth::FmPresetData`, `kNumFactoryPresets = 36`): unlike
-the 3-operator version's initial "no factory range yet" state, this
-engine now ships 36 hand-tuned patches across 8 named categories (Basic,
-E.Piano, Bells, Mallets, Bass, Brass, Pad, Lead — `kFactoryCategories` in
-`fm_synth.cpp`), grouped as contiguous ranges of the same flat
-`kFactoryPresets` array `GetFactoryPreset()`/`LoadFmPreset()` already
-address by a single 1-based slot number (the category grouping is purely
-a UI browsing aid layered on top, not a different storage shape — see
-*Preset folder browsing* below). Designed from real classic-FM-synth
-patch references (DX7/TX81Z-era electric pianos, bells, basses, brass),
-not just guessed: notably, several bell/glass/metallic patches (Church
-Bell, Glass Bells, Tubular Bell, Music Box, Metallic Pluck) were
-corrected to root one operator on a **1.5x ratio** rather than a clean
-integer one, since real bell/inharmonic FM patches rely on a ratio close
-to √2 (~1.4:1) for their characteristic detuned quality — any integer
-ratio, even a high one, is still harmonic and reads more like a bright
-buzz than an actual bell. 1.5x is this project's closest quantized match
-(see *Ratio quantization* above for why the table doesn't include 1.4
-directly). The electric-piano-family patches (Classic E.Piano, Soft EP,
-Bright EP, Slap Bass, Marimba, Kalimba, Bright Lead) lean on DualStack's
-two-tower shape for exactly the reason described under *Algorithms*
-above.
+**A real, previously-latent bug found while building the Algo page's
+diagram**: `FmCore::get_carrier_operators()` (msfa/fm_core.cpp) checked
+only the `OUT_BUS_ADD` flag bit, which actually means "sum into my
+target rather than overwrite it" — a flag also set on plain modulators
+that sum into a shared bus (used by several converging algorithms, e.g.
+16-18) — not "carrier" specifically. Decoding all 32 real algorithms
+directly confirmed this over-reported carriers on 15 of the 32. Fixed to
+check `outbus == 0` (writes straight to the final mix, exactly what
+`render()` itself checks), which is what the Brightness macro above and
+the Algo diagram below both now rely on.
 
-**Preset folder browsing** (`FmParamPage::Preset`, `Ui`'s
-`fm_preset_folder_cursor_`/`fm_preset_folder_open_`): the Load side of
-the usual Files/New chooser (see *The Files/New Load chooser* below)
-gains one extra level here versus Pad's own flat numbered list — a
-folder list (the 8 named categories plus one trailing synthetic "User"
-folder holding every SD-saved slot) is browsed first, then Button 1
-opens the highlighted folder to browse the presets inside it, or backs
-back out to the folder list if one's already open. `fm_preset_cursor_`
-means "index within the currently open folder" here, not a flat index
-across everything — resolved to an actual slot via
-`Ui::ResolveFmPresetSlot()` (a factory category's local index through
-`FmSynth::GetFactoryCategorySlot()`, or `fm_preset_user_slots_[cursor]`
-for the User folder). Entering `BrowsingLoad` fresh always resets back to
-the folder list, never wherever it was last left drilled into.
+**Algorithm diagram (`DexedParamPage::Algo`)**: a real, generic box-and-
+arrow diagram of whichever of the 32 real algorithms is loaded, laid out
+fresh from `FmCore::get_operator_routing()`'s per-operator bus data —
+not 32 hand-drawn pictures. The routing graph (which operator feeds
+which bus, and in what order, exactly matching msfa's own sequential
+`render()` processing) is reconstructed into a column (independent
+chain)/row (depth from that chain's root) layout; a parent feeding more
+than one child branches the later child(ren) into a fresh column instead
+of overlapping the first; a converging algorithm (multiple parents into
+one child) centers that child between its parents' columns. Every
+connector is strictly horizontal/vertical (a straight drop for a same-
+column parent, an elbow — down to the child's own row height, then
+sideways into the middle of its near side edge — for a cross-column one)
+by explicit design constraint, not a limitation: it keeps the diagram
+legible on a 128x64 monochrome display without needing a curve renderer.
+Filled boxes are carriers, outline boxes are modulators (the operator
+number punched through as "off" pixels on a filled box so it still
+reads); a horizontal "OUT" bus line collects every carrier's drop; the
+one operator (if any) with real self-feedback — both `FB_IN` and
+`FB_OUT` set, confirmed from the routing data to always be a single
+self-loop on one chain-root operator, never split across two — gets an
+explicit "FB" text tag beside it (a small pixel bracket was tried first
+and read poorly at this box size; feedback operators are always chain
+roots with no incoming edges, so their side edges are always free for
+this). Algorithm can be cycled three ways: Knob 1 (quantized bucket
+selection across all 32, soft pickup), Button 1 (step back), Button 2
+(step forward).
 
-**Live preview while browsing** (`HandleButton2()`'s `Screen::Fm` case):
-once a folder is open and a preset is highlighted, a *short* Button 2 tap
-applies it to the live engine immediately without leaving the browser or
-resetting `save_load_mode_` — added specifically so scrolling Knob 1 and
-tapping Button 2 repeatedly auditions one preset after another while
-searching for a sound, instead of needing to fully commit-and-re-enter
-the Save/Load flow for every single preset tried. Button 2's *hold*
-gesture still does the same load AND exits back to `Idle`, for once
-you've settled on one — the footer label switches to "Prev./Hold=Load"
-in this state to make both behaviors visible on screen.
+**Factory presets — 961 across 15 folders, real sourced data, never
+invented**: sourced from the official MicroDexed project
+(`codeberg.org/dcoredump/MicroDexed`, `addon/SD/` — the same project
+this whole port's msfa lineage already traces through), each a real,
+standard 32-voice SysEx bulk-dump bank. 11 folders organized by real
+sound type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/
+Perc/Choir/Bells — `kDexedFactoryCategories` in `dexed_factory_data.cpp`,
+two source banks each, 64 voices, except Perc at 65 — see below), plus 4
+more, **Rom 1** through **Rom 4**, each the real, unsorted 64-voice
+contents of an actual Yamaha factory ROM cartridge pair (ROM1=1A+1B ...
+ROM4=4A+4B) kept in their own original folders rather than re-sorted by
+sound type. Real quality/popularity rankings for DX7 patches aren't
+something that can be sourced reliably, so the ROM folders stand in as
+an objective proxy instead — genuine factory data every real DX7 shipped
+with (ROM1) or that Yamaha sold as official cartridges (ROM2-4). One
+single voice (the classic ROM1A "MARIMBA") was hand-picked into the Perc
+folder on top of its two source banks, after a user report that no
+marimba sound existed anywhere in the set. Stored as raw 128-byte-per-
+voice **packed** payloads (never pre-expanded and held in flash/RAM
+unpacked) — `DexedSynth::GetFactoryPreset()` unpacks on demand via
+`DexedSysex::UnpackVoice()`, verified byte-exact via a native (non-
+embedded) round-trip test against real bank data before ever being
+embedded.
 
-**Voice count**: `kMaxVoices = 6` (see the CPU-measurement story above
-for why, down from an initial 8) — every loop/array in the class already
-keys off this one constant, so it's the only line that needs to change
-if the trade-off is revisited again.
+**Duplicate factory names, and why some folders auto-number them**: real
+factory banks occasionally have a long run of voices someone saved
+without ever renaming from a generic default (the Bells folder's source
+bank has ~30 voices literally all named bare "BELL") — indistinguishable
+from each other while scrolling the preset browser, confirmed by a real
+user report. `DexedSynth::GetFactoryPresetName()` disambiguates any name
+that repeats anywhere within its own category with a running " N" suffix
+(numbering every occurrence, including the first, so no two presets in
+the same folder ever display identically) — a display-only fix; the
+underlying patch data/sound is untouched.
 
-**Voice allocation, Tune, Envelope, Chorus, Vibrato, Filter, Mix, Pan**:
-identical to Pad Synth's own (see below) — same oldest-note voice
-stealing, same curved-seconds ADSR convention, same one-shared-Chorus-
-instance bus effect, same mod-wheel-gated triangle-LFO vibrato, same
-bus-level `Svf` filter pair, same linear pan law. Not repeated here.
+**Preset data & save/load** (`DexedSynth::DexedPresetData`): patch bytes
+plus `reverb_send01`/`output_level01`/filter mode+cutoff+resonance — a
+flat snapshot via `ApplyPreset()`/`CapturePreset()`, the same shape every
+other engine's own preset struct already uses. `output_level01` defaults
+to **0.6** (not 1.0), and since factory presets never set this field
+themselves, that's the level every one of the 961 factory presets
+actually loads at. User presets save/load to `DEXP/PRESnnn.DAT` via
+`PerformanceStore` (up to `kMaxDexedPresets = 1200` total slot numbers,
+headroom above the 961 factory presets for up to ~239 of your own) — the
+factory range is served straight from `GetFactoryPreset()` with zero card
+I/O and, unlike the user range, is never subject to Delete/Duplicate's
+own slot-renumbering (`CompactSlotsAfterDelete()` is fundamentally
+incompatible with a fixed factory bank, the same reasoning Grains'
+preset range already established).
 
-## Pad Synth (Screen::Pad)
+**Preset folder browsing & live preview**: identical two-level
+folder-then-preset browsing, and the identical "a short Button 2 tap
+while a folder's open previews the highlighted preset live, without
+resetting `save_load_mode_`" behavior, as the removed Fm Synth's own
+preset browser — confirmed directly from that engine's own source
+(`git show fm-synth-experiment:src/ui.cpp`) that live preview and commit
+were always literally the same function call, just with or without also
+exiting back to `Idle`; reused as-is here rather than redesigned.
 
-A MIDI-played, polyphonic pad instrument (`pad_synth.h/.cpp`), meant for
-warm/lush sustained sounds (chords held via a MIDI keyboard), not a
-percussive/plucked instrument. Owns its own DSP state directly as
-members, the same ownership model `LooperLayer` already uses for its own
-`Svf` filter pair — a single self-contained instrument with its own
-filter/level/send, not a cross-cutting bus effect like `main.cpp`'s
-master filter.
+**Filter/Mix**: one bus-level `Svf` pair (post-mix, pre-limiter, see
+above) and Reverb Send/Output Level, both reachable identically from
+Dexed's own Mix page and from `Screen::Mixer`'s DXD channel — same
+underlying value either way.
 
-**Architecture, proven cheap on real hardware before this class was
-written** (measured directly in `main.cpp` with the same DWT
-cycle-counter technique used throughout this project): `kMaxVoices` ×
-`daisysp::OscillatorBank` (a divide-down organ/"string synth" oscillator
-— no transcendental calls at all in its `Process()`), each with its own
-`daisysp::Adsr` envelope (also pure arithmetic per sample), plus ONE
-shared `daisysp::Chorus` on the summed bus. At 8 voices this cost 49%
-worst-case CPU alongside a full 4-layer loop + reverb already playing.
-`daisysp::StringVoice` (Karplus-Strong) was measured and ruled out
-instead — a SINGLE voice alone cost 68% (two `powf()` + one `atanf()`
-every sample, unconditionally), which is why the additive/organ approach
-was chosen over a plucked-string model.
+**On by default? No** — `dexed_enabled_` defaults to **false**
+(`Global:Dexed`'s own Button 1 toggle turns it on), matching Grains' own
+default-off convention now that a real toggle exists — early in this
+engine's development it defaulted on, back when no toggle existed yet to
+turn it off.
 
-**Voice count**: `kMaxVoices` was reduced from 8 to **6** after measuring
-the genuine worst case with everything running at once (4 loop layers +
-reverb + full Pad Synth + Grains, all simultaneously active) at ~94% —
-a direct, proportional trade-off of polyphony for headroom, not a free
-optimization. Every loop/array in the class already keys off this one
-constant, so this is the only line that needs to change if that
-trade-off is revisited (e.g. under the FM-synth experiment mentioned in
-project history, where a cheaper per-voice cost might afford more
-voices back).
+**Recording Dexed (and Grains) into a loop layer**: `main.cpp`'s
+`AudioCallback()` sums live input with Grains' and Dexed's own generated
+audio into a `mixed_in_l/r` buffer, and each loop layer's `Process()`
+call uses that mixed buffer instead of plain `in` only while that
+specific layer is actually `Recording`/`Overdubbing`/`ArmedCountIn` —
+layers just playing back always get plain `in`. This exact mechanism
+existed before Pad/Fm's removal (as `mixed_in`, feeding Pad/Fm's own
+output into recordings) and was deleted along with them under the
+incorrect assumption that it existed only for those two instruments — it
+also covered Grains (a real regression, since fixed) and needed
+extending to cover Dexed too. Grains' own separate "Direct Record"
+capture feature (its own dedicated live-input-into-Grains'-buffer path,
+independent of the loop layers) was extended the same way, to also
+include Dexed's generated audio (not Grains' own — that would be a
+self-capture feedback loop).
 
-**Voice allocation**: `FindVoiceForNote()` prefers an already-silent
-voice (its `Adsr` in `ADSR_SEG_IDLE`) that isn't currently held, then a
-genuinely free (never-triggered) voice, then falls back to stealing the
-oldest currently-held voice (`triggered_at`, a simple monotonic counter)
-— standard oldest-note voice stealing, no special-casing beyond that.
-
-**Tone/Registration**: `SetRegistration01()` is a single-knob morph
-between a hand-tuned "dark" (weighted toward 8'/4' organ stops) and
-"bright" (weighted toward 2'/1') `OscillatorBank` amplitude vector,
-applied identically to every voice — a property of the instrument's
-overall character, not a per-note thing.
-
-**Tune**: a coarse ±24-semitone transpose, discretized the same way
-Grains' own `GetGrainTuneSemitones01()` is (see *Grains* below and its
-bucket-center rounding note) — recomputed at control-rate
-(`tune_rate_ = powf(2, semitones/12)`), not per sample, same as pitch
-bend's own `bend_ratio_`.
-
-**Envelope**: attack/decay/release use the project's existing curved-
-seconds convention (`kMinAdsrSeconds`=5ms .. `kMaxAdsrSeconds`=3s,
-exponential) so a knob's physical travel doesn't visually "do nothing"
-for most of its range the way a raw-01-to-seconds mapping would — the
-same math already backing the ADSR-shape graph drawn on screen.
-
-**Chorus**: one shared `daisysp::Chorus` instance on the summed voice
-bus (Depth/Rate knobs), not per-voice — the same "one shared instance,
-not N" reasoning as the loop layers' shared reverb bus.
-
-**Vibrato**: a cheap phase-accumulator triangle LFO (not a
-`daisysp::Oscillator` instance — this project already has the identical
-`phase_ += inc; wrap` pattern elsewhere, e.g. `TempoClock`), scaling
-fractional FM up to `kVibratoMaxDepthFraction` (0.06, ≈1 semitone at
-full depth). The mod wheel gates/scales it (wheel at 0 = no vibrato
-regardless of the Depth knob, wheel at 1 = the full Depth-set amount) —
-Vibrato has no meaningful "always-on" base the way Filter/Chorus's mod
-destinations do, so this is a ceiling-and-scale relationship, not an
-additive one.
-
-**Mod wheel destinations** (`ModDestination`, cycled by the Preset
-page's neighbor, Mod Assign): Vibrato (see above), FilterCutoff, or
-ChorusDepth — the wheel routes additively on top of whichever page's own
-knob as the base value for the latter two; Vibrato is the one exception
-(no separate base, a still wheel means no vibrato at all).
-
-**Filter**: one bus-level `Svf` pair (post-chorus, pre-reverb-send),
-independent of `main.cpp`'s own master-bus filter, sharing the same
-`FilterMode`/curve it uses.
-
-**Mix**: Reverb Send and Output Level, both reachable identically from
-this engine's own Mix page and from `Screen::Mixer`'s Pad channel — same
-underlying value either way, so changing it in one place updates the
-other with no extra sync needed.
-
-**Pan**: linear pan law (`panL = 1-v`, `panR = v`), the same law
-`LooperLayer::SetPan01()` uses — kept consistent so Pad Synth pans the
-same way the loop layers do at the same knob position, rather than a
-"nicer" equal-power curve that would behave differently from everything
-else in the mix. Applied to both the dry output and the reverb send
-(post-pan), again matching `LooperLayer`'s own `Process()`.
-
-**Presets** (`PadSynth::PadPresetData`): a flat snapshot of every
-setting above. 14 hand-tuned factory presets are embedded in firmware
-(not SD files), always available even on a blank/unformatted card —
-index 0 ("New") is the neutral/default preset, and `Init()` applies it
-directly, so what boots is always exactly preset 0, not a second,
-separately-hand-coded default that could quietly drift out of sync with
-it. User presets save/load to `PADP/PRESnnn.DAT` (up to 99 slots, on top
-of the always-available factory range) via the same Save/Load/Back
-convention as Global:File (see *Save/load* below). A performance save
-does **not** embed the Pad sound (or Fm's, or Grains') at all — see
-*Save-file "bubbles"* below for why that changed and what it means in
-practice.
-
-Two fields (`tune01`, `pan01`) were added to `PadPresetData` after most
-of the factory presets were already written — both are trailing fields
-with default member initializers (0.5f = neutral/centered), so every
-existing positional initializer list (which only lists the fields that
-existed at the time it was written) still gets a sensible neutral value
-with no need to touch any of them.
+**Grains' own output level, raised for the same underlying reason**:
+real-hardware testing after the recording fix above surfaced that Grains
+sounded much quieter than Dexed even at Grains' own Output Level knob
+maxed — traced to two real, structural facts about `GranularEngine`'s own
+gain chain that Dexed simply doesn't share: overlap-gain compensation
+(dividing by however many grain slots are active, a deliberate,
+documented anti-clipping tradeoff) and the shared linear center-pan law
+(a real -6dB dip at center that Dexed currently skips entirely, having no
+Pan control yet). `GranularEngine::SetOutputLevel01()`'s ceiling was
+raised from 1.4x to 12x (in two real-hardware-driven steps, 4x first,
+then further after that still measured too quiet) specifically to give
+that knob enough real headroom to compensate — paired with a new
+`tanhf()` soft limiter in `Process()` (same convention as Dexed's own)
+so pushing the knob that hard drives it into deliberate, audible
+saturation rather than harsh digital clipping.
 
 ## Grains (Screen::Granular / GranularEngine)
 
 A MIDI-played, **monophonic** granular instrument (`granular_engine.h/
 .cpp`) — deliberately much simpler than an earlier 8-voice granular
 engine this project shelved on its own git branch: one held note at a
-time, no oscillator layer (Pad Synth covers that role now), and two
+time, no oscillator layer (Dexed covers that role now), and two
 overlapping-grain layers sharing one Size/Fill/Gap scheduling mechanism
 instead of one polyphonic grain cloud plus a separate, thinner "scan
 grain".
@@ -896,15 +804,18 @@ fade independently) rather than an audible instant cut.
   passed to `SetSource()` changes, so re-trimming always works from the
   original full capture, not whatever the previous trim left behind.
 
-**Filter/Mix/Reverb send/Pan/Output level**: same shape as Pad Synth's
-own (see above) — one bus-level `Svf` pair, independent Grain-layer and
-Scan-layer volumes summed before a single Output Level stage, a
-continuous Reverb Send knob (previously an unconditional full send with
-no control at all), and the same linear pan law applied to the
-already-stereo captured signal (Grains reads real L/R from whatever was
-captured/imported, unlike Pad Synth's mono voice sum).
+**Filter/Mix/Reverb send/Pan/Output level**: one bus-level `Svf` pair
+(same shape Dexed's own post-mix filter follows, see above), independent
+Grain-layer and Scan-layer volumes summed before a single Output Level
+stage — raised from a 1.4x to a 12x ceiling, plus a new `tanhf()` soft
+limiter, after real-hardware testing showed Grains reading much quieter
+than Dexed even maxed (see *Dexed*'s own note on this above for the full
+story) — a continuous Reverb Send knob, and the same linear pan law
+`LooperLayer` uses, applied to the already-stereo captured signal (Grains
+reads real L/R from whatever was captured/imported, unlike a mono voice
+sum).
 
-**Presets** (`GranularEngine::GranularPresetData`): unlike Pad Synth,
+**Presets** (`GranularEngine::GranularPresetData`): unlike Dexed,
 Grains presets are **audio-inclusive** — a Grains preset IS a specific
 captured sound plus how it's being played back, so saving/loading one
 needs to restore both. `PerformanceStore::SaveGranularPreset()`/
@@ -912,22 +823,22 @@ needs to restore both. `PerformanceStore::SaveGranularPreset()`/
 parameters into ONE combined file per slot (`GRNP/PRESnnn.DAT`, up to 99
 slots — no factory range, there's no hand-tuned-capture equivalent to a
 hand-tuned patch), so this can take real SD-transfer time (up to ~1.9MB
-of audio) and shows a live progress bar during the save/load, unlike Pad
-Presets' instant tiny-struct transfer. Output Level and Reverb Send are
+of audio) and shows a live progress bar during the save/load, unlike
+Dexed Presets' instant tiny-struct transfer. Output Level and Reverb Send are
 deliberately excluded from the saved struct (same reasoning as Pan) —
 session-level mixer settings, not part of the captured sound's own
 identity.
 
 ## Screen::Mixer
 
-One screen covering all 8 mixable channels — Loop Layers 1–4, Pad
-Synth, Grains, Bypass, and Master — reached by clicking the encoder on
+One screen covering all 8 mixable channels — Loop Layers 1–4, Grains,
+Dexed (DXD), Bypass, and Master — reached by clicking the encoder on
 `Global:Mixer` (which itself shows a static at-a-glance overview grid:
 all 8 channel names in a row, each with a real vertical Volume bar, no
 numeric readout, via `DrawMixerOverviewGrid()`).
 
 **Rotate picks the channel, not the page** — unlike every other
-Pad/Granular-style screen, `Screen::Mixer` has no sub-pages of its own;
+Dexed/Granular-style screen, `Screen::Mixer` has no sub-pages of its own;
 the encoder's usual "cycle this screen's pages" job is repurposed to
 step through one continuous, endlessly-wrapping sequence of 8 channel
 stops plus a final Scope stop (a live oscilloscope of the actual
@@ -942,13 +853,16 @@ for exactly this one screen was the least-surprising option, rather than
 inventing a second, competing "rotate" gesture.
 
 **Each of the 7 non-Master channels** shows a Detail page with real
-Volume/Pan/Reverb-Send vertical bars: Button 1 tap maps the knobs to
+Volume/Reverb-Send vertical bars: Button 1 tap maps the knobs to
 Volume+Pan, Button 2 tap maps them to Reverb Send — the same
-Button-1/Button-2-toggle-which-pair idiom already used elsewhere (Pad's
-merged ADSR page, Grains' merged Grain/ADSR/Mix pages). **Master** (the
-8th channel) has no toggle — Knob 1 is Volume, Knob 2 is Reverb Size,
-always, since there's no per-channel Pan/Send concept for the master bus
-itself.
+Button-1/Button-2-toggle-which-pair idiom already used elsewhere (Grains'
+merged Grain/ADSR/Mix pages). **DXD (Dexed)** is the one exception among
+those 7 — Dexed has no Pan control yet (see *Dexed* above), so its own
+Pan bar/readout is simply omitted rather than showing a value that
+wouldn't do anything; Volume and Reverb Send both still work normally.
+**Master** (the 8th channel) has no toggle at all — Knob 1 is Volume,
+Knob 2 is Reverb Size, always, since there's no per-channel Pan/Send
+concept for the master bus itself.
 
 **A genuine knob-pickup exception, and why**: `KnobContext::MixerVolPan`/
 `MixerReverb` are each shared across all 7 non-Master channels (branching
@@ -966,16 +880,16 @@ universal rule.
 
 ## SD card management (Global:SdMgmt)
 
-Lets you browse any of the 4 save categories — Performances, Pad
-Presets, Fm Presets, Grains Presets — and Duplicate or Delete individual
+Lets you browse any of the 3 save categories — Performances, Dexed
+Presets, Grains Presets — and Duplicate or Delete individual
 files directly from the Pod, no computer needed. Reuses the exact same
-cached slot-list arrays and dirty-flag/`Refresh*()` functions the 4 save
+cached slot-list arrays and dirty-flag/`Refresh*()` functions the 3 save
 pages already scan and cache — no duplicate directory-scanning logic
 anywhere.
 
 - **Duplicate** (Button 1 held 800ms): byte-for-byte chunked copy into
   the next free slot in that category (`CopyFileChunked()`, shared by
-  all 4 categories) — `FA_CREATE_NEW`, not `FA_CREATE_ALWAYS`, so an
+  all 3 categories) — `FA_CREATE_NEW`, not `FA_CREATE_ALWAYS`, so an
   unexpected filename collision fails loudly instead of silently
   overwriting something; any failure partway through deletes the partial
   destination file rather than leaving a corrupt copy behind.
@@ -986,7 +900,7 @@ anywhere.
   every higher-numbered file still on the card in that same category
   (and any other pre-existing gaps above it) shifts down to the lowest
   free number below it, converging back to contiguous numbering from 1
-  (or from the first user slot, for Pad/Fm Presets' factory-reserved
+  (or from the first user slot, for Dexed Presets' factory-reserved
   range) regardless of deletion order. Without this, `NextFree*Slot()`'s
   own "lowest free slot" scan would silently reuse the low number a
   delete just freed on the very next Save New, while other, higher-
@@ -996,14 +910,14 @@ anywhere.
   "Now: N" tracking is updated in the same pass to follow it to its new
   slot (or to "unsaved"/"custom" if it was the one actually deleted) —
   passed through as an in/out pointer to `DeleteSlot()`/
-  `DeletePadPreset()`/`DeleteFmPreset()`/`DeleteGranularPreset()` rather
+  `DeleteDexedPreset()`/`DeleteGranularPreset()` rather
   than guessed at from the caller side, since only the delete function
   itself knows exactly how far each surviving file actually moved.
 
 ## The Files/New Load chooser
 
-Save and Load use a deliberately identical two-step interaction on all 4
-save pages (Global:File, Pad Preset, Fm Preset, Grains Preset), so the
+Save and Load use a deliberately identical two-step interaction on all 3
+save pages (Global:File, Dexed Preset, Grains Preset), so the
 convention never needs re-learning between them:
 
 - **Save** (Button 1 tap from idle): reveals a two-line choice —
@@ -1012,26 +926,27 @@ convention never needs re-learning between them:
 - **Load** (Button 2 tap from idle): reveals the *same shape* of
   two-line choice — **Files** vs. **Load New** — picked with Knob 1.
   Selecting Files and tapping Button 1 drills in: the chooser is
-  replaced by the actual numbered file list (or, for Fm Preset only, a
-  folder list one level above that — see *Preset folder browsing* under
-  *Fm Synth* above), and Knob 1 now scrolls it directly. Button 1 is
-  "Back" everywhere else inside Load (drilled-in → back to the chooser
-  or folder list; chooser-with-New-highlighted → back to idle). Button 2
+  replaced by the actual numbered file list (or, for Dexed Preset only, a
+  folder list one level above that — see *Preset folder browsing & live
+  preview* under *Dexed* above), and Knob 1 now scrolls it directly.
+  Button 1 is "Back" everywhere else inside Load (drilled-in → back to
+  the chooser or folder list; chooser-with-New-highlighted → back to
+  idle). Button 2
   held 800ms confirms whichever is actually selected — a specific
   browsed file, or New — and does nothing yet at the chooser with Files
-  highlighted (or, for Fm, at its folder list), since there's no
+  highlighted (or, for Dexed, at its folder list), since there's no
   specific target picked at that level ("nothing if it does nothing",
   the same footer-label rule this project already applies everywhere
-  else). Fm's own Preset page additionally lets a *short* Button 2 tap
+  else). Dexed's own Preset page additionally lets a *short* Button 2 tap
   preview the highlighted file live without leaving the browser (see
-  *Live preview while browsing* under *Fm Synth* above) — the one real
-  difference from this otherwise-identical convention.
+  *Preset folder browsing & live preview* under *Dexed* above) — the one
+  real difference from this otherwise-identical convention.
 - **New**, reached this way instead of a separate hidden gesture, means:
   Global:File clears every layer's recorded audio (keeping every
-  setting); Pad Preset and Fm Preset each reset to their own first
-  factory patch; Grains Preset clears the captured audio and resets
-  every parameter to the engine's own defaults — each the same "genuine
-  fresh start" as the category's own factory-default state.
+  setting); Dexed Preset resets to its own first factory patch; Grains
+  Preset clears the captured audio and resets every parameter to the
+  engine's own defaults — each the same "genuine fresh start" as the
+  category's own factory-default state.
 
 Both this chooser and Overwrite/Save New share the same forcing rule
 when the "other" option isn't valid: Overwrite forces Save New when
@@ -1051,8 +966,8 @@ version tag (`kFileVersion` in `performance_store.cpp`, currently **10**)
 that gets bumped whenever a field is added or removed — a save from an
 older firmware version is rejected cleanly on load (shown as a short
 error on the File page) rather than being misread, so a firmware update
-can mean older saves need re-saving under the new version. Pad Presets
-(`PADP/PRESnnn.DAT`), Fm Presets (`FMP/PRESnnn.DAT`), and Grains Presets
+can mean older saves need re-saving under the new version. Dexed Presets
+(`DEXP/PRESnnn.DAT`) and Grains Presets
 (`GRNP/PRESnnn.DAT`, audio-inclusive — see *Grains* above) are each their
 own separate on-disk format with their own independent numbering, not
 part of a performance file's own version tag.
@@ -1060,21 +975,21 @@ part of a performance file's own version tag.
 ### Save-file "bubbles"
 
 A performance deals **only** with the looper (audio + tempo/global/
-per-layer settings) — it does not embed Pad, Fm, or Grains' sound at all,
-even though it once did (`kFileVersion` 7 added Pad's embedded sound,
-version 10 removed it). Each instrument's presets live entirely in their
+per-layer settings) — it does not embed Dexed's or Grains' sound at all,
+even though an earlier instrument (Pad Synth) once had its own sound
+embedded this way (`kFileVersion` 7 added it, version 10 removed it
+again). Each instrument's presets live entirely in their
 own independent save/load system instead, with no cross-embedding into a
 performance file — every instrument's saves stay in its own separate
 "bubble," performances included. This was a deliberate architecture
-change partway through Fm Synth's development, not a Fm-specific
-decision: the same directive applies equally to Pad and Grains, both of
-which had their own preset systems already but (in Pad's case) were
-*also* getting silently duplicated into every performance save. The
+change made partway through this project's history, not specific to any
+one instrument: it applies equally to every instrument that's ever had
+its own preset system. The
 practical effect: switching or tweaking any instrument's loaded sound
 never touches a saved performance, and loading an old performance never
 drags along whatever synth patch happened to be active when it was
 saved — the two are fully decoupled. `PerformanceStore::Save()`/`Load()`
-no longer take or return any Pad/Fm/Grains data at all as a result; each
+no longer take or return any instrument data at all as a result; each
 engine's own `TriggerSave*Preset()`/`TriggerLoad*Preset()` pair is
 completely separate and unaffected by performance Save/Load.
 
@@ -1083,7 +998,7 @@ see *The Files/New Load chooser* above) only wipes each layer's recorded
 *audio* (`LooperLayer::Clear()`) — every global and per-layer setting is
 left exactly as it was. It's deliberately not the same as applying the
 startup default (see below); those are two different, independent
-actions. Delete/Duplicate for all 4 save categories live on
+actions. Delete/Duplicate for all 3 save categories live on
 `Global:SdMgmt` instead (see *SD card management* above), not on these
 individual save/load pages.
 
@@ -1211,11 +1126,11 @@ A few things that are intentional, not bugs:
 - **Export is one stereo mixdown, not per-track stems**: all 4 layers'
   post-effects signal is summed into a single file (either export mode)
   — there's no way to export each layer as its own file.
-- **No per-engine MIDI routing yet**: NoteOn/NoteOff (and, for Pad/Fm,
+- **No per-engine MIDI routing yet**: NoteOn/NoteOff (and, for Dexed,
   pitch bend and mod wheel) drive every enabled engine from the same
   incoming MIDI stream (see *MIDI* above) — there's no way to play just
-  Grains from a keyboard without it also reaching whichever of Pad/Fm
-  is currently enabled.
+  Grains from a keyboard without it also reaching Dexed if it's enabled
+  too.
 - **Bypass's mix Volume/Pan don't persist**: like Master Volume and
   vari-speed, they're live-performance controls that always reset to
   their defaults on boot and after Load — not part of a saved
@@ -1240,18 +1155,24 @@ A few things that are intentional, not bugs:
 - `looper_layer.h/.cpp` — per-layer state machine, filter/effects/
   reverb, waveform cache, audio
 - `tempo_clock.h/.cpp` — BPM/bars/metronome/count-in engine
-- `pad_synth.h/.cpp` — the Pad Synth instrument (see *Pad Synth* above)
-- `fast_fm_voice.h` — the lookup-table 4-operator FM oscillator core (see
-  *Fm Synth* above) — no `.cpp`, everything's inline/force-inlined for
-  ITCM residency
-- `fm_synth.h/.cpp` — the Fm Synth instrument (see *Fm Synth* above)
+- `msfa/` — the vendored real DX7 emulation core (Google, Apache-2.0),
+  unmodified except two small, clearly-marked additive introspection
+  helpers on `FmCore` (`get_carrier_operators()`'s outbus-based fix, and
+  the new `get_operator_routing()` — see *Dexed* above)
+- `dexed_synth.h/.cpp` — the Dexed instrument built around msfa (see
+  *Dexed* above)
+- `dexed_sysex.h/.cpp` — this project's own clean-room packed↔unpacked
+  DX7 SysEx converter, written from the public 1993 Yamaha MIDI SysEx
+  spec (see *Dexed* above for why msfa itself doesn't include one)
+- `dexed_factory_data.h/.cpp` — the 961 embedded factory presets (see
+  *Dexed* above), stored packed and unpacked on demand
 - `granular_engine.h/.cpp` — the Grains instrument (see *Grains* above)
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering, for
-  every screen (Home/Layer/Global/Fm/Pad/Granular/Mixer)
+  every screen (Home/Layer/Global/Dexed/Granular/Mixer)
 - `font_tomthumb.h/.cpp` — the tiny proportional font used in the
   footer rows (see `README.md`'s Thanks section for credit)
-- `performance_store.h/.cpp` — SD card save/load (performances, Pad
-  Presets, Fm Presets, Grains Presets), WAV export, and SD Mgmt's
+- `performance_store.h/.cpp` — SD card save/load (performances, Dexed
+  Presets, Grains Presets), WAV export, and SD Mgmt's
   Duplicate/Delete. Performance on-disk format is at `kFileVersion = 10`
   (see *Save/load* above; bumped from 5→6 when Pitch's fields were
   removed — see *Pitch removal* below — up through Pad Synth's sound
@@ -1311,28 +1232,36 @@ took its cost with it, worst-case CPU under `BOOT_QSPI` + ITCM measured
 internal-flash baseline, with the QSPI chip's ~8MB now available for
 future features (the original motivation for this migration).
 
-That 45% predates Pad Synth and Grains; with both instruments added
-(and voice counts tuned against real measurements rather than paper
-estimates — see *Pad Synth*'s own CPU note above, including the
-`StringVoice` architecture that was measured and ruled out), the
-**genuine worst case with everything running at once** — full 4-layer
-loop + reverb, 6-voice Pad Synth, and Grains, all simultaneously active
-— measures **~94%**. The per-engine on/off toggles (see *Per-engine
-on/off* above) are a real, immediate mitigation if a given performance's
-actual worst case turns out tighter than that in practice.
+That 45% predates Pad Synth, Fm Synth, and Grains. The measurements below
+(worst-case ~94% with Pad Synth, and Fm Synth's own ~52-63% story
+including two real ITCM/QSPI placement bugs found and fixed) describe
+**Pad Synth and Fm Synth specifically, both since removed** and replaced
+outright by Dexed (see *Dexed* above for why a real DX7 clone made both
+of those from-scratch approximations redundant at once) — kept here as
+project history, since the *class* of bug they surfaced (inline/header-
+defined functions silently landing in slow QSPI instead of ITCM once
+they grow past whatever threshold the compiler stops inlining them
+below, the same class of regression as `PitchShifter`'s own gap just
+above) is a real, recurring risk worth remembering regardless of which
+instrument next runs into it. Dexed's own worst-case CPU cost alongside
+the looper and Grains has not yet been separately measured and recorded
+here — a real gap in this document, not a claim that it's fine.
 
-Fm Synth (mutually exclusive with Pad — see *Per-engine on/off* above)
-has its own separate worst-case story, told in full under *Fm Synth*'s
-own CPU-measurement writeup above: two real ITCM/QSPI code-placement
-bugs were found and fixed there (the same *class* of regression as
-`PitchShifter`'s own gap just above — inline/header-defined functions
-silently landing in slow QSPI instead of ITCM once they grew past
-whatever threshold the compiler was inlining them below), plus a voice
-count trade from 8 down to 6. With those fixes in, real hardware
-measurement showed **~52-57% Fm-alone** (idle vs. actively playing) and
-**~63% with 3 loop layers actively playing back alongside it** —
-confirmed on hardware as "much better" after being genuinely sluggish
-before the fix.
+With both Pad Synth and Grains added (and voice counts tuned against
+real measurements rather than paper estimates), the **genuine worst case
+with everything running at once** — full 4-layer loop + reverb, 6-voice
+Pad Synth, and Grains, all simultaneously active — measured **~94%**.
+The per-engine on/off toggles (see *Per-engine on/off* above) are a
+real, immediate mitigation if a given performance's actual worst case
+turns out tighter than that in practice.
+
+Fm Synth (mutually exclusive with Pad at the time — see *Per-engine
+on/off* above) had its own separate worst-case story: two real ITCM/QSPI
+code-placement bugs were found and fixed, plus a voice count trade from
+8 down to 6. With those fixes in, real hardware measurement showed
+**~52-57% Fm-alone** (idle vs. actively playing) and **~63% with 3 loop
+layers actively playing back alongside it** — confirmed on hardware as
+"much better" after being genuinely sluggish before the fix.
 
 **A genuinely new linker-level detail worth knowing if extending this**:
 the custom `.itcm_text` section has a load address (LMA) in QSPI flash but

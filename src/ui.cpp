@@ -2,6 +2,8 @@
 #include "performance_store.h"
 #include "audio_engine.h"
 #include "granular_engine.h"
+#include "dexed_synth.h"
+#include "msfa/fm_core.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -123,7 +125,8 @@ void Ui::Init(daisy::DaisyPod*              pod,
               volatile bool*                granular_capturing,
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
-              size_t                        master_scope_capacity)
+              size_t                        master_scope_capacity,
+              DexedSynth*                   dexed)
 {
     pod_        = pod;
     disp_       = display;
@@ -140,6 +143,7 @@ void Ui::Init(daisy::DaisyPod*              pod,
     granular_capture_write_pos_ = granular_capture_write_pos;
     master_scope_buf_      = master_scope_buf;
     master_scope_capacity_ = master_scope_capacity;
+    dexed_                 = dexed;
 
     // Same curve ApplyKnobs() uses for knob1 on Home, applied once here
     // so master_volume_ actually matches master_volume01_'s starting
@@ -285,6 +289,20 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             granular_param_page_ = new_granular_page;
             save_load_mode_      = SaveLoadMode::Idle; // same reset as Global:File above
         }
+        else if(screen_ == Screen::Dexed)
+        {
+            int n = (int)DexedParamPage::kCount;
+            int p = (((int)dexed_param_page_ + inc) % n + n) % n;
+            DexedParamPage new_dexed_page = (DexedParamPage)p;
+            if(new_dexed_page == DexedParamPage::Preset
+               && dexed_param_page_ != DexedParamPage::Preset)
+            {
+                dexed_preset_slots_dirty_ = true; // re-scan the card on entry
+                dexed_preset_folder_open_ = false; // always start at the folder list
+            }
+            dexed_param_page_ = new_dexed_page;
+            save_load_mode_   = SaveLoadMode::Idle; // same reset as Global:File above
+        }
         else if(screen_ == Screen::Mixer)
         {
             int n            = kNumMixerPositions;
@@ -366,16 +384,27 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             // convention Global:Pad/Global:Granular's own click uses.
             screen_ = Screen::Mixer;
         }
+        else if(!encoder_long_fired_ && screen_ == Screen::Global
+                && global_page_ == GlobalPage::Dexed)
+        {
+            // Global:Dexed is an entry point into Screen::Dexed, same
+            // convention Global:Granular's own click uses.
+            screen_ = Screen::Dexed;
+        }
         else if(!encoder_long_fired_ && screen_ == Screen::Global)
         {
             TogglePauseAll();
         }
-        else if(!encoder_long_fired_ && screen_ == Screen::Granular)
+        else if(!encoder_long_fired_
+                && (screen_ == Screen::Granular || screen_ == Screen::Dexed))
         {
             // Same mute-all-loop-layers click as every Global page's own
-            // (TogglePauseAll()) -- Granular has no click-to-drill-in of
-            // its own (that's the encoder's job from Global instead), so
-            // there's nothing else useful for its click to do either.
+            // (TogglePauseAll()) -- Granular/Dexed have no click-to-
+            // drill-in of their own yet (that's the encoder's job from
+            // Global instead), so there's nothing else useful for their
+            // click to do either. (A later phase gives Dexed's own
+            // Preset page a real click-to-drill-in of its own, into the
+            // advanced per-operator editor -- not built yet.)
             TogglePauseAll();
         }
         // Screen::Mixer: rotate already picks the stop (see
@@ -628,6 +657,71 @@ void Ui::HandleButton2(const UiControlEvents& events)
             button2_long_fired_ = false;
         }
     }
+    else if(screen_ == Screen::Dexed && dexed_param_page_ == DexedParamPage::Preset)
+    {
+        // Button2 confirms whichever of Save/Load is revealed -- see
+        // Global:File's own Button2 handling for the shared SaveLoadMode
+        // this mirrors.
+        bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
+        // Nothing concrete is highlighted while just browsing the folder
+        // list (folder names aren't presets) -- confirm only once "New"
+        // is picked at the top-level chooser, or a folder has actually
+        // been opened onto a real preset (see dexed_preset_folder_open_'s
+        // own comment).
+        bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
+                                 && (load_new_selected_
+                                     || (load_browsing_files_ && dexed_preset_folder_open_));
+        bool can_confirm      = can_confirm_save || can_confirm_load;
+        if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
+        {
+            button2_long_fired_ = true;
+            if(can_confirm_save)
+                TriggerSaveDexedPreset(save_as_new_);
+            else
+                TriggerLoadDexedPreset();
+            save_load_mode_ = SaveLoadMode::Idle;
+        }
+        if(events.btn2_released)
+        {
+            if(!button2_long_fired_ && events.btn2_held_ms > 800.f && can_confirm)
+            {
+                if(can_confirm_save)
+                    TriggerSaveDexedPreset(save_as_new_);
+                else
+                    TriggerLoadDexedPreset();
+                save_load_mode_ = SaveLoadMode::Idle;
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::BrowsingLoad
+                     && load_browsing_files_ && dexed_preset_folder_open_)
+            {
+                // Short tap while a preset is highlighted inside an open
+                // folder -- preview it immediately (apply to the live
+                // engine) WITHOUT leaving the browser, so scrolling K1
+                // and tapping B2 auditions one preset after another
+                // without re-entering the whole Save/Load flow each
+                // time. Button2's hold gesture above still does the same
+                // load AND exits back to Idle, for once you've settled
+                // on one.
+                TriggerLoadDexedPreset();
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
+            {
+                // Short tap from Idle only: reveal the preset list to
+                // browse (Button2's own label becomes "Hold=Load" to
+                // commit).
+                if(!PerformanceStore::IsCardPresent())
+                    PerformanceStore::Remount();
+                else
+                {
+                    save_load_mode_           = SaveLoadMode::BrowsingLoad;
+                    load_new_selected_        = false;
+                    load_browsing_files_      = false;
+                    dexed_preset_folder_open_ = false; // always start at the folder list
+                }
+            }
+            button2_long_fired_ = false;
+        }
+    }
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Tempo)
     {
         // Button2 does nothing else on this page -- save the current
@@ -768,6 +862,8 @@ void Ui::OnButton1Short()
             }
             else if(global_page_ == GlobalPage::Granular)
                 granular_enabled_ = !granular_enabled_;
+            else if(global_page_ == GlobalPage::Dexed)
+                dexed_enabled_ = !dexed_enabled_;
             else if(global_page_ == GlobalPage::Looper)
             {
                 looper_enabled_ = !looper_enabled_;
@@ -872,6 +968,68 @@ void Ui::OnButton1Short()
                 }
             }
             break;
+        case Screen::Dexed:
+            if(dexed_param_page_ == DexedParamPage::Algo && dexed_)
+            {
+                // Button1 cycles backward, Button2 (OnButton2Short())
+                // cycles forward -- a two-direction cycle since, unlike
+                // Layer:Filter/Granular:Filter's short mode lists,
+                // stepping past algorithm 32 back around to 1 (or vice
+                // versa) to reach a nearby one is a real, common need.
+                int algo = (dexed_->GetPatchByte(134) + 31) % 32;
+                dexed_->SetPatchByte(134, (uint8_t)algo);
+            }
+            else if(dexed_param_page_ == DexedParamPage::Filter && dexed_)
+            {
+                // Same "Button1 cycles" idiom as Layer:Filter/Granular:Filter.
+                int n = (int)FilterMode::kNumModes;
+                int m = ((int)dexed_->GetFilterMode() + 1) % n;
+                dexed_->SetFilterMode((FilterMode)m);
+            }
+            else if(dexed_param_page_ == DexedParamPage::Preset)
+            {
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                {
+                    // Two levels here, unlike Global:File's single
+                    // numbered list -- see dexed_preset_folder_open_'s
+                    // own comment. Folder open: back out to the folder
+                    // list. Folder list: open the highlighted folder
+                    // instead (Knob1 now scrolls the presets inside it).
+                    if(dexed_preset_folder_open_)
+                        dexed_preset_folder_open_ = false;
+                    else
+                    {
+                        dexed_preset_folder_open_ = true;
+                        dexed_preset_cursor_      = 0;
+                    }
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
+                {
+                    // "Files" is highlighted -- drill into the folder
+                    // list (Knob1 now scrolls dexed_preset_folder_cursor_
+                    // directly), always starting at its very top.
+                    load_browsing_files_     = true;
+                    dexed_preset_folder_open_ = false;
+                    dexed_preset_folder_cursor_ = 0;
+                }
+                else if(save_load_mode_ != SaveLoadMode::Idle)
+                {
+                    // Back -- Button2 confirms Save/Load (see
+                    // HandleButton2()), so this tap always just returns
+                    // to the page's own idle state, same as Global:File.
+                    save_load_mode_ = SaveLoadMode::Idle;
+                }
+                else if(!PerformanceStore::IsCardPresent())
+                    PerformanceStore::Remount();
+                else
+                {
+                    // Reveal the Overwrite/Save New choice -- Button2's
+                    // hold now confirms it (see HandleButton2()).
+                    save_load_mode_ = SaveLoadMode::ChoosingSave;
+                    save_as_new_    = dexed_loaded_preset_slot_ <= DexedSynth::GetNumFactoryPresets();
+                }
+            }
+            break;
         case Screen::Mixer:
             mixer_target_reverb_ = false; // knobs -> Volume+Pan (ignored on Master)
             break;
@@ -917,6 +1075,14 @@ void Ui::OnButton2Short()
     }
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Export)
         TriggerExportMicroDexed();
+    else if(screen_ == Screen::Dexed && dexed_param_page_ == DexedParamPage::Algo && dexed_)
+    {
+        // Forward direction of the Algo page's two-way cycle -- see
+        // OnButton1Short()'s own comment for why this page (uniquely)
+        // gets both directions.
+        int algo = (dexed_->GetPatchByte(134) + 1) % 32;
+        dexed_->SetPatchByte(134, (uint8_t)algo);
+    }
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Grain)
         granular_grain_target_gap_scan_ = true; // knobs -> Gap+Scan
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::ADSR)
@@ -961,7 +1127,21 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Looper: return KnobContext::GlobalLooper;
                 case GlobalPage::Mixer: return KnobContext::GlobalMixer;
                 case GlobalPage::SdMgmt: return KnobContext::GlobalSdMgmt;
+                case GlobalPage::Dexed: return KnobContext::GlobalDexed;
                 default: return KnobContext::GlobalTempo;
+            }
+        case Screen::Dexed:
+            switch(dexed_param_page_)
+            {
+                case DexedParamPage::Algo: return KnobContext::DexedAlgo;
+                case DexedParamPage::Feedback: return KnobContext::DexedFeedback;
+                case DexedParamPage::Vibrato: return KnobContext::DexedVibrato;
+                case DexedParamPage::Brightness: return KnobContext::DexedBrightness;
+                case DexedParamPage::EnvSpeed: return KnobContext::DexedEnvSpeed;
+                case DexedParamPage::Filter: return KnobContext::DexedFilter;
+                case DexedParamPage::Mix: return KnobContext::DexedMix;
+                case DexedParamPage::Preset: return KnobContext::DexedPreset;
+                default: return KnobContext::DexedAlgo;
             }
         case Screen::Granular:
             switch(granular_param_page_)
@@ -1055,6 +1235,45 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalLooper: break; // no continuous knobs, Button1 toggle only
         case KnobContext::GlobalMixer: break; // entry point only -- see Screen::Mixer instead
         case KnobContext::GlobalSdMgmt: break; // browses a list directly, no pickup used
+        case KnobContext::GlobalDexed: break; // entry point only -- see Screen::Dexed instead
+        case KnobContext::DexedAlgo:
+            if(dexed_)
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(134) / 32.f;
+            break;
+        case KnobContext::DexedFeedback:
+            if(dexed_)
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(135) / 7.f;
+            break;
+        case KnobContext::DexedVibrato:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(137) / 99.f;
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(139) / 99.f;
+            }
+            break;
+        case KnobContext::DexedBrightness:
+            if(dexed_)
+                k1_pickup_raw_[i] = dexed_->GetBrightness01();
+            break;
+        case KnobContext::DexedEnvSpeed:
+            if(dexed_)
+                k1_pickup_raw_[i] = dexed_->GetEnvSpeed01();
+            break;
+        case KnobContext::DexedFilter:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = dexed_->GetFilterCutoff01();
+                k2_pickup_raw_[i] = dexed_->GetFilterResonance01();
+            }
+            break;
+        case KnobContext::DexedMix:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = dexed_->GetReverbSend01();
+                k2_pickup_raw_[i] = dexed_->GetOutputLevel01();
+            }
+            break;
+        case KnobContext::DexedPreset: break; // browses a list directly, no pickup used
         case KnobContext::GranularGrainSizeFill:
             if(granular_)
             {
@@ -1530,6 +1749,154 @@ void Ui::ApplyKnobs()
                 default: break;
             }
             break;
+
+        case Screen::Dexed:
+            if(!dexed_)
+                break;
+            switch(dexed_param_page_)
+            {
+                // Every case below that touches dexed_'s own
+                // SetPatchByte()/SetBrightness01()/SetEnvSpeed01() gates
+                // on a real "did this actually change" check before
+                // calling it -- unlike every other engine's own knob-
+                // driven setter in this project (a cheap float
+                // assignment KnobPickUp()'s own lack of a change-check
+                // was always harmless to call every tick against), these
+                // trigger a real per-held-voice Dx7Note::update() call
+                // (see ApplyPatchToHeldVoices()) inside a brief critical
+                // section (see NoteOn()'s own comment on why that's
+                // needed at all). Calling that every single main-loop
+                // tick the knob is engaged -- including while sitting
+                // still, since KnobPickUp() itself never checks for
+                // real movement -- was enough cumulative critical-
+                // section time with several notes held to audibly drop
+                // notes while turning the knob, confirmed on real
+                // hardware.
+                case DexedParamPage::Algo:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int algo = (int)(Clampf(k1, 0.f, 1.f) * 32.f);
+                        algo     = algo > 31 ? 31 : algo;
+                        if((uint8_t)algo != dexed_->GetPatchByte(134))
+                            dexed_->SetPatchByte(134, (uint8_t)algo);
+                    }
+                    break;
+                case DexedParamPage::Feedback:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int fb = (int)(Clampf(k1, 0.f, 1.f) * 7.f + 0.5f);
+                        fb     = fb > 7 ? 7 : fb;
+                        if((uint8_t)fb != dexed_->GetPatchByte(135))
+                            dexed_->SetPatchByte(135, (uint8_t)fb);
+                    }
+                    break;
+                case DexedParamPage::Vibrato:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int speed = (int)(Clampf(k1, 0.f, 1.f) * 99.f + 0.5f);
+                        speed     = speed > 99 ? 99 : speed;
+                        if((uint8_t)speed != dexed_->GetPatchByte(137))
+                            dexed_->SetPatchByte(137, (uint8_t)speed);
+                    }
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    {
+                        int depth = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
+                        depth     = depth > 99 ? 99 : depth;
+                        if((uint8_t)depth != dexed_->GetPatchByte(139))
+                            dexed_->SetPatchByte(139, (uint8_t)depth);
+                    }
+                    break;
+                case DexedParamPage::Brightness:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci])
+                       && fabsf(k1 - dexed_->GetBrightness01()) > 0.002f)
+                        dexed_->SetBrightness01(k1);
+                    break;
+                case DexedParamPage::EnvSpeed:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci])
+                       && fabsf(k1 - dexed_->GetEnvSpeed01()) > 0.002f)
+                        dexed_->SetEnvSpeed01(k1);
+                    break;
+                case DexedParamPage::Filter:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        dexed_->SetFilterCutoff01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        dexed_->SetFilterResonance01(k2);
+                    break;
+                case DexedParamPage::Mix:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        dexed_->SetReverbSend01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        dexed_->SetOutputLevel01(k2);
+                    break;
+                case DexedParamPage::Preset:
+                {
+                    if(save_load_mode_ == SaveLoadMode::ChoosingSave)
+                    {
+                        // Overwrite is only a real option once a real
+                        // user slot (not a factory one) is loaded.
+                        save_as_new_
+                            = dexed_loaded_preset_slot_ <= DexedSynth::GetNumFactoryPresets()
+                                  ? true
+                                  : k1 >= 0.5f;
+                        break;
+                    }
+                    if(save_load_mode_ != SaveLoadMode::BrowsingLoad)
+                        break;
+                    if(!load_browsing_files_)
+                    {
+                        // Top-level chooser (mirrors ChoosingSave's own
+                        // Overwrite/Save New pick above) -- factory
+                        // presets always exist, so "Files" is always a
+                        // real option here.
+                        load_new_selected_ = k1 >= 0.5f;
+                        break;
+                    }
+                    // One extra folder level versus Global:File/Granular
+                    // Preset's own single numbered list (see
+                    // dexed_preset_folder_open_'s own comment) -- K1
+                    // scrolls whichever of the two is currently active,
+                    // discretized/not pickup-tracked, same idiom as
+                    // Global:File's own file_cursor_.
+                    if(!dexed_preset_folder_open_)
+                    {
+                        // Folder list -- kNumFactoryCategories named
+                        // categories plus one trailing "User" folder.
+                        int total = DexedSynth::kNumFactoryCategories + 1;
+                        int idx   = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        if(idx >= total)
+                            idx = total - 1;
+                        dexed_preset_folder_cursor_ = idx;
+                        break;
+                    }
+                    {
+                        // Inside a folder -- browsing either one factory
+                        // category's own presets, or (the trailing
+                        // folder) every user-saved slot.
+                        int total
+                            = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
+                                  ? DexedSynth::GetFactoryCategoryCount(
+                                        dexed_preset_folder_cursor_)
+                                  : dexed_preset_user_slot_count_;
+                        if(total <= 0)
+                            break;
+                        int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                        if(idx >= total)
+                            idx = total - 1;
+                        // Browsing again -- clear the last save/load
+                        // result so the "Load:" line (which shows what
+                        // the knob is actually pointing at right now)
+                        // comes back instead of staying stuck on a
+                        // status message that never otherwise clears.
+                        if(idx != dexed_preset_cursor_)
+                            dexed_preset_status_[0] = '\0';
+                        dexed_preset_cursor_ = idx;
+                    }
+                    break;
+                }
+                default: break;
+            }
+            break;
+
         case Screen::Mixer:
         {
             int ch = mixer_position_;
@@ -1604,6 +1971,7 @@ void Ui::Draw()
         case Screen::Global: DrawGlobalScreen(); break;
         case Screen::Granular: DrawGranularScreen(); break;
         case Screen::Mixer: DrawMixerScreen(); break;
+        case Screen::Dexed: DrawDexedScreen(); break;
     }
     disp_->Update();
 }
@@ -2132,6 +2500,22 @@ void Ui::DrawGlobalScreen()
 
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        return;
+    }
+    if(global_page_ == GlobalPage::Dexed)
+    {
+        // Entry point into Screen::Dexed, plus the on/off toggle -- same
+        // treatment as Global:Granular above.
+        disp_->SetCursor(0, 0);
+        WriteUpper("Global:Dexed");
+        DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+        disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+        disp_->SetCursor(0, 20);
+        WriteUpper(dexed_enabled_ ? "Enabled" : "Disabled");
+        disp_->SetCursor(0, 30);
+        WriteUpper("Click to open Dexed");
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Toggle On/Off", "", "", "");
         return;
     }
 
@@ -3099,8 +3483,9 @@ const char* Ui::MixerChannelName(int ch) const
         case 2: return "L3";
         case 3: return "L4";
         case 4: return "GR";
-        case 5: return "BYP";
-        case 6: return "MAS";
+        case 5: return "DXD";
+        case 6: return "BYP";
+        case 7: return "MAS";
         default: return "?";
     }
 }
@@ -3111,8 +3496,9 @@ float Ui::MixerGetVolume01(int ch) const
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetVolume01();
         case 4: return granular_ ? granular_->GetOutputLevel01() : 0.f;
-        case 5: return bypass_mix_volume01_;
-        case 6: return master_volume01_;
+        case 5: return dexed_ ? dexed_->GetOutputLevel01() : 0.f;
+        case 6: return bypass_mix_volume01_;
+        case 7: return master_volume01_;
         default: return 0.f;
     }
 }
@@ -3123,8 +3509,8 @@ float Ui::MixerGetPan01(int ch) const
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetPan01();
         case 4: return granular_ ? granular_->GetPan01() : 0.5f;
-        case 5: return bypass_pan01_;
-        default: return 0.5f; // Master has no Pan
+        case 6: return bypass_pan01_;
+        default: return 0.5f; // Master and DXD (no Pan control yet) have none
     }
 }
 
@@ -3134,7 +3520,8 @@ float Ui::MixerGetSend01(int ch) const
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetReverbSend01();
         case 4: return granular_ ? granular_->GetReverbSend01() : 0.f;
-        case 5: return bypass_reverb_send01_;
+        case 5: return dexed_ ? dexed_->GetReverbSend01() : 0.f;
+        case 6: return bypass_reverb_send01_;
         default: return 0.f; // Master uses Reverb Size instead (see reverb_size01_)
     }
 }
@@ -3145,8 +3532,9 @@ void Ui::MixerSetVolume01(int ch, float v01)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetVolume01(v01); break;
         case 4: if(granular_) granular_->SetOutputLevel01(v01); break;
-        case 5: SetBypassMixVolume01(v01); break;
-        case 6:
+        case 5: if(dexed_) dexed_->SetOutputLevel01(v01); break;
+        case 6: SetBypassMixVolume01(v01); break;
+        case 7:
             master_volume01_ = Clampf(v01, 0.f, 1.f);
             master_volume_   = powf(master_volume01_, 2.5f) * 1.43f;
             if(master_volume_ < 0.f)
@@ -3162,8 +3550,8 @@ void Ui::MixerSetPan01(int ch, float v01)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetPan01(v01); break;
         case 4: if(granular_) granular_->SetPan01(v01); break;
-        case 5: SetBypassPan01(v01); break;
-        default: break; // Master has no Pan
+        case 6: SetBypassPan01(v01); break;
+        default: break; // Master and DXD (no Pan control yet) -- no-op
     }
 }
 
@@ -3173,9 +3561,15 @@ void Ui::MixerSetSend01(int ch, float v01)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetReverbSend01(v01); break;
         case 4: if(granular_) granular_->SetReverbSend01(v01); break;
-        case 5: bypass_reverb_send01_ = Clampf(v01, 0.f, 1.f); break;
+        case 5: if(dexed_) dexed_->SetReverbSend01(v01); break;
+        case 6: bypass_reverb_send01_ = Clampf(v01, 0.f, 1.f); break;
         default: break; // Master uses Reverb Size instead, set directly in ApplyKnobs()
     }
+}
+
+bool Ui::MixerChannelHasPan(int ch) const
+{
+    return ch != 5 && ch != kNumMixerChannels - 1;
 }
 
 // Vertical fader-style bar -- (x0,y0) is the box's top-left corner, fills
@@ -3221,6 +3615,512 @@ void Ui::DrawMixerOverviewGrid(int top_y)
         TomThumbDrawText(disp_, center_x - nw / 2, top_y + 1, name, true);
 
         DrawMixerVBar(center_x - kBarW / 2, kBarY0, kBarW, kBarH, MixerGetVolume01(ch));
+    }
+}
+
+void Ui::DrawDexedScreen()
+{
+    if(!dexed_)
+        return;
+
+    const char* page_name = "Algo";
+    switch(dexed_param_page_)
+    {
+        case DexedParamPage::Algo: page_name = "Algo"; break;
+        case DexedParamPage::Feedback: page_name = "Feedback"; break;
+        case DexedParamPage::Vibrato: page_name = "Vibrato"; break;
+        case DexedParamPage::Brightness: page_name = "Bright"; break;
+        case DexedParamPage::EnvSpeed: page_name = "EnvSpd"; break;
+        case DexedParamPage::Filter: page_name = "Filter"; break;
+        case DexedParamPage::Mix: page_name = "Mix"; break;
+        case DexedParamPage::Preset: page_name = "Preset"; break;
+        default: break;
+    }
+    char title[24];
+    snprintf(title, sizeof(title), "Dexed:%s", page_name);
+    disp_->SetCursor(0, 0);
+    WriteUpper(title);
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    switch(dexed_param_page_)
+    {
+        case DexedParamPage::Algo:
+        {
+            // Algorithm number (top-left, below the header) plus a real
+            // box diagram of its exact operator routing filling the rest
+            // of the page -- generically derived per-algorithm from
+            // FmCore::get_operator_routing() (never hand-authored per
+            // algorithm), so this is always exactly correct for whichever
+            // of the 32 is loaded.
+            int  algo0 = dexed_->GetPatchByte(134);
+            char line1[16];
+            snprintf(line1, sizeof(line1), "ALGO %d/32", algo0 + 1);
+            TomThumbDrawText(disp_, 0, 15, line1, true);
+
+            // --- Reconstruct the signal-flow graph -------------------
+            // Array index 0 = hardware OP6, index 5 = OP1 (confirmed from
+            // the real DX7 SysEx spec), matching render()'s own
+            // processing order (index 0..5) -- a bus can only ever be
+            // read by an operator whose index is higher than whichever
+            // operator(s) wrote it, so a single forward pass is enough to
+            // resolve every edge and depth.
+            int  input_bus[6], output_bus[6];
+            bool sums[6], is_carrier[6] = {}, has_fb[6];
+            for(int i = 0; i < 6; i++)
+            {
+                FmOperatorRouting r = FmCore::get_operator_routing((uint8_t)algo0, i);
+                input_bus[i]  = r.input_bus;
+                output_bus[i] = r.output_bus;
+                sums[i]       = r.sums;
+                has_fb[i]     = r.has_feedback;
+            }
+
+            int  edge_count[6] = {};
+            int  edge_from[6][6];
+            int  cur_writer_count[3] = {0, 0, 0}; // indexed by bus 1/2 (0 unused)
+            int  cur_writers[3][6];
+            for(int i = 0; i < 6; i++)
+            {
+                int ib = input_bus[i];
+                if(ib != 0)
+                {
+                    for(int k = 0; k < cur_writer_count[ib]; k++)
+                        edge_from[i][edge_count[i]++] = cur_writers[ib][k];
+                }
+                int ob = output_bus[i];
+                if(ob == 0)
+                {
+                    is_carrier[i] = true;
+                }
+                else if(sums[i] && cur_writer_count[ob] > 0)
+                {
+                    cur_writers[ob][cur_writer_count[ob]++] = i;
+                }
+                else
+                {
+                    cur_writers[ob][0] = i;
+                    cur_writer_count[ob] = 1;
+                }
+            }
+
+            // Row = depth from this operator's own chain root.
+            int depth[6];
+            for(int i = 0; i < 6; i++)
+            {
+                if(edge_count[i] == 0)
+                {
+                    depth[i] = 0;
+                }
+                else
+                {
+                    int maxd = 0;
+                    for(int k = 0; k < edge_count[i]; k++)
+                    {
+                        int pd = depth[edge_from[i][k]];
+                        if(pd > maxd)
+                            maxd = pd;
+                    }
+                    depth[i] = maxd + 1;
+                }
+            }
+
+            // Column: each independent chain root gets the next free
+            // column (in processing order, i.e. HW op6 first); an
+            // operator with a single parent extends that parent's column
+            // (straight chain) UNLESS the parent already has an earlier
+            // child claiming that column -- a parent feeding more than
+            // one child (e.g. algorithm 19's op6 feeding both op5 and
+            // op4) branches its later children into fresh columns
+            // instead of stacking them on top of each other. An operator
+            // with more than one parent (a converging algorithm, e.g.
+            // 16-18) sits centered between its parents' columns instead.
+            float column[6];
+            bool  column_claimed[6] = {};
+            int   next_root_col     = 0;
+            for(int i = 0; i < 6; i++)
+            {
+                if(edge_count[i] == 0)
+                {
+                    column[i] = (float)(next_root_col++);
+                }
+                else if(edge_count[i] == 1)
+                {
+                    int p = edge_from[i][0];
+                    if(!column_claimed[p])
+                    {
+                        column[i]         = column[p];
+                        column_claimed[p] = true;
+                    }
+                    else
+                    {
+                        column[i] = (float)(next_root_col++);
+                    }
+                }
+                else
+                {
+                    float sum = 0.f;
+                    for(int k = 0; k < edge_count[i]; k++)
+                        sum += column[edge_from[i][k]];
+                    column[i] = sum / (float)edge_count[i];
+                }
+            }
+            int num_columns = next_root_col;
+            int max_depth   = 0;
+            for(int i = 0; i < 6; i++)
+                if(depth[i] > max_depth)
+                    max_depth = depth[i];
+            int num_rows = max_depth + 1;
+
+            // --- Pixel layout, orthogonal connectors only -------------
+            // Diagram width stops short of the full screen width, and the
+            // OUT bus line only spans that same reduced width -- reserves
+            // a strip on the right no box or connector ever enters, so
+            // the "OUT" label can sit there with no risk of collision
+            // regardless of algorithm/column count.
+            const int kOutLabelW = 16;
+            const int kDiagTop   = 17;
+            const int kOutLineY  = kFooterDividerY - 1; // 45, just above the footer rule
+            const int kDiagWidth = disp_->Width() - kOutLabelW;
+            const float col_pitch = (float)kDiagWidth / (float)num_columns;
+            const float row_pitch = (float)(kOutLineY - kDiagTop) / (float)num_rows;
+            // Width is fixed and snug around the number's own ink (3px
+            // wide, see font_tomthumb.cpp's glyph table) plus a real 1px
+            // gap and a 1px border on each side -- not stretched to the
+            // column pitch, which has far more room to spare than the
+            // number ever needs and was what made boxes read as too
+            // wide. Height instead scales with row_pitch (rows are the
+            // genuinely scarce dimension), so the 29 algorithms with more
+            // vertical room to spare get visibly taller boxes; the floor
+            // (7 = 5px ink + 1px border each side, no extra gap left) is
+            // only actually reached by the three 4-row algorithms
+            // (1, 2, 18), where there's no more height to give.
+            const int box_w = 7;
+            int       box_h = (int)row_pitch;
+            if(box_h > 11) box_h = 11;
+            if(box_h < 7) box_h = 7;
+
+            int cx[6], cy[6];
+            for(int i = 0; i < 6; i++)
+            {
+                cx[i] = (int)(col_pitch * (column[i] + 0.5f));
+                cy[i] = kDiagTop + (int)(row_pitch * ((float)depth[i] + 0.5f));
+            }
+
+            // Connectors first (drawn under the boxes). A same-column
+            // parent drops a plain straight vertical line into the
+            // child's top edge. A cross-column parent (a converging
+            // algorithm, e.g. 16-18, or a parent branching into more than
+            // one child, e.g. 19) instead drops down to the CHILD's own
+            // row height and runs a horizontal segment straight into the
+            // middle of the child's near side edge -- no separate gutter
+            // row needed above the child, which is what leaves the extra
+            // vertical room for bigger boxes. Horizontal/vertical
+            // segments only, as required.
+            for(int i = 0; i < 6; i++)
+            {
+                for(int k = 0; k < edge_count[i]; k++)
+                {
+                    int p  = edge_from[i][k];
+                    int py = cy[p] + box_h / 2;
+                    if(cx[p] == cx[i])
+                    {
+                        disp_->DrawLine(cx[p], py, cx[i], cy[i] - box_h / 2, true);
+                    }
+                    else
+                    {
+                        int side_x = cx[p] < cx[i] ? cx[i] - box_w / 2 : cx[i] + box_w / 2;
+                        disp_->DrawLine(cx[p], py, cx[p], cy[i], true);
+                        disp_->DrawLine(cx[p], cy[i], side_x, cy[i], true);
+                    }
+                }
+            }
+
+            // OUT bus: every carrier drops a straight vertical line down
+            // to one shared horizontal line at the bottom of the diagram
+            // -- stops at kDiagWidth, clear of the reserved "OUT" label
+            // strip (see kOutLabelW above).
+            disp_->DrawLine(0, kOutLineY, kDiagWidth - 1, kOutLineY, true);
+            TomThumbDrawText(disp_, kDiagWidth + 2, kOutLineY - 1, "OUT", true);
+            for(int i = 0; i < 6; i++)
+                if(is_carrier[i])
+                    disp_->DrawLine(cx[i], cy[i] + box_h / 2, cx[i], kOutLineY, true);
+
+            // Boxes: filled = carrier (reaches the ear directly), outline
+            // = modulator. The real HW operator number (6-index) is
+            // punched through as "off" pixels when the box is filled so
+            // it still reads clearly against the solid fill.
+            for(int i = 0; i < 6; i++)
+            {
+                int x0 = cx[i] - box_w / 2, x1 = cx[i] + box_w / 2;
+                int y0 = cy[i] - box_h / 2, y1 = cy[i] + box_h / 2;
+                disp_->DrawRect(x0, y0, x1, y1, true, is_carrier[i]);
+                char num[2]  = {(char)('0' + (6 - i)), 0};
+                int  ink_w   = TomThumbInkWidth(num);
+                // Centered on ink width (not advance width) so the
+                // number sits with a true, symmetric 1px-or-more gap
+                // from the border on both sides -- box_w (7) is sized
+                // for the common 3px-wide digits, so '1' (2px ink) gets
+                // an extra spare pixel on the right rather than being
+                // pushed off-center.
+                int pen_x = x0 + 1 + (box_w - 2 - ink_w) / 2;
+                // Same margin-based centering vertically: ink is a fixed
+                // 5px tall, baseline sits 5 rows below its top -- when
+                // box_h is at its 7px floor this comes out flush against
+                // the border (no room left for a gap that small), but it
+                // grows into a real, symmetric gap on every algorithm
+                // with a taller box to spare.
+                int pen_y = y0 + 6 + (box_h - 7) / 2;
+                TomThumbDrawText(disp_, pen_x, pen_y, num, !is_carrier[i]);
+
+                // Feedback: an explicit "FB" tag beside the one operator
+                // (if any) with real self-feedback -- a small pixel
+                // bracket read poorly at this box size across several
+                // algorithms, so this uses actual text instead, which
+                // stays legible regardless of where that operator lands.
+                // Feedback operators are always chain roots (no incoming
+                // edges, confirmed from the routing data), so connectors
+                // only ever leave from their BOTTOM -- both side edges
+                // are always free for this label. Prefers the right side;
+                // falls back to the left if that would run past the
+                // reserved OUT-label strip.
+                if(has_fb[i])
+                {
+                    const char* fb = "FB";
+                    int         fb_w = TomThumbInkWidth(fb);
+                    int         fb_x = x1 + 2;
+                    if(fb_x + fb_w > kDiagWidth)
+                        fb_x = x0 - 2 - fb_w;
+                    TomThumbDrawText(disp_, fb_x, pen_y, fb, true);
+                }
+            }
+
+            char algo_val[8];
+            snprintf(algo_val, sizeof(algo_val), "%d", algo0 + 1);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Algo", algo_val, "", "");
+            DrawControlRow(
+                kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle -", "", "", "Cycle +");
+            break;
+        }
+        case DexedParamPage::Feedback:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(135));
+            disp_->SetCursor(0, 20);
+            WriteUpper("Feedback");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case DexedParamPage::Vibrato:
+        {
+            char speed_val[8], depth_val[8];
+            snprintf(speed_val, sizeof(speed_val), "%d", dexed_->GetPatchByte(137));
+            snprintf(depth_val, sizeof(depth_val), "%d", dexed_->GetPatchByte(139));
+            disp_->SetCursor(0, 20);
+            WriteUpper("Vibrato (automatic)");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Speed", speed_val, depth_val,
+                             "Depth");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case DexedParamPage::Brightness:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d%%", (int)(dexed_->GetBrightness01() * 100.f + 0.5f));
+            disp_->SetCursor(0, 20);
+            WriteUpper("Brightness");
+            disp_->SetCursor(0, 30);
+            WriteUpper("50% = as saved");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case DexedParamPage::EnvSpeed:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d%%", (int)(dexed_->GetEnvSpeed01() * 100.f + 0.5f));
+            disp_->SetCursor(0, 20);
+            WriteUpper("Envelope Speed");
+            disp_->SetCursor(0, 30);
+            WriteUpper("50% = as saved");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case DexedParamPage::Filter:
+        {
+            char mode_line[20];
+            snprintf(mode_line, sizeof(mode_line), "Mode: %s",
+                      FilterModeName(dexed_->GetFilterMode()));
+            disp_->SetCursor(0, 20);
+            WriteUpper(mode_line);
+
+            char cutoff_val[8], res_val[8];
+            snprintf(cutoff_val, sizeof(cutoff_val), "%d%%",
+                      (int)(dexed_->GetFilterCutoff01() * 100.f + 0.5f));
+            snprintf(res_val, sizeof(res_val), "%d%%",
+                      (int)(dexed_->GetFilterResonance01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Cutoff", cutoff_val, res_val,
+                             "Res");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle mode", "", "", "");
+            break;
+        }
+        case DexedParamPage::Mix:
+        {
+            char send_val[8], out_val[8];
+            snprintf(send_val, sizeof(send_val), "%d%%",
+                      (int)(dexed_->GetReverbSend01() * 100.f + 0.5f));
+            snprintf(out_val, sizeof(out_val), "%d%%",
+                      (int)(dexed_->GetOutputLevel01() * 100.f + 0.5f));
+            disp_->SetCursor(0, 20);
+            WriteUpper("Mix");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Rev", send_val, out_val,
+                             "Level");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
+        case DexedParamPage::Preset:
+        {
+            if(!PerformanceStore::IsCardPresent())
+            {
+                disp_->SetCursor(0, 20);
+                WriteUpper("No card");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Retry", "", "", "");
+                break;
+            }
+            if(dexed_preset_slots_dirty_)
+                RefreshDexedPresetSlots();
+
+            bool choosing_save    = save_load_mode_ == SaveLoadMode::ChoosingSave;
+            bool browsing_load    = save_load_mode_ == SaveLoadMode::BrowsingLoad;
+            bool load_chooser     = browsing_load && !load_browsing_files_;
+            bool browsing_folders
+                = browsing_load && load_browsing_files_ && !dexed_preset_folder_open_;
+            // A folder name isn't a preset -- nothing to confirm-load
+            // until "New" is picked at the top chooser, or a folder is
+            // actually open onto a real preset (see
+            // dexed_preset_folder_open_'s own comment).
+            bool can_hold_load = browsing_load
+                                  && (load_new_selected_
+                                      || (load_browsing_files_ && dexed_preset_folder_open_));
+
+            if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
+            {
+                float       held     = pod_->button2.TimeHeldMs();
+                int         w = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
+                const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
+                disp_->SetCursor(0, 20);
+                WriteUpper(hold_msg);
+                disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
+                if(w > 0)
+                    disp_->DrawRect(1, 31, w, 33, true, true);
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+                break;
+            }
+
+            if(choosing_save)
+            {
+                bool can_overwrite
+                    = dexed_loaded_preset_slot_ > DexedSynth::GetNumFactoryPresets();
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Overwrite%s", !save_as_new_ ? '>' : ' ',
+                          can_overwrite ? "" : " (n/a)");
+                snprintf(line2, sizeof(line2), "%c Save New", save_as_new_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(load_chooser)
+            {
+                char line1[24], line2[16];
+                snprintf(line1, sizeof(line1), "%c Files", !load_new_selected_ ? '>' : ' ');
+                snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
+                disp_->SetCursor(0, 16);
+                WriteUpper(line1);
+                disp_->SetCursor(0, 28);
+                WriteUpper(line2);
+            }
+            else if(browsing_folders)
+            {
+                int count = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
+                                ? DexedSynth::GetFactoryCategoryCount(dexed_preset_folder_cursor_)
+                                : dexed_preset_user_slot_count_;
+                char line2[24];
+                snprintf(line2, sizeof(line2), "Folder: %s (%d)",
+                          dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
+                              ? DexedSynth::GetFactoryCategoryName(dexed_preset_folder_cursor_)
+                              : "User",
+                          count);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else if(browsing_load) // load_browsing_files_ && dexed_preset_folder_open_
+            {
+                int  browsed_slot = ResolveDexedPresetSlot();
+                char line2[24];
+                if(browsed_slot < 0)
+                    snprintf(line2, sizeof(line2), "(empty)");
+                else if(browsed_slot <= DexedSynth::GetNumFactoryPresets())
+                    snprintf(line2, sizeof(line2), "Load: %s",
+                              DexedSynth::GetFactoryPresetName(browsed_slot - 1));
+                else
+                    snprintf(line2, sizeof(line2), "Load: %d", browsed_slot);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else
+            {
+                char line1[24];
+                if(dexed_loaded_preset_slot_ <= 0)
+                    snprintf(line1, sizeof(line1), "Now: (custom)");
+                else if(dexed_loaded_preset_slot_ <= DexedSynth::GetNumFactoryPresets())
+                    snprintf(line1, sizeof(line1), "Now: %s",
+                              DexedSynth::GetFactoryPresetName(dexed_loaded_preset_slot_ - 1));
+                else
+                    snprintf(line1, sizeof(line1), "Now: %d", dexed_loaded_preset_slot_);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line1);
+                if(dexed_preset_status_[0] != '\0')
+                {
+                    disp_->SetCursor(0, 32);
+                    WriteUpper(dexed_preset_status_);
+                }
+            }
+
+            {
+                const char* b1_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b1_label = "Save";
+                else if(load_chooser && !load_new_selected_)
+                    b1_label = "Select";
+                else if(browsing_folders)
+                    b1_label = "Open";
+                else
+                    b1_label = "Back";
+                const char* b2_label;
+                if(save_load_mode_ == SaveLoadMode::Idle)
+                    b2_label = "Load";
+                else if(choosing_save)
+                    b2_label = "Hold=Save";
+                else if(load_browsing_files_ && dexed_preset_folder_open_)
+                    b2_label = "Prev./Hold=Load";
+                else if(can_hold_load)
+                    b2_label = "Hold=Load";
+                else
+                    b2_label = "";
+
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY,
+                                 (choosing_save || browsing_load) ? "Scroll" : "", "", "", "");
+                DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, b1_label, "", "",
+                                 b2_label);
+            }
+            break;
+        }
+        default: break;
     }
 }
 
@@ -3282,7 +4182,7 @@ void Ui::DrawMixerScreen()
         DrawMixerVBar(bars_x0, kBarY0, kBarW, kBarH, vol01);
         DrawMixerVBar(bars_x0 + kBarW + kBarGap, kBarY0, kBarW, kBarH, second01);
 
-        if(!channel_is_master)
+        if(MixerChannelHasPan(ch))
         {
             float pan01 = MixerGetPan01(ch);
             disp_->DrawRect(bars_x0, kPanY, bars_x0 + bars_w - 1, kPanY + kPanH - 1, true, false);
@@ -3303,11 +4203,22 @@ void Ui::DrawMixerScreen()
     }
     else if(!mixer_target_reverb_)
     {
-        char pan_val[8];
-        snprintf(pan_val, sizeof(pan_val), "%d%%",
-                  (int)(MixerGetPan01(mixer_position_) * 100.f + 0.5f));
-        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, pan_val, "Pan");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol/Pan*", "", "", "Rev");
+        if(MixerChannelHasPan(mixer_position_))
+        {
+            char pan_val[8];
+            snprintf(pan_val, sizeof(pan_val), "%d%%",
+                      (int)(MixerGetPan01(mixer_position_) * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, pan_val, "Pan");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol/Pan*", "", "", "Rev");
+        }
+        else
+        {
+            // DXD: no Pan control yet -- K2 has nothing to do on this
+            // page, so the row just shows Volume alone instead of a Pan
+            // readout that wouldn't reflect anything real.
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol*", "", "", "Rev");
+        }
     }
     else
     {
@@ -3838,6 +4749,95 @@ void Ui::TriggerLoadGranularPreset()
     else
     {
         snprintf(granular_preset_status_, sizeof(granular_preset_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
+void Ui::RefreshDexedPresetSlots()
+{
+    dexed_preset_user_slot_count_
+        = PerformanceStore::ListDexedPresets(dexed_preset_user_slots_, kMaxDexedPresetSlots);
+    int folder_count = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
+                            ? DexedSynth::GetFactoryCategoryCount(dexed_preset_folder_cursor_)
+                            : dexed_preset_user_slot_count_;
+    if(dexed_preset_cursor_ >= folder_count)
+        dexed_preset_cursor_ = folder_count > 0 ? folder_count - 1 : 0;
+    dexed_preset_slots_dirty_ = false;
+}
+
+int Ui::ResolveDexedPresetSlot() const
+{
+    if(dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories)
+        return DexedSynth::GetFactoryCategorySlot(dexed_preset_folder_cursor_, dexed_preset_cursor_);
+    if(dexed_preset_cursor_ < 0 || dexed_preset_cursor_ >= dexed_preset_user_slot_count_)
+        return -1;
+    return dexed_preset_user_slots_[dexed_preset_cursor_];
+}
+
+void Ui::TriggerSaveDexedPreset(bool force_new)
+{
+    if(!dexed_)
+        return;
+    int slot = (!force_new && dexed_loaded_preset_slot_ > DexedSynth::GetNumFactoryPresets())
+                   ? dexed_loaded_preset_slot_
+                   : PerformanceStore::NextFreeDexedPresetSlot();
+    if(slot < 0)
+    {
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Card full/missing");
+        return;
+    }
+    bool ok = PerformanceStore::SaveDexedPreset(slot, dexed_->CapturePreset());
+    if(ok)
+    {
+        dexed_loaded_preset_slot_ = slot;
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Saved %d", slot);
+        dexed_preset_slots_dirty_ = true; // a new slot may now exist
+    }
+    else
+    {
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+    }
+}
+
+void Ui::TriggerNewDexedPreset()
+{
+    if(!dexed_)
+        return;
+    dexed_->ApplyPreset(DexedSynth::GetFactoryPreset(0));
+    dexed_loaded_preset_slot_ = 1;
+    snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "New (%s)",
+              DexedSynth::GetFactoryPresetName(0));
+}
+
+void Ui::TriggerLoadDexedPreset()
+{
+    if(!dexed_)
+        return;
+    if(!load_browsing_files_)
+    {
+        TriggerNewDexedPreset();
+        return;
+    }
+    int slot = ResolveDexedPresetSlot();
+    if(slot < 0)
+        return;
+
+    DexedSynth::DexedPresetData preset;
+    bool ok = PerformanceStore::LoadDexedPreset(slot, &preset);
+    if(ok)
+    {
+        dexed_->ApplyPreset(preset);
+        dexed_loaded_preset_slot_ = slot;
+        if(slot <= DexedSynth::GetNumFactoryPresets())
+            snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Loaded %s",
+                      DexedSynth::GetFactoryPresetName(slot - 1));
+        else
+            snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Loaded %d", slot);
+    }
+    else
+    {
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Fail:%s",
                   PerformanceStore::GetLastError());
     }
 }

@@ -71,11 +71,31 @@ uint8_t FmCore::get_carrier_operators(uint8_t algorithm)
 
   for (uint8_t i = 0; i < 6; i++)
   {
-    if ((alg.ops[i]&OUT_BUS_ADD) == OUT_BUS_ADD)
+    // A carrier is an operator that writes straight to the final mix --
+    // outbus (bits 0-1, OUT_BUS_ONE/OUT_BUS_TWO) both clear, exactly
+    // render()'s own `outptr = (outbus == 0) ? output : buf_[...]` check.
+    // NOT the OUT_BUS_ADD bit alone (a real, previously-latent bug fixed
+    // here): that flag just means "sum into my target rather than
+    // overwrite it" and is also set on plain modulators that sum into a
+    // shared bus (e.g. algorithms 16-18's converging chains) -- confirmed
+    // by decoding all 32 real algorithms, where the ADD-bit-alone check
+    // over-reports carriers on 15 of the 32.
+    if ((alg.ops[i] & (OUT_BUS_ONE | OUT_BUS_TWO)) == 0)
       op_out |= 1 << i;
   }
 
   return op_out;
+}
+
+FmOperatorRouting FmCore::get_operator_routing(uint8_t algorithm, int op)
+{
+  FmOperatorRouting r;
+  int32_t flags   = algorithms[algorithm].ops[op];
+  r.input_bus     = (flags >> 4) & 3;
+  r.output_bus    = flags & 3;
+  r.sums          = (flags & OUT_BUS_ADD) != 0;
+  r.has_feedback  = (flags & (FB_IN | FB_OUT)) == (FB_IN | FB_OUT);
+  return r;
 }
 
 void FmCore::dump() {

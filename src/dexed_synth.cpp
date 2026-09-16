@@ -9,6 +9,7 @@
 #include "msfa/porta.h"
 #include <cmath>
 #include <cstring>
+#include <cstdio>
 
 namespace
 {
@@ -61,6 +62,9 @@ void DexedSynth::Init(float sample_rate)
     PitchEnv::init(sample_rate_);
     Porta::init_sr(sample_rate_);
     Lfo::init(sample_rate_);
+
+    filter_l_.Init(sample_rate_);
+    filter_r_.Init(sample_rate_);
 
     ctrls_.core          = &engine_;
     ctrls_.values_[kControllerPitch]        = 0x2000; // centered, see Dx7Note::compute()'s pb math
@@ -192,10 +196,27 @@ void DexedSynth::NoteOn(uint8_t note, uint8_t velocity)
     // Adsr::Retrigger() convenience the removed FmSynth used, Dx7Note's
     // own init() already gives a full fresh envelope attack on its own,
     // so no separate retrigger-vs-fresh-strike branch is needed here.
+    //
+    // Brief critical section around the actual mutation: this runs from
+    // ControlTimerCallback (TIM5, a genuinely LOWER NVIC priority than
+    // the audio DMA ISR -- see that function's own doc comment), and
+    // Dx7Note::init() is a real multi-step write across several of this
+    // voice's internal fields (env_[], basepitch_[], algorithm_, ...),
+    // not an atomic flag set. RenderQuantum() (the audio ISR) reads this
+    // exact same voice's state every quantum and, being higher priority,
+    // can genuinely preempt this call mid-mutation -- real hardware
+    // playtesting reported dropped/glitched notes specifically under
+    // fast playing, consistent with landing in that window. Disabling
+    // IRQs for this one voice's own init() call (a small, fixed amount
+    // of work, never a loop over unbounded data) is enough to make it
+    // atomic with respect to the audio ISR without meaningfully risking
+    // that ISR's own timing.
+    __disable_irq();
     v.note.init(patch_, note, velocity, note, -1, &ctrls_);
     v.held_note    = note;
     v.velocity     = velocity;
     v.triggered_at = ++trigger_seq_;
+    __enable_irq();
 }
 
 void DexedSynth::NoteOff(uint8_t note)
@@ -204,12 +225,17 @@ void DexedSynth::NoteOff(uint8_t note)
     {
         if(voices_[i].held_note == (int)note)
         {
+            // Same race as NoteOn()'s own -- see its comment.
+            // Dx7Note::keyup() also writes multiple operators' env_[]
+            // state, not a single atomic flag.
+            __disable_irq();
             voices_[i].note.keyup();
             // Freed immediately (see NoteOn()'s own free-voice-
             // preference logic) -- the voice keeps rendering its own
             // real release tail regardless (see RenderQuantum(), which
             // computes every voice unconditionally).
             voices_[i].held_note = -1;
+            __enable_irq();
         }
     }
 }
@@ -238,25 +264,60 @@ DSY_ITCM_TEXT
 void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_send_l,
                         float* reverb_send_r)
 {
+    // Block-rate filter cutoff/res -- same curve/guard every other
+    // engine's own bus filter uses (see GranularEngine::Process()).
+    if(filter_mode_ != FilterMode::Off)
+    {
+        float cutoff_hz = kFilterMinHz * powf(kFilterMaxHz / kFilterMinHz, filter_cutoff01_);
+        float nyquist_guard = sample_rate_ / 3.f - 1.f;
+        cutoff_hz = cutoff_hz < kFilterMinHz ? kFilterMinHz
+                    : cutoff_hz > nyquist_guard ? nyquist_guard
+                                                : cutoff_hz;
+        filter_l_.SetFreq(cutoff_hz);
+        filter_l_.SetRes(filter_res01_ * 0.9f);
+        filter_r_.SetFreq(cutoff_hz);
+        filter_r_.SetRes(filter_res01_ * 0.9f);
+    }
+
     const float send = reverb_send01_;
     for(size_t i = 0; i < size; i++)
     {
         if(stage_pos_ >= kMsfaBlock)
             RenderQuantum();
 
-        float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale * output_level_;
+        float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale;
         stage_pos_++;
+
+        // Post-mix bus filter, same shape/position as GranularEngine's
+        // own (before the soft limiter, so a resonant peak still gets
+        // caught by it) -- both filter_l_/filter_r_ process the same
+        // mono input for now (Dexed has no Pan control yet, a later
+        // increment), matching the pair-of-filters convention every
+        // other engine here uses rather than a single mono filter, so
+        // stereo behavior is a smaller change to add later.
+        if(filter_mode_ != FilterMode::Off)
+        {
+            filter_l_.Process(s);
+            filter_r_.Process(s);
+            switch(filter_mode_)
+            {
+                case FilterMode::LowPass: s = filter_l_.Low(); break;
+                case FilterMode::HighPass: s = filter_l_.High(); break;
+                case FilterMode::BandPass: s = filter_l_.Band(); break;
+                default: break;
+            }
+        }
 
         // Soft limiter, on top of kHeadroomScale's own real-measured
         // correction above -- catches genuinely rare peaks beyond what
         // that fixed scale already accounts for (bigger chords, unusual
-        // phase alignment) so those compress gracefully instead of
-        // hard-clipping, without needing this fixed scale to chase every
-        // last possible worst case on its own. tanhf() is near-
-        // transparent for normal signal levels (tanhf(0.5) attenuates
-        // only ~8%) and only compresses hard once a peak actually
-        // approaches/exceeds unity.
-        s = tanhf(s);
+        // phase alignment, or a resonant filter peak) so those compress
+        // gracefully instead of hard-clipping, without needing this
+        // fixed scale to chase every last possible worst case on its
+        // own. tanhf() is near-transparent for normal signal levels
+        // (tanhf(0.5) attenuates only ~8%) and only compresses hard once
+        // a peak actually approaches/exceeds unity.
+        s = tanhf(s) * output_level_;
         out_l[i] = s;
         out_r[i] = s;
         if(send > 0.f)
@@ -269,11 +330,20 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
 
 void DexedSynth::ApplyPatchToHeldVoices()
 {
+    // Called from the main loop (preset load/preview, macro knobs) --
+    // also a lower NVIC priority than the audio ISR, same race as
+    // NoteOn()/NoteOff()'s own (see NoteOn()'s comment). One short
+    // critical section per voice rather than one covering the whole
+    // loop, keeping each individual disable window as small as possible.
     for(int i = 0; i < kMaxVoices; i++)
     {
         Voice& v = voices_[i];
         if(v.held_note != -1)
+        {
+            __disable_irq();
             v.note.update(patch_, v.held_note, v.velocity, -1, &ctrls_);
+            __enable_irq();
+        }
     }
 }
 
@@ -329,12 +399,26 @@ void DexedSynth::SetEnvSpeed01(float v01)
     ApplyPatchToHeldVoices();
 }
 
+void DexedSynth::SetPatchByte(int byte_index, uint8_t value)
+{
+    if(byte_index < 0 || byte_index >= 156)
+        return;
+    patch_[byte_index]          = value;
+    patch_baseline_[byte_index] = value;
+    if(byte_index == 137) // LFO speed -- Lfo::reset() reads params[6] starting here
+        lfo_.reset(&patch_[137]);
+    ApplyPatchToHeldVoices();
+}
+
 DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
 {
     DexedPresetData p;
     std::memcpy(p.patch, patch_, 156);
-    p.reverb_send01  = reverb_send01_;
-    p.output_level01 = output_level01_;
+    p.reverb_send01   = reverb_send01_;
+    p.output_level01  = output_level01_;
+    p.filter_mode     = (int32_t)filter_mode_;
+    p.filter_cutoff01 = filter_cutoff01_;
+    p.filter_res01    = filter_res01_;
     return p;
 }
 
@@ -405,6 +489,19 @@ DexedSynth::DexedPresetData DexedSynth::GetFactoryPreset(int flat_index)
     return p;
 }
 
+namespace
+{
+void UnpackTrimmedVoiceName(const uint8_t* packed_voice, char out[11])
+{
+    uint8_t unpacked[156];
+    DexedSysex::UnpackVoice(packed_voice, unpacked);
+    memcpy(out, unpacked + 145, 10);
+    out[10] = '\0';
+    for(int i = 9; i >= 0 && out[i] == ' '; i--)
+        out[i] = '\0';
+}
+} // namespace
+
 const char* DexedSynth::GetFactoryPresetName(int flat_index)
 {
     static char                 name_buf[11];
@@ -412,11 +509,38 @@ const char* DexedSynth::GetFactoryPresetName(int flat_index)
     int                          local = 0;
     if(!ResolveFactoryIndex(flat_index, &cat, &local))
         return "?";
-    uint8_t unpacked[156];
-    DexedSysex::UnpackVoice(cat->packed_data + local * 128, unpacked);
-    std::memcpy(name_buf, unpacked + 145, 10);
-    name_buf[10] = '\0';
-    for(int i = 9; i >= 0 && name_buf[i] == ' '; i--)
-        name_buf[i] = '\0';
+    UnpackTrimmedVoiceName(cat->packed_data + local * 128, name_buf);
+
+    // Real factory banks occasionally have a long run of voices someone
+    // saved without ever renaming from a generic default (e.g. a whole
+    // stretch of bare "BELL") -- indistinguishable from each other while
+    // scrolling the preset browser (confirmed by real hardware testing:
+    // "a file named bells appears the same during a large portion of the
+    // K1 sweep"). Disambiguate with a running " N" suffix whenever a
+    // name repeats anywhere in this category, numbering every occurrence
+    // (including the first) so no two presets in the same category ever
+    // display identically.
+    int total_matches = 0;
+    int this_rank      = 0;
+    for(int i = 0; i < cat->count; i++)
+    {
+        char other[11];
+        UnpackTrimmedVoiceName(cat->packed_data + i * 128, other);
+        if(strcmp(other, name_buf) == 0)
+        {
+            total_matches++;
+            if(i <= local)
+                this_rank = total_matches;
+        }
+    }
+    if(total_matches > 1)
+    {
+        char suffix[6];
+        snprintf(suffix, sizeof(suffix), " %d", this_rank);
+        size_t name_len   = strlen(name_buf);
+        size_t suffix_len = strlen(suffix);
+        if(name_len + suffix_len <= 10)
+            strcat(name_buf, suffix);
+    }
     return name_buf;
 }

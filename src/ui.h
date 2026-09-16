@@ -6,6 +6,7 @@
 #include "font_tomthumb.h"
 
 class GranularEngine;
+class DexedSynth;
 
 // The whole "one encoder + push button, two knobs, two buttons, one small
 // OLED" menu system.
@@ -82,7 +83,8 @@ class Ui
               volatile bool*                granular_capturing,
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
-              size_t                        master_scope_capacity);
+              size_t                        master_scope_capacity,
+              DexedSynth*                   dexed);
 
     // Call once from main(), right after Init() -- applies the user's
     // saved startup defaults (see PerformanceStore::LoadPrefs()) on top
@@ -200,7 +202,10 @@ class Ui
         // already covers the "all 8 at a glance" job, so there's no
         // separate Overview stop in here too. Encoder click is unused
         // here, same as every other Pad/Granular-style screen.
-        Mixer
+        Mixer,
+        // Same treatment as Granular above, entered from Global:Dexed.
+        // See DexedParamPage for its own pages.
+        Dexed
     };
     // Shared save/load interaction state for Global:File, Pad Preset, and
     // Grains Preset -- only one of those three pages is ever visible at
@@ -250,6 +255,9 @@ class Ui
         // on/off toggle pulled forward from Stage 4, same idiom as Pad's
         // own toggle below.
         Granular,
+        // Entry point into Screen::Dexed, plus the on/off toggle -- same
+        // Button1-tap convention as Granular's own above.
+        Dexed,
         // On/off toggle only, same treatment as Pad/Granular above --
         // but for the whole 4-layer loop system, and a REAL stop (see
         // IsLooperEnabled()'s doc comment), not TogglePauseAll()'s own
@@ -321,6 +329,36 @@ class Ui
         kCount
     };
 
+    // Screen::Dexed's own pages -- a deliberately small "simple tier"
+    // (see the approved UI plan) for quick sound-shaping; deep per-
+    // operator editing lives in a separate advanced editor (a later
+    // phase), reached by an encoder click from the Preset page below.
+    enum class DexedParamPage
+    {
+        Algo,       // Button1 cycles the 32 real DX7 algorithms; no knobs
+        Feedback,   // K1 only, 0-7
+        // K1 = LFO speed, K2 = LFO pitch mod depth -- the patch's own
+        // baked-in automatic vibrato, distinct from the mod wheel's own
+        // separate ctrls_.wheel routing (already wired in Phase 4).
+        Vibrato,
+        // Bipolar macro, K1 only -- see DexedSynth::SetBrightness01()'s
+        // own doc comment for the scaling shape.
+        Brightness,
+        // Bipolar macro, K1 only -- see DexedSynth::SetEnvSpeed01()'s own
+        // doc comment.
+        EnvSpeed,
+        Filter, // Cutoff + Resonance, mode cycled by Button1
+        Mix,    // Reverb Send + Output Level
+        // Save/Load the whole Dexed sound as a preset, folder-browsing
+        // 150+ factory presets by real sound-type category plus a
+        // "User" folder of SD saves -- same two-level browsing shape
+        // the removed FmSynth's own Preset page used, generalized to
+        // more/larger categories. Encoder click here drills into the
+        // advanced per-operator editor (a later phase).
+        Preset,
+        kCount
+    };
+
     // One entry per distinct (screen, page) knob assignment -- NOT per
     // layer, because cursor_layer_ can only change while screen_==Home,
     // and entering a Layer page always passes through Home first (which
@@ -345,6 +383,7 @@ class Ui
         GlobalLooper, // no continuous knobs -- Button1 toggle only
         GlobalMixer, // entry point only -- see Screen::Mixer instead
         GlobalSdMgmt, // browses a list directly, no pickup used -- see GlobalPage::SdMgmt
+        GlobalDexed, // entry point only -- see Screen::Dexed instead
         // Screen::Granular's Grain page -- Button1/Button2 toggle which
         // pair the knobs reach (see granular_grain_target_gap_scan_).
         GranularGrainSizeFill,
@@ -372,6 +411,16 @@ class Ui
         MixerReverb,
         MixerMaster, // Master has no toggle -- Volume + Reverb Size, always
         MixerNoKnobs, // Overview/Scope stops -- no continuous knobs
+        // Screen::Dexed's own pages -- see DexedParamPage for what each
+        // one's knobs do.
+        DexedAlgo, // no continuous knobs -- Button1 cycles it
+        DexedFeedback,
+        DexedVibrato,
+        DexedBrightness,
+        DexedEnvSpeed,
+        DexedFilter,
+        DexedMix,
+        DexedPreset, // browses a list directly, no pickup used
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -427,13 +476,14 @@ class Ui
     void DrawSpeedScreen();
     void DrawGranularScreen();
     void DrawMixerScreen();
+    void DrawDexedScreen();
     // Screen::Mixer's own per-channel accessors -- channel index 0..3 is
     // Layer 1..4, 4 is Grains, 5 is Bypass, 6 is Master.
     // Kept as small indexed switches rather than a polymorphic interface
     // since there are only 7 cases and they already read/write each
     // engine's own real getters/setters directly -- no new state of its
     // own, this is purely another view onto values that already exist.
-    static constexpr int kNumMixerChannels = 7;
+    static constexpr int kNumMixerChannels = 8;
     // Total encoder "stops" in Screen::Mixer -- the 8 real channels above
     // plus the Scope stop (mixer_position_ == kNumMixerChannels). See
     // Screen::Mixer's own comment.
@@ -445,6 +495,11 @@ class Ui
     void        MixerSetVolume01(int ch, float v01);
     void        MixerSetPan01(int ch, float v01);   // no-op on Master
     void        MixerSetSend01(int ch, float v01);  // no-op on Master
+    // True for every channel except Master and DXD (ch 5) -- Dexed has no
+    // Pan control yet (a later increment), so its Mixer channel shows/
+    // edits Volume and Reverb Send like any other channel but leaves Pan
+    // out entirely instead of displaying a value that doesn't do anything.
+    bool        MixerChannelHasPan(int ch) const;
     // Small helper for the Detail page's vertical bars.
     void DrawMixerVBar(int x0, int y0, int w, int h, float v01);
     // All 8 channels' names across one row, each with a real vertical
@@ -623,6 +678,34 @@ class Ui
     // engine's own defaults, same fresh-start spirit as Global:File's
     // own TriggerNew().
     void TriggerNewGranularPreset();
+
+    // --- Dexed presets (DexedParamPage::Preset) --------------------------
+    // Two-level folder browsing (factory categories by real sound type,
+    // plus a trailing "User" folder of SD saves) -- same shape as the
+    // removed FmSynth's own preset browser (see
+    // dexed_preset_folder_cursor_/dexed_preset_folder_open_'s own
+    // comments), generalized to DexedSynth::kNumFactoryCategories
+    // (11, real sound-type folders) instead of a fixed 8.
+    void RefreshDexedPresetSlots();
+    int  ResolveDexedPresetSlot() const;
+    // Button1 short tap (force_new=false): smart save -- overwrites
+    // dexed_loaded_preset_slot_ if it names a real (non-factory) slot,
+    // else a new one. Button2 short tap (force_new=true): always a new
+    // slot. Same non-destructive reasoning as TriggerSave()'s own
+    // force_new.
+    void TriggerSaveDexedPreset(bool force_new = false);
+    // Load chooser confirmed with "New" highlighted -- applies factory
+    // preset 0, same fresh-start convention as the removed
+    // TriggerNewFmPreset().
+    void TriggerNewDexedPreset();
+    // Short tap while a preset is highlighted inside an open folder:
+    // applies it immediately to the live engine WITHOUT leaving the
+    // browser (live preview, scrolling K1 + tapping B2 auditions one
+    // preset after another) -- the SAME function as the hold-to-commit
+    // gesture, which additionally exits back to Idle. Confirmed as the
+    // real behavior of the removed FmSynth's own preset browser (not a
+    // separate non-committing "audition" primitive), reused as-is here.
+    void TriggerLoadDexedPreset();
     // Two-row control legend, drawn at the bottom of every screen in
     // Tom Thumb (see font_tomthumb.h): a knob row (circle icon) and a
     // button row (square icon), each with a label flush to the screen
@@ -746,12 +829,11 @@ class Ui
     // --- Per-engine on/off (see IsGranularEnabled()).
     bool granular_enabled_ = false;
     bool looper_enabled_   = true; // see IsLooperEnabled()'s own comment for why true
-    // Defaults true (unlike Granular's own false default) since there's
-    // no UI toggle for this yet (Phase 5 adds Screen::Dexed and a real
-    // Global:Dexed on/off page, matching Global:Granular's own Button1-
-    // tap convention) -- without this defaulting on, Phase 4's own real
-    // MIDI dispatch would have no way to actually be heard yet.
-    bool dexed_enabled_    = true;
+    // Same false default as Granular's own now that Global:Dexed's real
+    // on/off toggle exists (was temporarily true during Phase 4-6, back
+    // when there was no UI toggle yet and defaulting off would have made
+    // Dexed's own real MIDI dispatch unreachable/unheard).
+    bool dexed_enabled_    = false;
 
     uint32_t draw_counter_ = 0; // throttles the (slow, blocking-I2C) OLED redraw
 
@@ -915,4 +997,34 @@ class Ui
     // -1 = nothing loaded yet / current sound doesn't match a saved slot.
     int  granular_loaded_preset_slot_  = -1;
     char granular_preset_status_[24]   = {}; // last save/load result
+
+    // --- Dexed engine (Screen::Dexed) ------------------------------------
+    DexedSynth*    dexed_            = nullptr;
+    DexedParamPage dexed_param_page_ = DexedParamPage::Algo;
+
+    // --- Dexed presets (DexedParamPage::Preset) --------------------------
+    // Two-level folder browsing, same shape as the removed FmSynth's own
+    // preset browser (fm_preset_folder_cursor_/fm_preset_folder_open_) --
+    // dexed_preset_folder_cursor_ is 0..DexedSynth::kNumFactoryCategories-1
+    // for a real sound-type category, or ==kNumFactoryCategories itself
+    // for the trailing synthetic "User" folder holding every SD-saved
+    // slot. dexed_preset_folder_open_: false = K1 scrolls the folder
+    // list, true = K1 scrolls presets/slots inside the open folder.
+    int  dexed_preset_folder_cursor_ = 0;
+    bool dexed_preset_folder_open_   = false;
+    // Index WITHIN the open folder (not a flat index) -- resolved to a
+    // real 1-based PerformanceStore slot by ResolveDexedPresetSlot().
+    int  dexed_preset_cursor_ = 0;
+    // PerformanceStore::kMaxDexedPresets (1200) minus the current 961
+    // factory presets (11 sound-type categories + Rom 1-4) leaves up to
+    // 239 possible user slots -- 200 gives real headroom without needing
+    // to keep this in exact lockstep with the factory bank's own size.
+    static constexpr int kMaxDexedPresetSlots = 200;
+    int  dexed_preset_user_slots_[kMaxDexedPresetSlots] = {}; // SD user slots, ascending
+    int  dexed_preset_user_slot_count_                   = 0;
+    bool dexed_preset_slots_dirty_ = true; // forces one RefreshDexedPresetSlots() on entry
+    // Starts at slot 1 (factory preset 0, "ARP 2600"), matching
+    // DexedSynth::Init()'s own boot default.
+    int  dexed_loaded_preset_slot_ = 1;
+    char dexed_preset_status_[24]  = {}; // last save/load result, shown briefly
 };

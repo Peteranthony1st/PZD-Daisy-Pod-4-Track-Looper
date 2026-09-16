@@ -1,6 +1,8 @@
 #pragma once
 #include <cstdint>
 #include <cstddef>
+#include "daisysp.h"
+#include "looper_layer.h" // FilterMode, kFilterMinHz/kFilterMaxHz
 #include "msfa/dx7note.h"
 #include "msfa/controllers.h"
 #include "msfa/EngineMsfa.h"
@@ -82,6 +84,17 @@ class DexedSynth
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
+    // Post-mix bus filter, same shape as GranularEngine's own (a plain
+    // Svf pair, not part of the real DX7's own signal path -- this
+    // project's own addition, consistent with every other engine here
+    // having one).
+    void       SetFilterMode(FilterMode m) { filter_mode_ = m; }
+    FilterMode GetFilterMode() const { return filter_mode_; }
+    void       SetFilterCutoff01(float v01) { filter_cutoff01_ = v01; }
+    float      GetFilterCutoff01() const { return filter_cutoff01_; }
+    void       SetFilterResonance01(float v01) { filter_res01_ = v01; }
+    float      GetFilterResonance01() const { return filter_res01_; }
+
     // Bipolar macro knobs, centered at "as stored in the preset" (0.5),
     // matching the soft-pickup convention every other knob in this
     // project uses -- both scale linearly from 0x at v01=0 to 1x
@@ -107,6 +120,20 @@ class DexedSynth
     void  SetEnvSpeed01(float v01);
     float GetEnvSpeed01() const { return env_speed01_; }
 
+    // Direct single-byte patch edit -- writes both patch_ and
+    // patch_baseline_ (so Brightness/EnvSpeed's own baseline stays
+    // consistent with whatever's actually playing) and pushes the
+    // change to any currently-held voice via Dx7Note::update(), same
+    // click-free mechanism as SetPatch(). byte_index is a raw offset
+    // into the 156-byte unpacked layout (see dexed_synth.cpp's own
+    // comment for the full byte map) -- deliberately low-level rather
+    // than one named setter per parameter, since the UI needs this same
+    // shape for several independent single-byte fields (algorithm,
+    // feedback, LFO speed/depth) and a named setter per one would just
+    // be boilerplate.
+    void    SetPatchByte(int byte_index, uint8_t value);
+    uint8_t GetPatchByte(int byte_index) const { return patch_[byte_index]; }
+
     // A flat POD snapshot of the currently-loaded sound -- everything
     // needed to reproduce it via ApplyPreset(), same "preset != session
     // mix" split GranularEngine::GranularPresetData/the removed
@@ -115,9 +142,23 @@ class DexedSynth
     {
         uint8_t patch[156]  = {};
         float   reverb_send01  = 0.2f;
-        float   output_level01 = 0.8f;
+        // 0.6 (not 1.0) so a freshly-loaded factory/new preset lands at a
+        // safe, reasonable level by default -- factory presets never set
+        // this themselves (GetFactoryPreset() only fills in patch[]), so
+        // this default is literally what every one of the 700+ factory
+        // presets loads at.
+        float   output_level01 = 0.6f;
+        int32_t filter_mode     = (int32_t)FilterMode::Off;
+        float   filter_cutoff01 = 1.f;
+        float   filter_res01    = 0.f;
     };
-    void            ApplyPreset(const DexedPresetData& p) { SetPatch(p.patch, p.reverb_send01, p.output_level01); }
+    void ApplyPreset(const DexedPresetData& p)
+    {
+        SetPatch(p.patch, p.reverb_send01, p.output_level01);
+        SetFilterMode((FilterMode)p.filter_mode);
+        SetFilterCutoff01(p.filter_cutoff01);
+        SetFilterResonance01(p.filter_res01);
+    }
     DexedPresetData CapturePreset() const;
 
     // Factory presets: real DX7 patches, embedded from freely-
@@ -215,6 +256,11 @@ class DexedSynth
     // problem, not an average-loudness one).
     float output_level01_  = 0.8f;
     float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
+
+    daisysp::Svf filter_l_, filter_r_;
+    FilterMode   filter_mode_     = FilterMode::Off;
+    float        filter_cutoff01_ = 1.f;
+    float        filter_res01_    = 0.f;
 
     // msfa's native quantum -- Dx7Note::compute()/EngineMsfa::render()
     // always produce exactly this many samples per call (hardcoded via

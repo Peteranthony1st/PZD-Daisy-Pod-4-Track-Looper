@@ -32,7 +32,7 @@ The name, general concept, and file organization are based on
   `main.cpp` to switch it.
 
 - **MIDI IN** (optional) — the Pod's built-in MIDI jack, used to play the
-  Pad Synth and Grains instruments described below. Standard 5-pin DIN or
+  Dexed and Grains instruments described below. Standard 5-pin DIN or
   TRS MIDI IN, whatever your controller uses; no extra wiring needed.
 - **Micro SD Card** formatted to FAT32.
   Inserted into the pod to save and load your files. This is a
@@ -93,15 +93,15 @@ The name, general concept, and file organization are based on
 
 **Save/load**
 - Save and load full performances (all 4 layers' audio plus every
-  looper/tempo/global setting) to an SD card, up to 99 slots. Pad Synth,
-  Fm Synth, and Grains each have their own fully independent preset
+  looper/tempo/global setting) to an SD card, up to 99 slots. Dexed and
+  Grains each have their own fully independent preset
   systems (see above) — a performance deals only with the looper, and
   never embeds any instrument's sound, so switching/tweaking a synth's
   patch never disturbs a saved performance and vice versa.
 - Saving always offers a choice between Overwrite (the currently loaded
   file) and Save New; loading shows the same style of choice between
   browsing existing files or starting fresh with New — identical
-  convention across performances, Pad presets, and Grains presets.
+  convention across performances, Dexed presets, and Grains presets.
 - Export the current performance as a standard stereo WAV file — one full
   loop, every layer's live filter/effect/reverb chain and the
   master filter applied, peak-normalized so it doesn't come out quiet.
@@ -112,35 +112,37 @@ The name, general concept, and file organization are based on
   vari-speed is currently dialed in gets baked into the export on
   purpose, so you can capture a deliberate vari-speed effect to a file
 
-**Fm Synth** — a MIDI-played, 6-voice, 4-operator FM instrument running
-alongside the looper (`Global:Fm`, opened by clicking the encoder there),
-mutually exclusive with Pad Synth (enabling one turns the other off,
-since they share one "melodic voice" role and one Mixer channel). Four
-selectable operator-routing algorithms (Stack, Parallel, DualStack,
-YBranch — shown as a small Yamaha-style routing diagram on its own page),
-each operator's ratio quantized to a table of musically-clean multipliers
-so it always sounds in tune, plus depth/index per operator, coarse tune,
-a full ADSR, chorus, mod-wheel-assignable vibrato, its own filter, reverb
-send, output level, and pan. 36 built-in factory patches across 8 named
-categories (E.Piano, Bells, Mallets, Bass, Brass, Pad, Lead, plus a Basic
-category) browsed as folders — rotate to scroll, Button 1 opens a folder
-or backs out of one — with a short Button 2 tap previewing the
-highlighted patch live without leaving the browser, and up to 99 of your
-own on the SD card. Can be switched off entirely from `Global:Fm` to
-reclaim its CPU share.
-
-**Pad Synth** — a MIDI-played, 6-voice pad instrument running alongside
-the looper (`Global:Pad`, opened by clicking the encoder there). Tone
-(a dark↔bright oscillator registration morph) and gain, coarse tune
-(±24 semitones), a full Attack/Decay/Sustain/Release envelope, chorus,
-mod-wheel-assignable vibrato, its own filter (Off/Low/High/Band), reverb
-send, output level, and pan — plus a save/load preset system with ~14
-built-in factory patches and up to 99 of your own on the SD card. Can be
-switched off entirely from `Global:Pad` to reclaim its CPU share.
+**Dexed** — a MIDI-played, real 6-operator, 10-voice DX7 clone running
+alongside the looper (`Global:Dexed`, opened by clicking the encoder
+there), built around Google's own **msfa** DX7 emulation core — the real
+32 algorithms, the real envelope/scaling model, not an approximation.
+Off by default; switch it on from `Global:Dexed` (independent of
+Grains — no mutex, both can run together).
+- **961 factory presets** across 15 folders — 11 organized by real sound
+  type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/Perc/Choir/
+  Bells), plus **Rom 1**-**Rom 4**, the real, unsorted contents of the
+  actual Yamaha factory ROM cartridges — sourced from the official
+  MicroDexed project's own freely-distributed SD card banks, never
+  invented. Browsed as folders:
+  rotate to scroll, Button 1 opens a folder or backs out, a
+  short Button 2 tap previews the highlighted patch live without leaving
+  the browser, hold to commit — plus up to ~239 of your own on the SD
+  card.
+- **Algorithm page** shows a real box-and-arrow diagram of whichever of
+  the 32 algorithms is loaded (carriers filled, modulators outlined, feedback
+  tagged) — drawn fresh from the actual routing data, not 32 fixed
+  pictures. Cycle it with Knob 1 or Buttons 1/2.
+- **Brightness** and **Envelope Speed** macros scale every modulator's
+  level, or every operator's envelope rate, together — centered at "as
+  the preset saved it," so they're a quick sound-shaping layer on top of
+  any patch rather than a replacement for editing it.
+- Feedback, Vibrato (LFO speed/depth), its own filter, reverb send, and
+  output level round out the simple pages.
 
 **Grains** — a MIDI-played, monophonic granular instrument
 (`Global:Granular`), also running alongside the looper. Capture audio
-either by recording live input directly or pulling in whatever's already
+either by recording live input directly (also picks up Dexed's own
+sound if it's playing) or pulling in whatever's already
 on one of the 4 loop layers, then play it back through two overlapping
 grain layers: a fixed-position **Grain** cloud and a sweeping **Scan**
 layer, both sharing Size/Fill/Gap controls, plus Position, Tune (with
@@ -150,17 +152,22 @@ grain markers. Presets save the captured audio itself alongside every
 parameter, so loading one restores the exact sound, not just settings.
 Also switchable off from `Global:Granular` to free its CPU share.
 
+**Recording Dexed or Grains into a loop layer** — playing either
+instrument while a layer is actively recording/overdubbing captures its
+live sound directly into the take, mixed with your physical input, with
+no patch cable needed.
+
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
-there) with Volume/Pan/Reverb-Send for all 4 loop layers, Pad Synth (or
-Fm Synth, whichever's currently enabled — they share this one channel
-since only one is ever live at a time), Grains, and Bypass, plus
+there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains,
+and Bypass, Volume/Reverb-Send for Dexed (no Pan yet — a later
+increment), plus
 Volume/Reverb-Size for the final Master bus, ending in a live
 oscilloscope of the actual output mix. Rotate the encoder to step through
 each channel in turn; `Global:Mixer` itself shows an at-a-glance overview
 grid of all 8 channels' levels.
 
-**SD card management** — `Global:SdMgmt` lets you browse any of the 4
-save categories (Performances/Pad Presets/Fm Presets/Grains Presets) and
+**SD card management** — `Global:SdMgmt` lets you browse any of the 3
+save categories (Performances/Dexed Presets/Grains Presets) and
 Duplicate or Delete individual files directly on the card, without
 needing a computer. Deleting a file automatically closes the gap left behind —
 every higher-numbered file in that category shifts down to keep the
@@ -183,13 +190,13 @@ freed.
 - **Rotate** the encoder: on Home, moves between layers; on any other
   page, cycles through that page's sub-pages.
 - **Click** the encoder: from Home, opens the selected layer's pages; on
-  `Global:Fm`/`Global:Pad`/`Global:Granular`/`Global:Mixer`, drills into
-  that instrument/mixer's own screen; on any Fm Synth, Pad Synth, or
+  `Global:Dexed`/`Global:Granular`/`Global:Mixer`, drills into
+  that instrument/mixer's own screen; on any Dexed or
   Grains page, mutes/unmutes all 4 loop layers, same as every other
   Global page's click. On the Mixer screen itself, rotate steps through
   channels instead of pages (see below).
 - **Long-press** the encoder: from Home, opens Global settings; from
-  anywhere else (including Fm Synth, Pad Synth, Grains, and Mixer), goes
+  anywhere else (including Dexed, Grains, and Mixer), goes
   back to Home.
 
 Both knobs and both buttons are "soft" — what they do depends on which
@@ -255,51 +262,29 @@ hit Export gets baked into the file on purpose.
 | Global: File | Choosing Save: Overwrite/Save New; Browsing Load: scroll files | — | Save / Select file list (Load) / Back | Hold 800ms = Save or Load, whichever's open |
 | Global: SD Mgmt | Scroll (folder or file list) | — | Tap = drill in/back, Hold 800ms = Duplicate | Hold 1500ms = Delete |
 | Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
-| Global: Fm | — | — | Toggle Fm Synth on/off (also turns Pad off, they're mutually exclusive) | — |
-| Global: Pad | — | — | Toggle Pad Synth on/off (also turns Fm off) | — |
+| Global: Dexed | — | — | Toggle Dexed on/off (off by default) | — |
 | Global: Granular | — | — | Toggle Grains on/off | — |
 | Global: Looper | — | — | Toggle the whole 4-layer looper on/off | — |
 | Global: Mixer | — | — | — | — (push encoder to enter the Mixer screen) |
 
-**Fm Synth (`Screen::Fm`, rotate to cycle pages)**
+**Dexed (`Screen::Dexed`, rotate to cycle pages)**
 
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
-| Algo | — | — | Cycle algorithm (Stack/Parallel/DualStack/YBranch) | — |
-| Ratio | Op2 ratio | Op3 ratio | — | — |
-| Index | Op2 index | Op3 index | — | — |
-| Op4 | Op4 ratio | Op4 index | — | — |
-| Tune | Coarse tune, ±24 semitones | — | — | — |
-| ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
-| Chorus | Depth | Rate | — | — |
-| Vibrato | Depth | Rate | — | — |
+| Algo | Cycle algorithm (all 32, quantized) | — | Cycle back | Cycle forward |
+| Feedback | Feedback amount (0-7) | — | — | — |
+| Vibrato | LFO speed | LFO pitch-mod depth | — | — |
+| Brightness | Modulator level scale (center = as saved) | — | — | — |
+| EnvSpeed | Envelope rate scale (center = as saved) | — | — | — |
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Mix | Reverb send | Output level | — | — |
-| Mod Assign | — | — | Cycle mod wheel destination | — |
 | Preset | Rotate = scroll folders/presets | — | Save / Open folder / Back | Tap = preview, Hold 800ms = confirm |
 
-The Ratio, Index, and Op4 pages each show a small "Route:" line above the
-scope reflecting the *current* algorithm (e.g. `4>3>2>1` for Stack), since
-which operator feeds what changes depending on which algorithm is active.
-Clicking the encoder on any Fm Synth page mutes/unmutes all 4 loop
-layers, same as every Global page.
-
-**Pad Synth (`Screen::Pad`, rotate to cycle pages)**
-
-| Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
-|---|---|---|---|---|
-| Tone | Registration (dark↔bright) | Osc gain | — | — |
-| Tune | Coarse tune, ±24 semitones | — | — | — |
-| ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
-| Chorus | Depth | Rate | — | — |
-| Vibrato | Depth | Rate | — | — |
-| Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Mix | Reverb send | Output level | — | — |
-| Mod Assign | — | — | Cycle mod wheel destination | — |
-| Preset | See Save/load above | — | Save / Select (Load) / Back | Hold 800ms = confirm |
-
-Clicking the encoder on any Pad Synth page mutes/unmutes all 4 loop
-layers, same as every Global page.
+The Algo page shows a real box-and-arrow diagram of whichever algorithm
+is loaded (filled boxes = carriers, outlined = modulators, "FB" tags the
+one operator with feedback), redrawn fresh from the actual routing data
+for all 32 rather than 32 fixed pictures. Clicking the encoder on any
+Dexed page mutes/unmutes all 4 loop layers, same as every Global page.
 
 **Grains (`Screen::Granular`, rotate to cycle pages)**
 
@@ -320,16 +305,14 @@ layers.
 
 **Mixer (`Screen::Mixer`, rotate to step through channels)**
 
-Each of the 8 channels (Layer 1–4, Pad Synth/Fm Synth, Grains, Bypass,
+Each of the 8 channels (Layer 1–4, Grains, Dexed ("DXD"), Bypass,
 Master) gets its own stop; rotating past the last one shows a live
-oscilloscope of the final output mix, then wraps back to Layer 1. The
-4th channel shows whichever of Pad/Fm is currently enabled (labeled "PL"
-or "FM" on screen) — they share this one channel since only one is ever
-live at a time.
+oscilloscope of the final output mix, then wraps back to Layer 1.
 
 | Channel | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
-| Layer 1–4 / Pad-or-Fm / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| Layer 1–4 / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
+| DXD (Dexed) | Volume | — (no Pan yet) | Knobs → Volume | Knobs → Reverb send |
 | Master | Volume | Reverb size | — | — |
 
 ## Building and flashing
@@ -392,3 +375,9 @@ cd src && make
   for the tiny "Tom Thumb" font used throughout the OLED UI — a
   readability-tuned version of the original 3x5 font by Brian J.
   Swetland and Vassilii Khachaturov, ported here from Adafruit-GFX.
+- **Google's [msfa](https://github.com/google/music-synthesizer-for-android)**
+  (Apache License 2.0) — the real DX7 emulation core Dexed is built
+  around, vendored unmodified into `src/msfa/`.
+- **[MicroDexed](https://codeberg.org/dcoredump/MicroDexed)** — source of
+  Dexed's 961 factory presets, freely distributed as real DX7 SysEx
+  bank dumps.

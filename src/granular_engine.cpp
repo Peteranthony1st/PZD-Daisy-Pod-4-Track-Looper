@@ -45,9 +45,26 @@ void GranularEngine::Init(float sample_rate)
 void GranularEngine::SetOutputLevel01(float v01)
 {
     output_level01_ = Clampf(v01, 0.f, 1.f);
-    // Same curve PadSynth::SetOutputLevel01()/LooperLayer::SetVolume01()
-    // use, so all three engines' output-level knobs feel consistent.
-    output_level_ = powf(output_level01_, 2.5f) * 1.4f;
+    // Same shape (not the same ceiling) as LooperLayer::SetVolume01()'s
+    // own curve -- deliberately diverges here. This engine's own signal
+    // chain already loses real level nothing else in the project has to:
+    // overlap-gain compensation (1/fill_count_, up to -6dB+ depending on
+    // Fill) and the shared linear center-pan law (-6dB at center,
+    // unavoidable without diverging that too) both eat into it before
+    // this multiply even runs. Real hardware testing (user report: still
+    // very quiet with Mixer's Grains channel at 100%, i.e. output_level01_
+    // ==1) confirmed the old 1.4x ceiling didn't leave this knob enough
+    // real headroom to compensate. Process()'s own tanhf() soft limiter
+    // (added alongside this change) is what makes it safe to push this
+    // much higher without harsh digital clipping once a user actually
+    // turns this all the way up -- pushed again after a second real-
+    // hardware report that 4x's ceiling was still too quiet: at the top
+    // of the range this now drives tanhf() into real, deliberate
+    // saturation (louder AND more compressed, not just louder) rather
+    // than staying clean, which is the tradeoff needed to make "all the
+    // way up" actually loud given how much this engine's own gain chain
+    // (overlap-gain, center pan) eats before this multiply runs.
+    output_level_ = powf(output_level01_, 2.5f) * 12.f;
 }
 
 void GranularEngine::SetPan01(float v01)
@@ -612,6 +629,18 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
 
         fl *= output_level_ * pan_l_gain_;
         fr *= output_level_ * pan_r_gain_;
+
+        // Soft limiter -- output_level_'s own ceiling was raised well past
+        // unity (see SetOutputLevel01()'s comment) specifically so the
+        // Output Level knob has enough real headroom to compensate for
+        // this engine's own overlap-gain and center-pan attenuation, which
+        // Dexed/the loop layers don't have -- this is what makes pushing
+        // that knob all the way up loud instead of just clipping. tanhf()
+        // is near-transparent at normal levels and only compresses once a
+        // peak actually approaches/exceeds unity, same convention as
+        // DexedSynth::Process()'s own limiter.
+        fl = tanhf(fl);
+        fr = tanhf(fr);
 
         out_l[i] = fl;
         out_r[i] = fr;
