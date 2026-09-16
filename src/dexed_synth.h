@@ -4,7 +4,9 @@
 #include "msfa/dx7note.h"
 #include "msfa/controllers.h"
 #include "msfa/EngineMsfa.h"
+#include "msfa/fm_core.h"
 #include "msfa/lfo.h"
+#include "dexed_factory_data.h"
 
 // DX7/msfa port (see the approved plan). Phase 2 measured real per-voice
 // CPU cost on hardware (1/2/8/10 simultaneous voices, ~7% fixed + ~2.3%/
@@ -80,6 +82,62 @@ class DexedSynth
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
+    // Bipolar macro knobs, centered at "as stored in the preset" (0.5),
+    // matching the soft-pickup convention every other knob in this
+    // project uses -- both scale linearly from 0x at v01=0 to 1x
+    // (unchanged) at v01=0.5 to 2x at v01=1. Directly mutate patch_
+    // (relative to patch_baseline_, the pristine values captured at the
+    // last SetPatch() call) and push the result to any currently-held
+    // voice via Dx7Note::update() (not init()), so turning either while
+    // holding a note doesn't click or retrigger it. Saving a preset
+    // captures patch_ as-is -- these are real, persistent edits, not a
+    // transient overlay that resets on save (matches how every other
+    // knob/preset in this project already works).
+    //
+    // Brightness scales the output level of every operator NOT in
+    // FmCore::get_carrier_operators(patch_baseline_[134])'s mask
+    // (i.e. every modulator, for whichever of the 32 algorithms is
+    // currently loaded) -- carriers are untouched, since boosting a
+    // carrier only changes volume, not timbre.
+    void  SetBrightness01(float v01);
+    float GetBrightness01() const { return brightness01_; }
+    // Scales all 6 operators' 4 EG rates together -- does NOT touch the
+    // pitch EG (Dx7Note::update() never re-applies patch bytes 126-133
+    // regardless, see dexed_synth.cpp's own comment).
+    void  SetEnvSpeed01(float v01);
+    float GetEnvSpeed01() const { return env_speed01_; }
+
+    // A flat POD snapshot of the currently-loaded sound -- everything
+    // needed to reproduce it via ApplyPreset(), same "preset != session
+    // mix" split GranularEngine::GranularPresetData/the removed
+    // FmSynth::FmPresetData already use in this project.
+    struct DexedPresetData
+    {
+        uint8_t patch[156]  = {};
+        float   reverb_send01  = 0.2f;
+        float   output_level01 = 0.8f;
+    };
+    void            ApplyPreset(const DexedPresetData& p) { SetPatch(p.patch, p.reverb_send01, p.output_level01); }
+    DexedPresetData CapturePreset() const;
+
+    // Factory presets: real DX7 patches, embedded from freely-
+    // distributed real SysEx bank data (see dexed_factory_data.h/.cpp's
+    // own doc comment for the source) -- organized into named
+    // categories by real sound type (Synth/Piano/E.Piano/Bass/Strings/
+    // Woodwind/Brass/Organ/Percussion/Choir/Bells), addressed by a flat
+    // 0-based index resolved against that category table. Same
+    // {name,count}-contiguous-range shape the removed FmSynth used for
+    // its own (much smaller) factory bank, generalized to more/larger
+    // categories. All `static` -- no instance needed, matching FmSynth's
+    // own convention (PerformanceStore calls these directly).
+    static int             GetNumFactoryPresets();
+    static const char*     GetFactoryCategoryName(int cat);
+    static int              GetFactoryCategoryCount(int cat);
+    static int              GetFactoryCategorySlot(int cat, int local_index); // -> flat 1-based slot
+    static DexedPresetData  GetFactoryPreset(int flat_index); // 0-based; unpacks on demand
+    static const char*      GetFactoryPresetName(int flat_index); // reads the patch's own real name bytes
+    static constexpr int kNumFactoryCategories = kDexedNumFactoryCategories;
+
     // The real, committed voice count -- chosen from Phase 2's own
     // hardware CPU measurement (see the class doc comment above), not a
     // guess or a value carried over from any other engine.
@@ -98,6 +156,19 @@ class DexedSynth
     // merely "released" (NoteOff already called, but still ringing out).
     bool VoiceIsIdle(int voice_index);
 
+    // Copies new_patch into patch_ and patch_baseline_ (the reference
+    // point SetBrightness01()/SetEnvSpeed01() scale relative to,
+    // re-centering both macros back to 0.5), then pushes it to every
+    // currently-held voice via Dx7Note::update() (not init()) so
+    // switching/previewing a preset doesn't retrigger or click an
+    // already-held note. Used by ApplyPreset() and (in a later phase)
+    // the Preset page's load/preview flow.
+    void SetPatch(const uint8_t new_patch[156], float reverb_send01, float output_level01);
+    // Shared by SetPatch()/SetBrightness01()/SetEnvSpeed01() -- pushes
+    // the current patch_ to every voice with held_note != -1 via
+    // Dx7Note::update(), using that voice's own cached velocity.
+    void ApplyPatchToHeldVoices();
+
     struct Voice
     {
         Dx7Note note;
@@ -105,6 +176,11 @@ class DexedSynth
         // voice immediately rather than waiting for its release tail to
         // finish). Otherwise the MIDI note currently assigned here.
         int      held_note   = -1;
+        // Cached at NoteOn() time -- Dx7Note::update() (unlike init())
+        // still needs a velocity to recompute ScaleVelocity()-based
+        // output level, but doesn't take one as an already-tracked
+        // implicit voice property the way real hardware would.
+        uint8_t  velocity     = 100;
         uint32_t triggered_at = 0;
     };
     Voice       voices_[kMaxVoices];
@@ -118,6 +194,15 @@ class DexedSynth
     // independent oscillator per note).
     Lfo     lfo_;
     uint8_t patch_[156];
+    // Pristine copy of patch_ as of the last SetPatch() call -- the
+    // reference point Brightness/EnvSpeed scale relative to (so
+    // repeatedly nudging a macro knob back and forth doesn't compound
+    // rounding drift against its own previous output).
+    uint8_t patch_baseline_[156] = {};
+    // Centered at 0.5 ("as stored") -- see SetBrightness01()/
+    // SetEnvSpeed01()'s own doc comment for the bipolar scale shape.
+    float brightness01_ = 0.5f;
+    float env_speed01_  = 0.5f;
 
     float sample_rate_     = 48000.f;
     float reverb_send01_   = 0.f;

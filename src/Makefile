@@ -1,6 +1,6 @@
 TARGET = main
 
-CPP_SOURCES = main.cpp looper_layer.cpp tempo_clock.cpp ui.cpp performance_store.cpp font_tomthumb.cpp granular_engine.cpp dexed_synth.cpp
+CPP_SOURCES = main.cpp looper_layer.cpp tempo_clock.cpp ui.cpp performance_store.cpp font_tomthumb.cpp granular_engine.cpp dexed_synth.cpp dexed_sysex.cpp dexed_factory_data.cpp
 # msfa (the real DX7 emulation core, vendored from Synth_Dexed -- see
 # msfa/synth.h's own provenance comment).
 CPP_SOURCES += msfa/exp2.cpp msfa/freqlut.cpp msfa/sin.cpp msfa/fm_op_kernel.cpp msfa/fm_core.cpp msfa/env.cpp msfa/pitchenv.cpp msfa/lfo.cpp msfa/porta.cpp msfa/dx7note.cpp msfa/EngineMsfa.cpp

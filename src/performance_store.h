@@ -4,6 +4,7 @@
 #include "tempo_clock.h"
 #include "looper_layer.h"
 #include "granular_engine.h"
+#include "dexed_synth.h"
 
 // SD card save/load for a whole "performance" (all layers' audio plus
 // tempo/global/per-layer settings) as one flat binary file per slot.
@@ -145,6 +146,37 @@ int  NextFreeGranularPresetSlot();
 // through GranularEngine at all.
 bool DeleteGranularPreset(int slot, int* loaded_slot_inout = nullptr);
 bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Dexed presets: parameters only, no audio -- same shape as the
+// removed FmSynth/PadSynth presets, including the same factory range:
+// 1..DexedSynth::GetNumFactoryPresets() are the permanently read-only,
+// firmware-embedded factory presets (real DX7 patches, see
+// dexed_factory_data.h/.cpp) -- LoadDexedPreset() serves those directly
+// without touching the card, and SaveDexedPreset()/
+// NextFreeDexedPresetSlot() never target them. User saves start right
+// after that range. Unlike the removed Fm/Pad presets' fixed factory
+// count, this range is sized from the real embedded data (704 patches
+// as of writing) rather than a compile-time constant.
+constexpr int kMaxDexedPresets = 900; // headroom above the current 704 factory presets
+
+bool SaveDexedPreset(int slot, const DexedSynth::DexedPresetData& preset);
+bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset);
+// Lists existing USER slots only (ascending) -- factory presets are
+// always available and aren't part of this scan. Same shape as
+// ListSlots().
+int  ListDexedPresets(int* out_numbers, int max_out);
+// Lowest free USER slot, or -1 if the whole range is full/no card.
+int  NextFreeDexedPresetSlot();
+// Refuses factory slots (1..DexedSynth::GetNumFactoryPresets() aren't
+// files at all) same as SaveDexedPreset() -- see DeleteSlot()/
+// DuplicateSlot() above for the general shape, including the same
+// gap-closing renumbering and loaded_slot_inout follow-along. The
+// factory range itself is never deleted/compacted through this path --
+// see CompactSlotsAfterDelete()'s own doc comment in the .cpp for why
+// that renumbering scheme is fundamentally incompatible with a fixed,
+// ordered factory bank.
+bool DeleteDexedPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicateDexedPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
 
 // Importing a user-supplied WAV file (from a computer, dropped into
 // IMPORT/ on the SD card) as Grains capture audio -- a third capture

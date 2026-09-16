@@ -65,6 +65,14 @@ void GranularPresetFilename(int slot, char* out, size_t out_size)
     snprintf(out, out_size, "GRNP/PRES%03d.DAT", slot);
 }
 
+// Own subfolder/numbering, same reasoning as GranularPresetFilename()
+// above. Only ever called for USER slots (see SaveDexedPreset() and
+// friends' own factory-range guard) -- factory slots are never files.
+void DexedPresetFilename(int slot, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "DEXP/PRES%03d.DAT", slot);
+}
+
 // Own subfolder for user-supplied WAV files to import as Grains capture
 // audio -- unlike every other subfolder here, filenames underneath this
 // one are arbitrary (whatever the user named the file on their
@@ -890,6 +898,17 @@ struct GranularPresetFileHeader
     uint32_t audio_len;
 };
 constexpr uint32_t kGranularPresetFileVersion = 1;
+
+// Same shape as GranularPresetFileHeader above, own magic/version. No
+// audio, so no audio_len field -- just the header plus one raw
+// DexedPresetData block, a single small f_write()/f_read() like the
+// removed Fm/Pad presets used.
+struct DexedPresetFileHeader
+{
+    char     magic[4]; // "DEXP"
+    uint32_t version;
+};
+constexpr uint32_t kDexedPresetFileVersion = 1;
 } // namespace
 
 bool SaveGranularPreset(int                                       slot,
@@ -1129,6 +1148,187 @@ bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress
     }
     char dst[24];
     GranularPresetFilename(new_slot, dst, sizeof(dst));
+    if(!CopyFileChunked(src, dst, on_progress))
+        return false;
+    *out_new_slot = new_slot;
+    return true;
+}
+
+bool SaveDexedPreset(int slot, const DexedSynth::DexedPresetData& preset)
+{
+    if(!card_ready || slot <= DexedSynth::GetNumFactoryPresets() || slot > kMaxDexedPresets)
+        return false;
+
+    char fname[24];
+    DexedPresetFilename(slot, fname, sizeof(fname));
+
+    FRESULT mkdir_res = f_mkdir("DEXP");
+    if(mkdir_res != FR_OK && mkdir_res != FR_EXIST)
+    {
+        SetError("mkdir", mkdir_res);
+        return false;
+    }
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    static DexedPresetFileHeader hdr;
+    hdr = DexedPresetFileHeader{};
+    memcpy(hdr.magic, "DEXP", 4);
+    hdr.version = kDexedPresetFileVersion;
+
+    static DexedSynth::DexedPresetData data;
+    data = preset;
+
+    UINT bw;
+    fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
+    bool ok = fr == FR_OK && bw == sizeof(hdr);
+    if(ok)
+    {
+        fr = f_write(&file, &data, sizeof(data), &bw);
+        ok = fr == FR_OK && bw == sizeof(data);
+    }
+    if(!ok)
+        SetError("data", fr);
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK)
+        SetError("close", close_res);
+    return ok && close_res == FR_OK;
+}
+
+bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset)
+{
+    if(slot < 1 || slot > kMaxDexedPresets || !out_preset)
+        return false;
+    if(slot <= DexedSynth::GetNumFactoryPresets())
+    {
+        *out_preset = DexedSynth::GetFactoryPreset(slot - 1);
+        return true;
+    }
+    if(!card_ready)
+        return false;
+
+    char fname[24];
+    DexedPresetFilename(slot, fname, sizeof(fname));
+
+    ClearError();
+    static FIL file;
+    FRESULT    fr = f_open(&file, fname, FA_READ);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    static DexedPresetFileHeader hdr;
+    hdr = DexedPresetFileHeader{};
+    UINT br;
+    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
+    bool ok = fr == FR_OK && br == sizeof(hdr);
+    if(ok && (memcmp(hdr.magic, "DEXP", 4) != 0 || hdr.version != kDexedPresetFileVersion))
+    {
+        ok = false;
+        SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
+    }
+    else if(!ok)
+    {
+        SetError("hdr", fr);
+    }
+
+    static DexedSynth::DexedPresetData data;
+    data = DexedSynth::DexedPresetData{};
+    if(ok)
+    {
+        fr = f_read(&file, &data, sizeof(data), &br);
+        ok = fr == FR_OK && br == sizeof(data);
+        if(!ok)
+            SetError("data", fr);
+    }
+    if(ok)
+        *out_preset = data;
+
+    FRESULT close_res = f_close(&file);
+    if(close_res != FR_OK)
+        SetError("close", close_res);
+    return ok && close_res == FR_OK;
+}
+
+int ListDexedPresets(int* out_numbers, int max_out)
+{
+    if(!card_ready)
+        return 0;
+    int count = 0;
+    for(int slot = DexedSynth::GetNumFactoryPresets() + 1;
+        slot <= kMaxDexedPresets && count < max_out; slot++)
+    {
+        char    fname[24];
+        FILINFO fno;
+        DexedPresetFilename(slot, fname, sizeof(fname));
+        if(f_stat(fname, &fno) == FR_OK)
+            out_numbers[count++] = slot;
+    }
+    return count;
+}
+
+int NextFreeDexedPresetSlot()
+{
+    if(!card_ready)
+        return -1;
+    for(int slot = DexedSynth::GetNumFactoryPresets() + 1; slot <= kMaxDexedPresets; slot++)
+    {
+        char    fname[24];
+        FILINFO fno;
+        DexedPresetFilename(slot, fname, sizeof(fname));
+        if(f_stat(fname, &fno) != FR_OK)
+            return slot;
+    }
+    return -1;
+}
+
+bool DeleteDexedPreset(int slot, int* loaded_slot_inout)
+{
+    if(!card_ready || slot <= DexedSynth::GetNumFactoryPresets() || slot > kMaxDexedPresets)
+        return false;
+    char fname[24];
+    DexedPresetFilename(slot, fname, sizeof(fname));
+    if(!DeleteFileGeneric(fname))
+        return false;
+    if(loaded_slot_inout && *loaded_slot_inout == slot)
+        *loaded_slot_inout = 0;
+    CompactSlotsAfterDelete(slot, kMaxDexedPresets, DexedPresetFilename, loaded_slot_inout);
+    return true;
+}
+
+bool DuplicateDexedPreset(int slot, int* out_new_slot, ProgressFn on_progress)
+{
+    if(!out_new_slot)
+        return false;
+    *out_new_slot = -1;
+    if(!card_ready || slot <= DexedSynth::GetNumFactoryPresets() || slot > kMaxDexedPresets)
+        return false;
+    char    src[24];
+    FILINFO fno;
+    DexedPresetFilename(slot, src, sizeof(src));
+    if(f_stat(src, &fno) != FR_OK)
+    {
+        SetError("dupsrc", FR_NO_FILE);
+        return false;
+    }
+    int new_slot = NextFreeDexedPresetSlot();
+    if(new_slot < 0)
+    {
+        SetError("dupslot", FR_OK);
+        return false;
+    }
+    char dst[24];
+    DexedPresetFilename(new_slot, dst, sizeof(dst));
     if(!CopyFileChunked(src, dst, on_progress))
         return false;
     *out_new_slot = new_slot;

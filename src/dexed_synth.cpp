@@ -1,5 +1,6 @@
 #include "dexed_synth.h"
 #include "itcm.h"
+#include "dexed_sysex.h"
 #include "msfa/exp2.h"
 #include "msfa/sin.h"
 #include "msfa/freqlut.h"
@@ -22,17 +23,27 @@ namespace
 // note, though -- msfa's internal envelope/gain-staging deliberately
 // carries headroom well above nominal unity (the same "room for FM
 // modulation to push past simple +-1 waveshaping" design every fixed-
-// point FM engine like this needs), and this project's own test patch
-// sums 6 fully additive carriers on top of that. Measured directly on
-// real hardware (temporary peak-diagnostic instrumentation, since
-// removed): a single note peaks at ~1.74x this naive Q24-only scale, a
-// 3-note chord ~4.41x. kHeadroomScale is sized from that real number
-// (not a guess) so a 3-note chord lands right at the edge of unity,
-// leaving tanhf()'s own soft limiter in Process() to only ever have to
-// handle genuinely rare, bigger peaks (bigger chords, unusual phase
-// alignment) rather than routinely saturating hard on ordinary playing.
+// point FM engine like this needs). Measured directly on real hardware
+// (temporary peak-diagnostic instrumentation, since removed) against
+// this project's own worst-case 6-fully-additive-carrier test patch: a
+// single note peaked at ~1.74x this naive Q24-only scale, a 3-note
+// chord ~4.41x.
+//
+// An initial kHeadroomScale of 1/4.41 (landing that 3-note chord right
+// at the edge of unity) turned out to leave no real margin once real
+// factory patches (this project's own hand-tuned test patch was, if
+// anything, unusually mild -- many real patches use feedback, which
+// self-modulates far harder) and real polyphonic chords beyond 3 notes
+// entered the picture: tanhf()'s own soft limiter in Process() was
+// routinely engaging hard enough to audibly compress/distort a plain
+// single real patch playing alone, not just catching rare outlier
+// peaks the way it's meant to. Doubled again here for real margin --
+// tanhf() should stay a rare safety net for genuine outliers (bigger
+// chords, unusual phase alignment, hotter-than-average patches), not
+// something routine playing runs into; overall loudness is what the
+// master volume knob (already reaching up to 1.43x at 100%) is for.
 constexpr float kQ24Scale      = 1.f / (float)(1 << 24);
-constexpr float kHeadroomScale = 1.f / 4.41f;
+constexpr float kHeadroomScale = 1.f / 8.82f;
 } // namespace
 
 void DexedSynth::Init(float sample_rate)
@@ -77,83 +88,22 @@ void DexedSynth::Init(float sample_rate)
     ctrls_.wheel.setTarget(1); // bit0 = pitch
     ctrls_.refresh();
 
-    // Hardcoded test patch (Phase 2 only -- Phase 6 adds real preset
-    // save/load, Phase 7 real SysEx import): DX7 algorithm 32 (index 31,
-    // see msfa/fm_core.cpp's own algorithms table) -- all 6 operators are
-    // independent carriers summed straight into the main output, no
-    // modulation chains and no feedback, i.e. a plain 6-partial additive/
-    // organ-style patch. Chosen for Phase 2 specifically because it's
-    // the algorithm that exercises all 6 operators' real per-sample cost
-    // every single note, the same worst-case-per-voice shape this
-    // phase's CPU measurement needs -- not because it's a good-sounding
-    // patch (Phase 6+ ships real, well-known factory patches instead).
-    std::memset(patch_, 0, sizeof(patch_));
-    const int   kCoarse[6]   = {1, 2, 3, 4, 5, 6}; // harmonic series
-    // A natural-looking additive taper -- DX7 output-level units are
-    // logarithmic, not linear, so hand-tuning these against real-
-    // hardware clipping/loudness reports turned out unpredictable (small
-    // unit changes near the top barely move perceived loudness, larger
-    // ones further down cut it drastically). Left at a normal musical
-    // shape; real headroom safety now comes from Process()'s own soft
-    // limiter instead of fighting these units -- see its own comment.
-    const int   kOutLevel[6] = {99, 70, 55, 45, 35, 25}; // decaying with harmonic number
-    const int   kEgRate[4]   = {99, 60, 35, 50};
-    const int   kEgLevel[4]  = {99, 99, 60, 0};
-    for(int op = 0; op < 6; op++)
-    {
-        int off = op * 21;
-        for(int i = 0; i < 4; i++)
-        {
-            patch_[off + i]     = (uint8_t)kEgRate[i];
-            patch_[off + 4 + i] = (uint8_t)kEgLevel[i];
-        }
-        patch_[off + 8]  = 39; // break point, unused (depths below are 0)
-        patch_[off + 9]  = 0;  // left depth
-        patch_[off + 10] = 0;  // right depth
-        patch_[off + 11] = 0;  // left curve
-        patch_[off + 12] = 0;  // right curve
-        patch_[off + 13] = 0;  // rate scaling
-        patch_[off + 14] = 0;  // amp mod sensitivity
-        patch_[off + 15] = 0;  // velocity sensitivity
-        patch_[off + 16] = (uint8_t)kOutLevel[op];
-        patch_[off + 17] = 0; // mode: 0 = ratio (not fixed Hz)
-        patch_[off + 18] = (uint8_t)kCoarse[op];
-        patch_[off + 19] = 0; // fine
-        patch_[off + 20] = 7; // detune, 7 = centered/no detune
-    }
-    // Pitch EG: flat (no pitch envelope movement).
-    for(int i = 0; i < 4; i++)
-    {
-        patch_[126 + i] = 99;
-        patch_[130 + i] = 50;
-    }
-    patch_[134] = 31; // algorithm 32 (0-based index)
-    patch_[135] = 0;  // feedback off
-    patch_[136] = 0;  // osc key sync, unused by msfa's own compute path
-    // LFO speed: must be genuinely nonzero for the LFO's own phase to
-    // advance at all (0 froze it entirely) -- the mod wheel's own pitch
-    // contribution (Dx7Note::compute()'s pmod_2) is scaled by the LFO's
-    // CURRENT phase (senslfo), not a fixed value, so a frozen LFO turned
-    // moving the wheel into a static pitch offset instead of oscillating
-    // vibrato. 35 is a moderate, typical vibrato rate (~4-5Hz).
-    patch_[137] = 35;
-    patch_[138] = 0;  // LFO delay
-    patch_[139] = 0;  // LFO pitch mod depth -- LFO itself still has no AUTOMATIC vibrato of its own (that's this byte, separate from the wheel's own contribution above); only moving the mod wheel introduces any pitch modulation
-    patch_[140] = 0;  // LFO amp mod depth
-    patch_[141] = 0;  // LFO sync
-    patch_[142] = 0;  // LFO waveform
-    // LFO pitch mod SENSITIVITY -- despite the name, this is the note's
-    // overall susceptibility to ANY pitch modulation source (both the
-    // LFO's own depth above AND the mod wheel's own contribution via
-    // ctrls_.wheel -- see Dx7Note::compute()'s senslfo, which gates
-    // both through the same multiply). Left at 0 initially, this
-    // silently killed mod wheel vibrato even with wheel routing
-    // correctly configured in Init(); pitchmodsenstab[3] == 33, a
-    // moderate default depth once the wheel is actually moved.
-    patch_[143] = 3;
-    patch_[144] = 24; // transpose, unused by msfa's own compute path
+    // LFO pitch mod SENSITIVITY note: despite the name, patch byte 143
+    // is the note's overall susceptibility to ANY pitch modulation
+    // source (both the LFO's own depth AND the mod wheel's own
+    // contribution via ctrls_.wheel above -- see Dx7Note::compute()'s
+    // senslfo, which gates both through the same multiply) -- a patch
+    // with this at 0 will not respond to the mod wheel at all
+    // regardless of ctrls_.wheel's own routing, same as every other
+    // real DX7 patch parameter (nothing special is done here to force
+    // it on for factory/user patches that were authored with it off).
 
-    lfo_.reset(&patch_[137]);
+    // Boot default: real factory preset 0 (first patch in the first
+    // category), same "always exactly factory preset 0, no separately
+    // hand-coded default to drift out of sync" convention the removed
+    // FmSynth::Init() used. lfo_.reset() happens inside ApplyPreset()'s
+    // own SetPatch() call below.
+    ApplyPreset(GetFactoryPreset(0));
 
     // Every voice's Dx7Note gets a real init() up front -- RenderQuantum()
     // below calls compute() on every voice slot unconditionally every
@@ -179,8 +129,6 @@ void DexedSynth::Init(float sample_rate)
     std::memset(silent_patch, 0, sizeof(silent_patch));
     for(int i = 0; i < kMaxVoices; i++)
         voices_[i].note.init(silent_patch, 60, 0, 60, -1, &ctrls_);
-
-    SetOutputLevel01(output_level01_);
 }
 
 void DexedSynth::SetOutputLevel01(float v01)
@@ -246,6 +194,7 @@ void DexedSynth::NoteOn(uint8_t note, uint8_t velocity)
     // so no separate retrigger-vs-fresh-strike branch is needed here.
     v.note.init(patch_, note, velocity, note, -1, &ctrls_);
     v.held_note    = note;
+    v.velocity     = velocity;
     v.triggered_at = ++trigger_seq_;
 }
 
@@ -316,4 +265,158 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
             reverb_send_r[i] += s * send;
         }
     }
+}
+
+void DexedSynth::ApplyPatchToHeldVoices()
+{
+    for(int i = 0; i < kMaxVoices; i++)
+    {
+        Voice& v = voices_[i];
+        if(v.held_note != -1)
+            v.note.update(patch_, v.held_note, v.velocity, -1, &ctrls_);
+    }
+}
+
+void DexedSynth::SetPatch(const uint8_t new_patch[156], float reverb_send01, float output_level01)
+{
+    std::memcpy(patch_, new_patch, 156);
+    std::memcpy(patch_baseline_, new_patch, 156);
+    brightness01_ = 0.5f; // re-center -- "as stored" for the freshly loaded patch
+    env_speed01_  = 0.5f;
+    lfo_.reset(&patch_[137]);
+    SetReverbSend01(reverb_send01);
+    SetOutputLevel01(output_level01);
+    ApplyPatchToHeldVoices();
+}
+
+void DexedSynth::SetBrightness01(float v01)
+{
+    brightness01_ = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    // 0x at v01=0, 1x (unchanged) at v01=0.5, 2x at v01=1.
+    float scale = brightness01_ >= 0.5f ? 1.f + (brightness01_ - 0.5f) * 2.f
+                                          : brightness01_ * 2.f;
+
+    uint8_t carrier_mask = FmCore::get_carrier_operators(patch_baseline_[134]);
+    for(int op = 0; op < 6; op++)
+    {
+        if(carrier_mask & (1 << op))
+            continue; // carriers untouched -- only modulators shape brightness
+        int off        = op * 21;
+        int base_level = patch_baseline_[off + 16];
+        int new_level  = (int)((float)base_level * scale + 0.5f);
+        new_level      = new_level < 0 ? 0 : (new_level > 99 ? 99 : new_level);
+        patch_[off + 16] = (uint8_t)new_level;
+    }
+    ApplyPatchToHeldVoices();
+}
+
+void DexedSynth::SetEnvSpeed01(float v01)
+{
+    env_speed01_ = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    float scale  = env_speed01_ >= 0.5f ? 1.f + (env_speed01_ - 0.5f) * 2.f : env_speed01_ * 2.f;
+
+    for(int op = 0; op < 6; op++)
+    {
+        int off = op * 21;
+        for(int r = 0; r < 4; r++)
+        {
+            int base_rate = patch_baseline_[off + r];
+            int new_rate  = (int)((float)base_rate * scale + 0.5f);
+            new_rate      = new_rate < 0 ? 0 : (new_rate > 99 ? 99 : new_rate);
+            patch_[off + r] = (uint8_t)new_rate;
+        }
+    }
+    ApplyPatchToHeldVoices();
+}
+
+DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
+{
+    DexedPresetData p;
+    std::memcpy(p.patch, patch_, 156);
+    p.reverb_send01  = reverb_send01_;
+    p.output_level01 = output_level01_;
+    return p;
+}
+
+namespace
+{
+// Resolves a flat 0-based factory preset index to its category and the
+// voice index within it -- mirrors the inverse of the removed
+// FmSynth::GetFactoryCategorySlot()'s own "walk category counts" idiom.
+bool ResolveFactoryIndex(int flat_index, const DexedFactoryCategory** out_cat, int* out_local)
+{
+    if(flat_index < 0)
+        return false;
+    for(int c = 0; c < kDexedNumFactoryCategories; c++)
+    {
+        if(flat_index < kDexedFactoryCategories[c].count)
+        {
+            *out_cat   = &kDexedFactoryCategories[c];
+            *out_local = flat_index;
+            return true;
+        }
+        flat_index -= kDexedFactoryCategories[c].count;
+    }
+    return false;
+}
+} // namespace
+
+int DexedSynth::GetNumFactoryPresets()
+{
+    int total = 0;
+    for(int c = 0; c < kDexedNumFactoryCategories; c++)
+        total += kDexedFactoryCategories[c].count;
+    return total;
+}
+
+const char* DexedSynth::GetFactoryCategoryName(int cat)
+{
+    if(cat < 0 || cat >= kDexedNumFactoryCategories)
+        return "?";
+    return kDexedFactoryCategories[cat].name;
+}
+
+int DexedSynth::GetFactoryCategoryCount(int cat)
+{
+    if(cat < 0 || cat >= kDexedNumFactoryCategories)
+        return 0;
+    return kDexedFactoryCategories[cat].count;
+}
+
+int DexedSynth::GetFactoryCategorySlot(int cat, int local_index)
+{
+    if(cat < 0 || cat >= kDexedNumFactoryCategories)
+        return -1;
+    if(local_index < 0 || local_index >= kDexedFactoryCategories[cat].count)
+        return -1;
+    int start = 0;
+    for(int c = 0; c < cat; c++)
+        start += kDexedFactoryCategories[c].count;
+    return start + local_index + 1; // slots are 1-based
+}
+
+DexedSynth::DexedPresetData DexedSynth::GetFactoryPreset(int flat_index)
+{
+    DexedPresetData              p;
+    const DexedFactoryCategory* cat = nullptr;
+    int                          local = 0;
+    if(ResolveFactoryIndex(flat_index, &cat, &local))
+        DexedSysex::UnpackVoice(cat->packed_data + local * 128, p.patch);
+    return p;
+}
+
+const char* DexedSynth::GetFactoryPresetName(int flat_index)
+{
+    static char                 name_buf[11];
+    const DexedFactoryCategory* cat   = nullptr;
+    int                          local = 0;
+    if(!ResolveFactoryIndex(flat_index, &cat, &local))
+        return "?";
+    uint8_t unpacked[156];
+    DexedSysex::UnpackVoice(cat->packed_data + local * 128, unpacked);
+    std::memcpy(name_buf, unpacked + 145, 10);
+    name_buf[10] = '\0';
+    for(int i = 9; i >= 0 && name_buf[i] == ' '; i--)
+        name_buf[i] = '\0';
+    return name_buf;
 }
