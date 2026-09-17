@@ -1,7 +1,8 @@
 // Real DX7 factory patch data, embedded from freely-distributed real
-// SysEx bank dumps sourced directly from the official MicroDexed project
-// (codeberg.org/dcoredump/MicroDexed, addon/SD/ -- the same project this
-// whole DX7 port already traces its msfa engine lineage through), each
+// SysEx bank dumps circulating across the broader Dexed/MicroDexed
+// open-source ecosystem (the original Dexed plugin, its extracted
+// Synth_Dexed engine, and the various hardware ports built on it) --
+// not one single traceable upstream repo, each
 // file a real, standard 32-voice bulk-dump SysEx bank. Stored here as the
 // raw 128-byte-per-voice PACKED payload (the 4096 data bytes of each
 // bank, header/checksum/F7 stripped) -- unpacked on demand by

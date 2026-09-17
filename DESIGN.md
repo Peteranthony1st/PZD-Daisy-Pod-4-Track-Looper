@@ -17,10 +17,10 @@ layer, and SD card save/load, none of which exist in the original.
 **Dexed** (see its own section below) is built around **msfa**, Google's
 own real DX7 emulation core, released under the Apache License 2.0 —
 vendored unmodified into `src/msfa/` except two small additive
-introspection helpers. Its 961 factory presets are sourced from the
-official **[MicroDexed](https://codeberg.org/dcoredump/MicroDexed)**
-project's own freely-distributed SD card patch banks, the same project
-msfa's own lineage already traces through.
+introspection helpers. Its 961 factory presets are real, freely-
+distributed SysEx bank dumps drawn from the broader Dexed/MicroDexed
+open-source ecosystem that msfa's own lineage traces through, not one
+single traceable upstream repo.
 
 See **Known limitations & assumptions** below for the handful of things
 that deliberately differ from the original pedal's behaviour.
@@ -600,10 +600,10 @@ selection across all 32, soft pickup), Button 1 (step back), Button 2
 (step forward).
 
 **Factory presets — 961 across 15 folders, real sourced data, never
-invented**: sourced from the official MicroDexed project
-(`codeberg.org/dcoredump/MicroDexed`, `addon/SD/` — the same project
-this whole port's msfa lineage already traces through), each a real,
-standard 32-voice SysEx bulk-dump bank. 11 folders organized by real
+invented**: real, freely-distributed SysEx bank dumps drawn from the
+broader Dexed/MicroDexed open-source ecosystem this whole port's msfa
+lineage already traces through (not one single traceable upstream
+repo), each a real, standard 32-voice SysEx bulk-dump bank. 11 folders organized by real
 sound type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/
 Perc/Choir/Bells — `kDexedFactoryCategories` in `dexed_factory_data.cpp`,
 two source banks each, 64 voices, except Perc at 65 — see below), plus 4

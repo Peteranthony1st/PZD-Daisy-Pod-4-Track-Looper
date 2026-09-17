@@ -2,9 +2,10 @@
 #include <cstdint>
 
 // See dexed_factory_data.cpp's own doc comment for the real source of
-// this data (freely-distributed real DX7 SysEx banks from the official
-// MicroDexed project) and its format (raw 128-byte-per-voice packed
-// payload, unpacked on demand via DexedSysex::UnpackVoice()).
+// this data (freely-distributed real DX7 SysEx banks from the broader
+// Dexed/MicroDexed open-source ecosystem) and its format (raw
+// 128-byte-per-voice packed payload, unpacked on demand via
+// DexedSysex::UnpackVoice()).
 struct DexedFactoryCategory
 {
     const char*    name;

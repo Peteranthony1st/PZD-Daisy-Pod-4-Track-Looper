@@ -121,8 +121,8 @@ Grains — no mutex, both can run together).
 - **961 factory presets** across 15 folders — 11 organized by real sound
   type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/Perc/Choir/
   Bells), plus **Rom 1**-**Rom 4**, the real, unsorted contents of the
-  actual Yamaha factory ROM cartridges — sourced from the official
-  MicroDexed project's own freely-distributed SD card banks, never
+  actual Yamaha factory ROM cartridges — real, freely-distributed SysEx
+  data from the broader Dexed/MicroDexed open-source ecosystem, never
   invented. Browsed as folders:
   rotate to scroll, Button 1 opens a folder or backs out, a
   short Button 2 tap previews the highlighted patch live without leaving
@@ -378,6 +378,6 @@ cd src && make
 - **Google's [msfa](https://github.com/google/music-synthesizer-for-android)**
   (Apache License 2.0) — the real DX7 emulation core Dexed is built
   around, vendored unmodified into `src/msfa/`.
-- **[MicroDexed](https://codeberg.org/dcoredump/MicroDexed)** — source of
-  Dexed's 961 factory presets, freely distributed as real DX7 SysEx
+- The broader **Dexed/MicroDexed** open-source ecosystem — source of
+  Dexed's 961 factory presets, freely distributed real DX7 SysEx
   bank dumps.
