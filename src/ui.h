@@ -1015,10 +1015,10 @@ class Ui
     // Index WITHIN the open folder (not a flat index) -- resolved to a
     // real 1-based PerformanceStore slot by ResolveDexedPresetSlot().
     int  dexed_preset_cursor_ = 0;
-    // PerformanceStore::kMaxDexedPresets (1200) minus the current 961
-    // factory presets (11 sound-type categories + Rom 1-4) leaves up to
-    // 239 possible user slots -- 200 gives real headroom without needing
-    // to keep this in exact lockstep with the factory bank's own size.
+    // PerformanceStore::kMaxDexedPresets (4200) minus the current 3834
+    // factory presets (28 folders total) leaves up to 366 possible user
+    // slots -- 200 gives real headroom without needing to keep this in
+    // exact lockstep with the factory bank's own size.
     static constexpr int kMaxDexedPresetSlots = 200;
     int  dexed_preset_user_slots_[kMaxDexedPresetSlots] = {}; // SD user slots, ascending
     int  dexed_preset_user_slot_count_                   = 0;

@@ -24,6 +24,12 @@ struct DexedFactoryCategory
 // instead: genuine factory data every real DX7 shipped with (ROM1) or
 // that Yamaha sold as official cartridges (ROM2-4), kept in their own
 // folders exactly as originally organized rather than re-sorted into
-// the sound-type categories above.
-constexpr int kDexedNumFactoryCategories = 15;
+// the sound-type categories above -- plus 13 more (Synth 2/Piano 2/
+// EPiano/Bass 2/Strings 2/Woodwind 2/Brass 2/Organ 2/Perc 2/Voice/
+// Bells 2/FX/Div), a second, much larger real patch collection added
+// later, kept in their own separate folders (a " 2" suffix, or a plain
+// new name where none collided) rather than merged into the
+// same-named folders above, since the two were sourced and reviewed
+// separately.
+constexpr int kDexedNumFactoryCategories = 28;
 extern const DexedFactoryCategory kDexedFactoryCategories[kDexedNumFactoryCategories];

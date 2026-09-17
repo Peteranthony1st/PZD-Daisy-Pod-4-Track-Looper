@@ -157,7 +157,7 @@ bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress
 // after that range. Unlike the removed Fm/Pad presets' fixed factory
 // count, this range is sized from the real embedded data (704 patches
 // as of writing) rather than a compile-time constant.
-constexpr int kMaxDexedPresets = 1200; // headroom above the current 961 factory presets
+constexpr int kMaxDexedPresets = 4200; // headroom above the current 3834 factory presets
 
 bool SaveDexedPreset(int slot, const DexedSynth::DexedPresetData& preset);
 bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset);

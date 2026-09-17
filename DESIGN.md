@@ -17,7 +17,7 @@ layer, and SD card save/load, none of which exist in the original.
 **Dexed** (see its own section below) is built around **msfa**, Google's
 own real DX7 emulation core, released under the Apache License 2.0 —
 vendored unmodified into `src/msfa/` except two small additive
-introspection helpers. Its 961 factory presets are real, freely-
+introspection helpers. Its 3834 factory presets are real, freely-
 distributed SysEx bank dumps drawn from the broader Dexed/MicroDexed
 open-source ecosystem that msfa's own lineage traces through, not one
 single traceable upstream repo.
@@ -599,11 +599,12 @@ this). Algorithm can be cycled three ways: Knob 1 (quantized bucket
 selection across all 32, soft pickup), Button 1 (step back), Button 2
 (step forward).
 
-**Factory presets — 961 across 15 folders, real sourced data, never
+**Factory presets — 3834 across 28 folders, real sourced data, never
 invented**: real, freely-distributed SysEx bank dumps drawn from the
 broader Dexed/MicroDexed open-source ecosystem this whole port's msfa
 lineage already traces through (not one single traceable upstream
-repo), each a real, standard 32-voice SysEx bulk-dump bank. 11 folders organized by real
+repo), each a real, standard 32-voice SysEx bulk-dump bank. The original
+15: 11 folders organized by real
 sound type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/
 Perc/Choir/Bells — `kDexedFactoryCategories` in `dexed_factory_data.cpp`,
 two source banks each, 64 voices, except Perc at 65 — see below), plus 4
@@ -616,12 +617,32 @@ an objective proxy instead — genuine factory data every real DX7 shipped
 with (ROM1) or that Yamaha sold as official cartridges (ROM2-4). One
 single voice (the classic ROM1A "MARIMBA") was hand-picked into the Perc
 folder on top of its two source banks, after a user report that no
-marimba sound existed anywhere in the set. Stored as raw 128-byte-per-
+marimba sound existed anywhere in the set.
+
+**13 more, added later from a second, much larger real patch
+collection** (a genuine ~100-bank, ~2900-voice set, found already
+organized into named categories by its own upstream source manifest):
+**Synth 2/Piano 2/EPiano/Bass 2/Strings 2/Woodwind 2/Brass 2/Organ 2/
+Perc 2/Voice/Bells 2/FX/Div** — kept in their own separate folders
+(a " 2" suffix where a same-named folder already existed above, a plain
+new name where it didn't) rather than merged into the original folders,
+since the two collections were sourced and reviewed independently; an
+8th category in that same source collection, its own "ROM" folder, was
+confirmed byte-for-byte identical to this project's own Rom 1-4 (same
+ultimate origin) and skipped rather than duplicated. Voices that were
+entirely empty (all-zero patch bytes, ~2% of the raw set — real banks
+aren't always fully populated) were filtered out during import rather
+than embedded as dead presets.
+
+Stored as raw 128-byte-per-
 voice **packed** payloads (never pre-expanded and held in flash/RAM
 unpacked) — `DexedSynth::GetFactoryPreset()` unpacks on demand via
 `DexedSysex::UnpackVoice()`, verified byte-exact via a native (non-
 embedded) round-trip test against real bank data before ever being
-embedded.
+embedded. The original `.syx` bank files themselves (both collections)
+are kept in the repo under `addon/SD/DEXED/<category>/`, mirroring the
+firmware's own folder names, for reference/attribution — not read by
+the firmware build itself.
 
 **Duplicate factory names, and why some folders auto-number them**: real
 factory banks occasionally have a long run of voices someone saved
@@ -639,10 +660,10 @@ plus `reverb_send01`/`output_level01`/filter mode+cutoff+resonance — a
 flat snapshot via `ApplyPreset()`/`CapturePreset()`, the same shape every
 other engine's own preset struct already uses. `output_level01` defaults
 to **0.6** (not 1.0), and since factory presets never set this field
-themselves, that's the level every one of the 961 factory presets
+themselves, that's the level every one of the 3834 factory presets
 actually loads at. User presets save/load to `DEXP/PRESnnn.DAT` via
-`PerformanceStore` (up to `kMaxDexedPresets = 1200` total slot numbers,
-headroom above the 961 factory presets for up to ~239 of your own) — the
+`PerformanceStore` (up to `kMaxDexedPresets = 4200` total slot numbers,
+headroom above the 3834 factory presets for up to ~366 of your own) — the
 factory range is served straight from `GetFactoryPreset()` with zero card
 I/O and, unlike the user range, is never subject to Delete/Duplicate's
 own slot-renumbering (`CompactSlotsAfterDelete()` is fundamentally
@@ -1164,7 +1185,7 @@ A few things that are intentional, not bugs:
 - `dexed_sysex.h/.cpp` — this project's own clean-room packed↔unpacked
   DX7 SysEx converter, written from the public 1993 Yamaha MIDI SysEx
   spec (see *Dexed* above for why msfa itself doesn't include one)
-- `dexed_factory_data.h/.cpp` — the 961 embedded factory presets (see
+- `dexed_factory_data.h/.cpp` — the 3834 embedded factory presets (see
   *Dexed* above), stored packed and unpacked on demand
 - `granular_engine.h/.cpp` — the Grains instrument (see *Grains* above)
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering, for

@@ -118,15 +118,19 @@ there), built around Google's own **msfa** DX7 emulation core — the real
 32 algorithms, the real envelope/scaling model, not an approximation.
 Off by default; switch it on from `Global:Dexed` (independent of
 Grains — no mutex, both can run together).
-- **961 factory presets** across 15 folders — 11 organized by real sound
+- **3834 factory presets** across 28 folders — 11 organized by real sound
   type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/Perc/Choir/
-  Bells), plus **Rom 1**-**Rom 4**, the real, unsorted contents of the
-  actual Yamaha factory ROM cartridges — real, freely-distributed SysEx
-  data from the broader Dexed/MicroDexed open-source ecosystem, never
-  invented. Browsed as folders:
+  Bells), **Rom 1**-**Rom 4** (the real, unsorted contents of the
+  actual Yamaha factory ROM cartridges), and 13 more from a second, much
+  larger collection (Synth 2/Piano 2/EPiano/Bass 2/Strings 2/Woodwind 2/
+  Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div) kept in their own separate
+  folders rather than merged into the originals — real, freely-distributed
+  SysEx data from the broader Dexed/MicroDexed open-source ecosystem, never
+  invented (the raw source `.syx` banks themselves are kept in
+  `addon/SD/DEXED/` for reference). Browsed as folders:
   rotate to scroll, Button 1 opens a folder or backs out, a
   short Button 2 tap previews the highlighted patch live without leaving
-  the browser, hold to commit — plus up to ~239 of your own on the SD
+  the browser, hold to commit — plus up to ~366 of your own on the SD
   card.
 - **Algorithm page** shows a real box-and-arrow diagram of whichever of
   the 32 algorithms is loaded (carriers filled, modulators outlined, feedback
@@ -379,5 +383,5 @@ cd src && make
   (Apache License 2.0) — the real DX7 emulation core Dexed is built
   around, vendored unmodified into `src/msfa/`.
 - The broader **Dexed/MicroDexed** open-source ecosystem — source of
-  Dexed's 961 factory presets, freely distributed real DX7 SysEx
+  Dexed's 3834 factory presets, freely distributed real DX7 SysEx
   bank dumps.
