@@ -33,14 +33,16 @@ float DSY_SDRAM_BSS buffer_l[kNumLayers][kBuffSize];
 float DSY_SDRAM_BSS buffer_r[kNumLayers][kBuffSize];
 
 // Grains' own dedicated capture buffer -- separate from the loop layers'
-// buffers above (~5s @ 48kHz, chosen to fit comfortably in the SDRAM left
-// over after the 4 loop layers). Two sources write into it: Ui's
+// buffers above (~10s @ 48kHz, chosen to fit comfortably in the SDRAM
+// left over after the 4 loop layers -- raised from an original ~5s once
+// that turned out too short for a real imported WAV file, e.g. a
+// multi-bar commercial loop). Two sources write into it: Ui's
 // TriggerGranularCaptureFromLayer() (an instant main-loop-side copy from
 // whichever loop layer is selected) or live input recorded sample-by-
 // sample in AudioCallback() while g_granular_capturing is true (see
 // below). Either way, granular.SetSource() is pointed at it once the
 // capture finishes, same as every other GranularEngine source.
-constexpr size_t kGranularCaptureSamples = 240000; // ~5s @ 48kHz
+constexpr size_t kGranularCaptureSamples = 480000; // ~10s @ 48kHz
 float DSY_SDRAM_BSS g_granular_capture_l[kGranularCaptureSamples];
 float DSY_SDRAM_BSS g_granular_capture_r[kGranularCaptureSamples];
 

@@ -544,10 +544,24 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
         {
             env = adsr_.Process(gate);
 
+            // Keep triggering new grains through the WHOLE release tail,
+            // not just while the note is actually held -- gating this on
+            // plain `gate` meant a long Release time never actually
+            // produced a longer tail than whatever grain(s) happened to
+            // already be in flight at the moment of NoteOff (at most one
+            // grain's own Size, up to 500ms), since nothing kept feeding
+            // new material for the envelope to shape. IsRunning() stays
+            // true until the envelope actually reaches idle (release
+            // genuinely finished), so this naturally stops triggering
+            // exactly when there'd be nothing left to hear anyway --
+            // confirmed via a real user report ("long release, let go of
+            // the note -- should sound on, but it doesn't").
+            bool still_sounding = gate || adsr_.IsRunning();
+
             // Grain layer: fixed anchor, just needs re-triggering on its
             // own schedule.
             grain_cluster_.next_grain_countdown -= 1.f;
-            if(grain_cluster_.next_grain_countdown <= 0.f && gate)
+            if(grain_cluster_.next_grain_countdown <= 0.f && still_sounding)
             {
                 float dir_sign  = ResolveDirectionSign();
                 float note_mult = grain_follows_note_ ? note_rate_ : 1.f;
@@ -589,7 +603,7 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
                 }
 
                 scan_cluster_.next_grain_countdown -= 1.f;
-                if(scan_cluster_.next_grain_countdown <= 0.f && gate)
+                if(scan_cluster_.next_grain_countdown <= 0.f && still_sounding)
                 {
                     float note_mult = grain_follows_note_ ? note_rate_ : 1.f;
                     TriggerGrainInCluster(scan_cluster_, scan_position_samples_,

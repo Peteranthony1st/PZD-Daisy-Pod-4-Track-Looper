@@ -84,6 +84,17 @@ class DexedSynth
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
+    // Same linear pan law every other engine here uses (panL = 1-v,
+    // panR = v). Added after a real user report that live Dexed played
+    // disproportionately loud next to a recorded-and-played-back loop
+    // layer: every other source in the mix (loop layers, Grains) goes
+    // through this same center-pan attenuation before reaching the
+    // master mix, but Dexed's own live output previously had no pan
+    // stage at all, so it reached out[] fully unscaled while everything
+    // else took the usual -6dB-at-center cut.
+    void  SetPan01(float v01);
+    float GetPan01() const { return pan01_; }
+
     // Post-mix bus filter, same shape as GranularEngine's own (a plain
     // Svf pair, not part of the real DX7's own signal path -- this
     // project's own addition, consistent with every other engine here
@@ -151,6 +162,13 @@ class DexedSynth
         int32_t filter_mode     = (int32_t)FilterMode::Off;
         float   filter_cutoff01 = 1.f;
         float   filter_res01    = 0.f;
+        // Added once Dexed got a real Pan control -- 0.5 (centered), so
+        // every DexedPresetData written before this field existed (a
+        // positional/aggregate initializer that only lists the fields
+        // that existed at the time) still gets a sensible neutral value
+        // via this trailing default, same convention PadSynth's own
+        // tune01/pan01 fields used when they were added later.
+        float   pan01 = 0.5f;
     };
     void ApplyPreset(const DexedPresetData& p)
     {
@@ -158,6 +176,7 @@ class DexedSynth
         SetFilterMode((FilterMode)p.filter_mode);
         SetFilterCutoff01(p.filter_cutoff01);
         SetFilterResonance01(p.filter_res01);
+        SetPan01(p.pan01);
     }
     DexedPresetData CapturePreset() const;
 
@@ -256,6 +275,10 @@ class DexedSynth
     // problem, not an average-loudness one).
     float output_level01_  = 0.8f;
     float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
+
+    float pan01_      = 0.5f;
+    float pan_l_gain_ = 0.5f; // 1-pan01_, control-rate cache
+    float pan_r_gain_ = 0.5f; // pan01_
 
     daisysp::Svf filter_l_, filter_r_;
     FilterMode   filter_mode_     = FilterMode::Off;

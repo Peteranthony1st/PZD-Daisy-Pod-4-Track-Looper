@@ -1497,7 +1497,18 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
         f_close(&file);
         return false;
     }
-    if(audio_format != 1 || bits_per_sample != 16 || (num_channels != 1 && num_channels != 2)
+    // PCM at 16/24/32-bit, or 32-bit IEEE float (audio_format 3 -- what
+    // several DAWs/export tools default to) -- widened from 16-bit-only
+    // after a real user report: a commercial sample-pack loop (24-bit,
+    // otherwise perfectly ordinary stereo/44.1kHz) failed to import with
+    // no path to fix it short of re-encoding on a computer first. Real
+    // sample rate conversion beyond the existing 44.1->48kHz case isn't
+    // attempted -- that's a separate, much bigger problem (arbitrary
+    // resampling) than "this bit depth/format isn't decoded yet".
+    bool format_ok = (audio_format == 1 && (bits_per_sample == 16 || bits_per_sample == 24
+                                              || bits_per_sample == 32))
+                      || (audio_format == 3 && bits_per_sample == 32);
+    if(!format_ok || (num_channels != 1 && num_channels != 2)
        || (sample_rate != 48000 && sample_rate != 44100))
     {
         // Not a FatFS error -- the file itself is a format this importer
@@ -1536,11 +1547,16 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
     static Resampler44_1to48 resampler; // see the DTCMRAM/DMA comment on Save() above
     resampler = Resampler44_1to48{};
 
-    static int16_t raw_buf[kChunkSamples * 2]; // interleaved, up to stereo
-    uint32_t       bytes_per_frame = (uint32_t)num_channels * 2;
-    uint32_t       total_frames    = data_size / bytes_per_frame;
-    uint32_t       frames_done     = 0;
-    size_t         written         = 0;
+    // Raw bytes, not int16_t -- unlike the 16-bit-only version of this
+    // function, the sample width varies by file (2/3/4 bytes), so this
+    // reads and decodes generically instead of assuming int16_t layout.
+    // Sized for the worst case (stereo, 4 bytes/sample).
+    static uint8_t raw_buf[kChunkSamples * 2 * 4];
+    uint32_t       bytes_per_sample = (uint32_t)bits_per_sample / 8;
+    uint32_t       bytes_per_frame  = (uint32_t)num_channels * bytes_per_sample;
+    uint32_t       total_frames     = data_size / bytes_per_frame;
+    uint32_t       frames_done      = 0;
+    size_t         written          = 0;
 
     while(ok && frames_done < total_frames && written < audio_capacity)
     {
@@ -1556,17 +1572,50 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
             break;
         }
 
+        // Decodes one little-endian sample starting at byte offset
+        // `off` in raw_buf, to a -1..1 float, based on this stream's own
+        // (constant for the whole file) audio_format/bits_per_sample.
+        // 24-bit has no native integer type, so it's reconstructed by
+        // hand: shift the 3 bytes into the TOP 24 bits of a 32-bit int,
+        // then arithmetic-shift back down by 8 -- sign-extends and
+        // rescales into the same numeric range a native 24-bit type
+        // would have, in one step.
+        auto decode_sample = [&](UINT off) -> float {
+            if(audio_format == 3) // 32-bit IEEE float
+            {
+                float f;
+                memcpy(&f, raw_buf + off, 4);
+                return f;
+            }
+            if(bits_per_sample == 24)
+            {
+                int32_t v = (int32_t)((uint32_t)raw_buf[off] << 8
+                                        | (uint32_t)raw_buf[off + 1] << 16
+                                        | (uint32_t)raw_buf[off + 2] << 24);
+                return (float)(v >> 8) / 8388608.f; // 2^23
+            }
+            if(bits_per_sample == 32) // 32-bit PCM int
+            {
+                int32_t v;
+                memcpy(&v, raw_buf + off, 4);
+                return (float)v / 2147483648.f; // 2^31
+            }
+            int16_t v; // 16-bit PCM int
+            memcpy(&v, raw_buf + off, 2);
+            return (float)v / 32768.f; // 2^15
+        };
+
         for(UINT i = 0; i < frames_this_chunk && written < audio_capacity; i++)
         {
             float l, r;
             if(num_channels == 1)
             {
-                l = r = (float)raw_buf[i] / 32768.f;
+                l = r = decode_sample(i * bytes_per_sample);
             }
             else
             {
-                l = (float)raw_buf[i * 2] / 32768.f;
-                r = (float)raw_buf[i * 2 + 1] / 32768.f;
+                l = decode_sample(i * bytes_per_frame);
+                r = decode_sample(i * bytes_per_frame + bytes_per_sample);
             }
 
             if(!need_resample)

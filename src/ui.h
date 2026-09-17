@@ -205,7 +205,14 @@ class Ui
         Mixer,
         // Same treatment as Granular above, entered from Global:Dexed.
         // See DexedParamPage for its own pages.
-        Dexed
+        Dexed,
+        // The advanced per-operator FM editor -- entered from
+        // Screen::Dexed's own Advanced page (encoder click), NOT a
+        // Global page of its own. Encoder click here returns to
+        // Screen::Dexed (landing back on the Advanced page); long-press
+        // still goes all the way back to Home like every other screen.
+        // See DexedOpParamPage for its own pages.
+        DexedOperator
     };
     // Shared save/load interaction state for Global:File, Pad Preset, and
     // Grains Preset -- only one of those three pages is ever visible at
@@ -349,13 +356,38 @@ class Ui
         EnvSpeed,
         Filter, // Cutoff + Resonance, mode cycled by Button1
         Mix,    // Reverb Send + Output Level
+        // Entry point into Screen::DexedOperator (encoder click) -- no
+        // continuous knobs of its own, same "entry point only" idiom as
+        // GlobalPage::Granular/Dexed. Positioned right before Preset so
+        // the deep-editing detour sits next to the save/load workflow
+        // it's meant to feed into, without being the very last page.
+        Advanced,
         // Save/Load the whole Dexed sound as a preset, folder-browsing
         // 150+ factory presets by real sound-type category plus a
         // "User" folder of SD saves -- same two-level browsing shape
         // the removed FmSynth's own Preset page used, generalized to
-        // more/larger categories. Encoder click here drills into the
-        // advanced per-operator editor (a later phase).
+        // more/larger categories.
         Preset,
+        kCount
+    };
+
+    // Screen::DexedOperator's own pages -- the v1 "core set" advanced
+    // per-operator editor scope (Ratio/Level, Detune, and the 4 EG
+    // Rates + 4 EG Levels via the existing AD/SR Button2-toggle idiom
+    // already used for every ADSR-shaped page in this codebase -- see
+    // dexed_op_egrate_target_sr_/dexed_op_eglevel_target_sr_). Keyboard
+    // scaling, velocity sensitivity, and amp-mod sensitivity are
+    // deliberately deferred to a later increment. Operator select
+    // (1-6, shown as the real HW op number, i.e. 6-dexed_op_index_) is
+    // Button1-cycled, not a page of its own -- rotate stays reserved
+    // for page navigation, matching every other screen's own
+    // rotate-cycles-pages convention.
+    enum class DexedOpParamPage
+    {
+        RatioLevel, // K1 = Coarse ratio (quantized 0-31), K2 = Output Level
+        Detune,     // K1 only, 0-14 centered on 7
+        EgRate,     // K1/K2 = Rate1/Rate2 (AD) or Rate3/Rate4 (SR), Button2 toggles
+        EgLevel,    // K1/K2 = Level1/Level2 (AD) or Level3/Level4 (SR), Button2 toggles
         kCount
     };
 
@@ -420,7 +452,20 @@ class Ui
         DexedEnvSpeed,
         DexedFilter,
         DexedMix,
+        DexedAdvanced, // entry point only -- see Screen::DexedOperator instead
         DexedPreset, // browses a list directly, no pickup used
+        // Screen::DexedOperator -- one context per sub-page, shared
+        // across all 6 operators (branch internally on dexed_op_index_),
+        // same "one context, branch on which target" idiom LayerStatus
+        // already uses for cursor_layer_/Cur(). EgRate/EgLevel each
+        // split into two contexts for the AD/SR toggle, same shape as
+        // GranularEnvAD/GranularEnvSR above.
+        DexedOpRatioLevel,
+        DexedOpDetune,
+        DexedOpEgRateAD,
+        DexedOpEgRateSR,
+        DexedOpEgLevelAD,
+        DexedOpEgLevelSR,
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -495,10 +540,10 @@ class Ui
     void        MixerSetVolume01(int ch, float v01);
     void        MixerSetPan01(int ch, float v01);   // no-op on Master
     void        MixerSetSend01(int ch, float v01);  // no-op on Master
-    // True for every channel except Master and DXD (ch 5) -- Dexed has no
-    // Pan control yet (a later increment), so its Mixer channel shows/
-    // edits Volume and Reverb Send like any other channel but leaves Pan
-    // out entirely instead of displaying a value that doesn't do anything.
+    // True for every channel except Master -- Dexed's own channel (ch 5)
+    // used to be excluded here too, back when Dexed had no real Pan
+    // control of its own; it now does (see DexedSynth::SetPan01()), so
+    // this is just Master's own exception now.
     bool        MixerChannelHasPan(int ch) const;
     // Small helper for the Detail page's vertical bars.
     void DrawMixerVBar(int x0, int y0, int w, int h, float v01);
@@ -1015,8 +1060,8 @@ class Ui
     // Index WITHIN the open folder (not a flat index) -- resolved to a
     // real 1-based PerformanceStore slot by ResolveDexedPresetSlot().
     int  dexed_preset_cursor_ = 0;
-    // PerformanceStore::kMaxDexedPresets (4200) minus the current 3834
-    // factory presets (28 folders total) leaves up to 366 possible user
+    // PerformanceStore::kMaxDexedPresets (3500) minus the current 3129
+    // factory presets (54 folders total) leaves up to 371 possible user
     // slots -- 200 gives real headroom without needing to keep this in
     // exact lockstep with the factory bank's own size.
     static constexpr int kMaxDexedPresetSlots = 200;
@@ -1027,4 +1072,18 @@ class Ui
     // DexedSynth::Init()'s own boot default.
     int  dexed_loaded_preset_slot_ = 1;
     char dexed_preset_status_[24]  = {}; // last save/load result, shown briefly
+
+    // --- Dexed advanced editor (Screen::DexedOperator) -------------------
+    // 0-5, array index into patch_[] (op*21) -- 0 = HW OP6, 5 = OP1, same
+    // convention confirmed from the real DX7 SysEx spec and already used
+    // throughout the Algo diagram. Button1-cycled, not a page of its own.
+    int                dexed_op_index_ = 0;
+    DexedOpParamPage   dexed_op_page_  = DexedOpParamPage::RatioLevel;
+    // AD/SR toggles for the EgRate/EgLevel pages, same idiom as
+    // granular_adsr_target_sr_ -- two independent bools since the two
+    // pages' own toggle state shouldn't reset just from navigating
+    // between them.
+    bool dexed_op_egrate_target_sr_  = false;
+    bool dexed_op_eglevel_target_sr_ = false;
+    void DrawDexedOperatorScreen();
 };

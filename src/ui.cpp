@@ -303,6 +303,12 @@ void Ui::HandleEncoder(const UiControlEvents& events)
             dexed_param_page_ = new_dexed_page;
             save_load_mode_   = SaveLoadMode::Idle; // same reset as Global:File above
         }
+        else if(screen_ == Screen::DexedOperator)
+        {
+            int n = (int)DexedOpParamPage::kCount;
+            int p = (((int)dexed_op_page_ + inc) % n + n) % n;
+            dexed_op_page_ = (DexedOpParamPage)p;
+        }
         else if(screen_ == Screen::Mixer)
         {
             int n            = kNumMixerPositions;
@@ -395,16 +401,30 @@ void Ui::HandleEncoder(const UiControlEvents& events)
         {
             TogglePauseAll();
         }
+        else if(!encoder_long_fired_ && screen_ == Screen::Dexed
+                && dexed_param_page_ == DexedParamPage::Advanced)
+        {
+            // Dexed's own Advanced page is an entry point into
+            // Screen::DexedOperator, same convention Global:Granular/
+            // Global:Dexed's own click uses to enter their screens.
+            screen_ = Screen::DexedOperator;
+        }
+        else if(!encoder_long_fired_ && screen_ == Screen::DexedOperator)
+        {
+            // Short click backs out to Screen::Dexed (landing back on
+            // the Advanced page); long-press above still goes all the
+            // way to Home, same as every other screen.
+            screen_ = Screen::Dexed;
+        }
         else if(!encoder_long_fired_
                 && (screen_ == Screen::Granular || screen_ == Screen::Dexed))
         {
             // Same mute-all-loop-layers click as every Global page's own
-            // (TogglePauseAll()) -- Granular/Dexed have no click-to-
-            // drill-in of their own yet (that's the encoder's job from
-            // Global instead), so there's nothing else useful for their
-            // click to do either. (A later phase gives Dexed's own
-            // Preset page a real click-to-drill-in of its own, into the
-            // advanced per-operator editor -- not built yet.)
+            // (TogglePauseAll()) -- every other Granular/Dexed page has
+            // no click-to-drill-in of their own (that's the encoder's
+            // job from Global instead, or Dexed's own Advanced page
+            // above), so there's nothing else useful for their click to
+            // do either.
             TogglePauseAll();
         }
         // Screen::Mixer: rotate already picks the stop (see
@@ -1030,6 +1050,39 @@ void Ui::OnButton1Short()
                 }
             }
             break;
+        case Screen::DexedOperator:
+        {
+            // Button1 cycles which of the 6 operators is being edited --
+            // rotate stays reserved for DexedOpParamPage navigation, same
+            // "Button1 cycles a non-page selector" convention as Algo's
+            // own algorithm cycle above.
+            dexed_op_index_ = (dexed_op_index_ + 1) % 6;
+            // Real bug, confirmed on hardware: DexedOpRatioLevel/Detune/
+            // EgRateAD/etc. are each ONE KnobContext shared across all 6
+            // operators (branching internally on dexed_op_index_, same
+            // idiom as LayerStatus/cursor_layer_) -- but unlike rotating
+            // between LayerStatus's own layers (which always passes back
+            // through Home, a genuine context change, first), changing
+            // dexed_op_index_ here does NOT change which KnobContext
+            // enum value CurrentKnobContext() returns, so ApplyKnobs()'s
+            // own automatic "re-arm pickup on context change" never
+            // fires. Left alone, an already-engaged knob would
+            // immediately re-apply its last raw position against the
+            // NEWLY selected operator's bytes on the very next tick --
+            // exactly what turning one operator's Rate then cycling to
+            // another showed on hardware ("all the other operators'
+            // rates change to that value"). Screen::Mixer's own rotate
+            // handling hit the identical class of bug for mixer_position_
+            // and fixed it the same way: explicitly re-run the reset/
+            // reseed here instead of relying on the automatic path.
+            KnobContext ctx       = CurrentKnobContext();
+            size_t      ctx_index = (size_t)ctx;
+            k1_pickup_engaged_[ctx_index] = false;
+            k2_pickup_engaged_[ctx_index] = false;
+            SyncPickupTargets(ctx);
+            last_knob_context_ = ctx;
+            break;
+        }
         case Screen::Mixer:
             mixer_target_reverb_ = false; // knobs -> Volume+Pan (ignored on Master)
             break;
@@ -1083,6 +1136,15 @@ void Ui::OnButton2Short()
         int algo = (dexed_->GetPatchByte(134) + 1) % 32;
         dexed_->SetPatchByte(134, (uint8_t)algo);
     }
+    else if(screen_ == Screen::DexedOperator && dexed_op_page_ == DexedOpParamPage::EgRate)
+        // Toggles (not just sets true) -- unlike Granular's own ADSR
+        // page, Button1 is already committed to operator-select duty
+        // here (see OnButton1Short()), so there's no second button free
+        // to select AD explicitly; Button2 alone has to cover both
+        // directions.
+        dexed_op_egrate_target_sr_ = !dexed_op_egrate_target_sr_;
+    else if(screen_ == Screen::DexedOperator && dexed_op_page_ == DexedOpParamPage::EgLevel)
+        dexed_op_eglevel_target_sr_ = !dexed_op_eglevel_target_sr_;
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Grain)
         granular_grain_target_gap_scan_ = true; // knobs -> Gap+Scan
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::ADSR)
@@ -1140,8 +1202,22 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case DexedParamPage::EnvSpeed: return KnobContext::DexedEnvSpeed;
                 case DexedParamPage::Filter: return KnobContext::DexedFilter;
                 case DexedParamPage::Mix: return KnobContext::DexedMix;
+                case DexedParamPage::Advanced: return KnobContext::DexedAdvanced;
                 case DexedParamPage::Preset: return KnobContext::DexedPreset;
                 default: return KnobContext::DexedAlgo;
+            }
+        case Screen::DexedOperator:
+            switch(dexed_op_page_)
+            {
+                case DexedOpParamPage::RatioLevel: return KnobContext::DexedOpRatioLevel;
+                case DexedOpParamPage::Detune: return KnobContext::DexedOpDetune;
+                case DexedOpParamPage::EgRate:
+                    return dexed_op_egrate_target_sr_ ? KnobContext::DexedOpEgRateSR
+                                                          : KnobContext::DexedOpEgRateAD;
+                case DexedOpParamPage::EgLevel:
+                    return dexed_op_eglevel_target_sr_ ? KnobContext::DexedOpEgLevelSR
+                                                           : KnobContext::DexedOpEgLevelAD;
+                default: return KnobContext::DexedOpRatioLevel;
             }
         case Screen::Granular:
             switch(granular_param_page_)
@@ -1273,7 +1349,55 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k2_pickup_raw_[i] = dexed_->GetOutputLevel01();
             }
             break;
+        case KnobContext::DexedAdvanced: break; // entry point only -- see Screen::DexedOperator instead
         case KnobContext::DexedPreset: break; // browses a list directly, no pickup used
+        case KnobContext::DexedOpRatioLevel:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 18) / 32.f; // coarse
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 16) / 99.f; // output level
+            }
+            break;
+        case KnobContext::DexedOpDetune:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 20) / 14.f;
+            }
+            break;
+        case KnobContext::DexedOpEgRateAD:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 0) / 99.f; // Rate1
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 1) / 99.f; // Rate2
+            }
+            break;
+        case KnobContext::DexedOpEgRateSR:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 2) / 99.f; // Rate3
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 3) / 99.f; // Rate4
+            }
+            break;
+        case KnobContext::DexedOpEgLevelAD:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 4) / 99.f; // Level1
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 5) / 99.f; // Level2
+            }
+            break;
+        case KnobContext::DexedOpEgLevelSR:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 6) / 99.f; // Level3
+                k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 7) / 99.f; // Level4
+            }
+            break;
         case KnobContext::GranularGrainSizeFill:
             if(granular_)
             {
@@ -1828,6 +1952,7 @@ void Ui::ApplyKnobs()
                     if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                         dexed_->SetOutputLevel01(k2);
                     break;
+                case DexedParamPage::Advanced: break; // no knobs, encoder click drills in
                 case DexedParamPage::Preset:
                 {
                     if(save_load_mode_ == SaveLoadMode::ChoosingSave)
@@ -1896,6 +2021,83 @@ void Ui::ApplyKnobs()
                 default: break;
             }
             break;
+
+        case Screen::DexedOperator:
+        {
+            if(!dexed_)
+                break;
+            int base = dexed_op_index_ * 21;
+            switch(dexed_op_page_)
+            {
+                case DexedOpParamPage::RatioLevel:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int coarse = (int)(Clampf(k1, 0.f, 1.f) * 32.f);
+                        coarse     = coarse > 31 ? 31 : coarse;
+                        if((uint8_t)coarse != dexed_->GetPatchByte(base + 18))
+                            dexed_->SetPatchByte(base + 18, (uint8_t)coarse);
+                    }
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    {
+                        int level = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
+                        level     = level > 99 ? 99 : level;
+                        if((uint8_t)level != dexed_->GetPatchByte(base + 16))
+                            dexed_->SetPatchByte(base + 16, (uint8_t)level);
+                    }
+                    break;
+                case DexedOpParamPage::Detune:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int detune = (int)(Clampf(k1, 0.f, 1.f) * 14.f + 0.5f);
+                        detune     = detune > 14 ? 14 : detune;
+                        if((uint8_t)detune != dexed_->GetPatchByte(base + 20))
+                            dexed_->SetPatchByte(base + 20, (uint8_t)detune);
+                    }
+                    break;
+                case DexedOpParamPage::EgRate:
+                {
+                    int off1 = dexed_op_egrate_target_sr_ ? base + 2 : base + 0;
+                    int off2 = dexed_op_egrate_target_sr_ ? base + 3 : base + 1;
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int rate = (int)(Clampf(k1, 0.f, 1.f) * 99.f + 0.5f);
+                        rate     = rate > 99 ? 99 : rate;
+                        if((uint8_t)rate != dexed_->GetPatchByte(off1))
+                            dexed_->SetPatchByte(off1, (uint8_t)rate);
+                    }
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    {
+                        int rate = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
+                        rate     = rate > 99 ? 99 : rate;
+                        if((uint8_t)rate != dexed_->GetPatchByte(off2))
+                            dexed_->SetPatchByte(off2, (uint8_t)rate);
+                    }
+                    break;
+                }
+                case DexedOpParamPage::EgLevel:
+                {
+                    int off1 = dexed_op_eglevel_target_sr_ ? base + 6 : base + 4;
+                    int off2 = dexed_op_eglevel_target_sr_ ? base + 7 : base + 5;
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        int level = (int)(Clampf(k1, 0.f, 1.f) * 99.f + 0.5f);
+                        level     = level > 99 ? 99 : level;
+                        if((uint8_t)level != dexed_->GetPatchByte(off1))
+                            dexed_->SetPatchByte(off1, (uint8_t)level);
+                    }
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    {
+                        int level = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
+                        level     = level > 99 ? 99 : level;
+                        if((uint8_t)level != dexed_->GetPatchByte(off2))
+                            dexed_->SetPatchByte(off2, (uint8_t)level);
+                    }
+                    break;
+                }
+                default: break;
+            }
+            break;
+        }
 
         case Screen::Mixer:
         {
@@ -1972,6 +2174,7 @@ void Ui::Draw()
         case Screen::Granular: DrawGranularScreen(); break;
         case Screen::Mixer: DrawMixerScreen(); break;
         case Screen::Dexed: DrawDexedScreen(); break;
+        case Screen::DexedOperator: DrawDexedOperatorScreen(); break;
     }
     disp_->Update();
 }
@@ -3509,8 +3712,9 @@ float Ui::MixerGetPan01(int ch) const
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetPan01();
         case 4: return granular_ ? granular_->GetPan01() : 0.5f;
+        case 5: return dexed_ ? dexed_->GetPan01() : 0.5f;
         case 6: return bypass_pan01_;
-        default: return 0.5f; // Master and DXD (no Pan control yet) have none
+        default: return 0.5f; // Master has none
     }
 }
 
@@ -3550,8 +3754,9 @@ void Ui::MixerSetPan01(int ch, float v01)
     {
         case 0: case 1: case 2: case 3: layers_[ch].SetPan01(v01); break;
         case 4: if(granular_) granular_->SetPan01(v01); break;
+        case 5: if(dexed_) dexed_->SetPan01(v01); break;
         case 6: SetBypassPan01(v01); break;
-        default: break; // Master and DXD (no Pan control yet) -- no-op
+        default: break; // Master has no Pan -- no-op
     }
 }
 
@@ -3569,7 +3774,11 @@ void Ui::MixerSetSend01(int ch, float v01)
 
 bool Ui::MixerChannelHasPan(int ch) const
 {
-    return ch != 5 && ch != kNumMixerChannels - 1;
+    // Only Master lacks a Pan concept now -- Dexed got a real Pan
+    // control after a user report that its live output, having no pan
+    // stage at all, reached the mix disproportionately loud next to
+    // every other source's own center-pan-attenuated signal.
+    return ch != kNumMixerChannels - 1;
 }
 
 // Vertical fader-style bar -- (x0,y0) is the box's top-left corner, fills
@@ -3633,6 +3842,7 @@ void Ui::DrawDexedScreen()
         case DexedParamPage::EnvSpeed: page_name = "EnvSpd"; break;
         case DexedParamPage::Filter: page_name = "Filter"; break;
         case DexedParamPage::Mix: page_name = "Mix"; break;
+        case DexedParamPage::Advanced: page_name = "Advanced"; break;
         case DexedParamPage::Preset: page_name = "Preset"; break;
         default: break;
     }
@@ -3980,6 +4190,20 @@ void Ui::DrawDexedScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
+        case DexedParamPage::Advanced:
+        {
+            // Entry point into Screen::DexedOperator -- same "Click to
+            // open..." idiom as GlobalPage::Granular/Dexed's own entry
+            // pages, just reached by a click on this page instead of a
+            // Global one.
+            disp_->SetCursor(0, 20);
+            WriteUpper("Per-operator editor");
+            disp_->SetCursor(0, 30);
+            WriteUpper("Click to open");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
         case DexedParamPage::Preset:
         {
             if(!PerformanceStore::IsCardPresent())
@@ -4124,6 +4348,95 @@ void Ui::DrawDexedScreen()
     }
 }
 
+void Ui::DrawDexedOperatorScreen()
+{
+    if(!dexed_)
+        return;
+
+    // Real HW op number (6-index), same convention the Algo diagram
+    // already uses -- confirmed from the real DX7 SysEx spec that array
+    // index 0 is HW OP6, index 5 is OP1.
+    int hw_op = 6 - dexed_op_index_;
+    int base  = dexed_op_index_ * 21;
+
+    const char* page_name = "Ratio";
+    switch(dexed_op_page_)
+    {
+        case DexedOpParamPage::RatioLevel: page_name = "Ratio"; break;
+        case DexedOpParamPage::Detune: page_name = "Detune"; break;
+        case DexedOpParamPage::EgRate: page_name = "EG Rate"; break;
+        case DexedOpParamPage::EgLevel: page_name = "EG Level"; break;
+        default: break;
+    }
+    char title[24];
+    snprintf(title, sizeof(title), "Op %d:%s", hw_op, page_name);
+    disp_->SetCursor(0, 0);
+    WriteUpper(title);
+    DrawBeatIndicator(disp_->Width() - 41, 0, 3);
+    disp_->DrawLine(0, 9, disp_->Width() - 1, 9, true);
+
+    switch(dexed_op_page_)
+    {
+        case DexedOpParamPage::RatioLevel:
+        {
+            char ratio_val[8], level_val[8];
+            snprintf(ratio_val, sizeof(ratio_val), "%d", dexed_->GetPatchByte(base + 18));
+            snprintf(level_val, sizeof(level_val), "%d", dexed_->GetPatchByte(base + 16));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Ratio", ratio_val, level_val,
+                             "Level");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
+        case DexedOpParamPage::Detune:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(base + 20));
+            disp_->SetCursor(0, 20);
+            WriteUpper("7 = centered");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Detune", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
+        case DexedOpParamPage::EgRate:
+        {
+            // Real DX7 R1-R4 aren't literally an ADSR envelope, but
+            // naming them Attack/Decay/Sustain/Release (matching this
+            // same AD/SR-toggle idiom's own "AD"/"SR" pairing) reads far
+            // more clearly than "Rate1..4" -- requested directly after
+            // real hardware testing.
+            bool sr = dexed_op_egrate_target_sr_;
+            disp_->SetCursor(0, 20);
+            WriteUpper(sr ? "Sustain+Release" : "Attack+Decay");
+            char v1[8], v2[8];
+            snprintf(v1, sizeof(v1), "%d", dexed_->GetPatchByte(sr ? base + 2 : base + 0));
+            snprintf(v2, sizeof(v2), "%d", dexed_->GetPatchByte(sr ? base + 3 : base + 1));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, sr ? "Sustain" : "Attack", v1, v2,
+                             sr ? "Release" : "Decay");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "AD/SR");
+            break;
+        }
+        case DexedOpParamPage::EgLevel:
+        {
+            // Same Attack/Decay/Sustain/Release naming as the EgRate
+            // page above, and for the same reason -- the title bar
+            // ("Op N:EG Level" vs "...EG Rate") already disambiguates
+            // level from rate, so reusing identical stage names here
+            // instead of "Level1..4" is consistent, not ambiguous.
+            bool sr = dexed_op_eglevel_target_sr_;
+            disp_->SetCursor(0, 20);
+            WriteUpper(sr ? "Sustain+Release" : "Attack+Decay");
+            char v1[8], v2[8];
+            snprintf(v1, sizeof(v1), "%d", dexed_->GetPatchByte(sr ? base + 6 : base + 4));
+            snprintf(v2, sizeof(v2), "%d", dexed_->GetPatchByte(sr ? base + 7 : base + 5));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, sr ? "Sustain" : "Attack", v1, v2,
+                             sr ? "Release" : "Decay");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "AD/SR");
+            break;
+        }
+        default: break;
+    }
+}
+
 void Ui::DrawMixerScreen()
 {
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
@@ -4213,9 +4526,9 @@ void Ui::DrawMixerScreen()
         }
         else
         {
-            // DXD: no Pan control yet -- K2 has nothing to do on this
-            // page, so the row just shows Volume alone instead of a Pan
-            // readout that wouldn't reflect anything real.
+            // No channel currently lacks Pan besides Master (handled
+            // above via is_master) -- kept as a real fallback rather
+            // than an assert, in case that ever changes again.
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Vol", vol_val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Vol*", "", "", "Rev");
         }

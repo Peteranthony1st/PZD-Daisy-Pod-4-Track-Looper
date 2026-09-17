@@ -17,7 +17,7 @@ layer, and SD card save/load, none of which exist in the original.
 **Dexed** (see its own section below) is built around **msfa**, Google's
 own real DX7 emulation core, released under the Apache License 2.0 —
 vendored unmodified into `src/msfa/` except two small additive
-introspection helpers. Its 3834 factory presets are real, freely-
+introspection helpers. Its 3129 factory presets are real, freely-
 distributed SysEx bank dumps drawn from the broader Dexed/MicroDexed
 open-source ecosystem that msfa's own lineage traces through, not one
 single traceable upstream repo.
@@ -154,7 +154,12 @@ Full control map:
 | Dexed: EnvSpeed | All-operator envelope rate scale (0x..2x, center = as saved) | — | — | — |
 | Dexed: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Dexed: Mix | Reverb send | Output level | — | — |
+| Dexed: Advanced | — | — | — | — (push encoder to enter Screen::DexedOperator) |
 | Dexed: Preset | Folder list: scroll folders. Inside a folder: scroll presets | — | Save / Open folder (or Select at top chooser) / Back | Tap = preview live (stays in browser); Hold 800ms = confirm + exit |
+| DexedOperator: RatioLevel | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
+| DexedOperator: Detune | Detune (0-14, 7=centered) | — | Cycle operator (1-6) | — |
+| DexedOperator: EgRate | Attack (or Sustain) | Decay (or Release) | Cycle operator (1-6) | Toggle AD/SR |
+| DexedOperator: EgLevel | Attack Level (or Sustain Level) | Decay Level (or Release Level) | Cycle operator (1-6) | Toggle AD/SR |
 | Granular: Grain | Size (or Gap) | Fill (or Scan) | Knobs → Size+Fill | Knobs → Gap+Scan |
 | Granular: Position | Position (Grain layer's fixed anchor) | — | — | — |
 | Granular: TuneDirection | Tune (grain pitch, ±24 semitones) | Direction (Forward/Reverse/Random) | Toggle Map-to-Note | — |
@@ -164,8 +169,7 @@ Full control map:
 | Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
 | Granular: Trim | Trim start | Trim end | — | — |
 | Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
-| Mixer: Layer/Grains/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
-| Mixer: DXD (Dexed) | Volume | — (no Pan control yet) | Knobs → Volume (no Pan to toggle) | Knobs → Reverb send |
+| Mixer: Layer/Grains/Dexed/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
 | Mixer: Master | Volume | Reverb size | — | — |
 
 BPM/Bars are locked once any layer holds a recording, and the knobs stop
@@ -535,9 +539,27 @@ final `tanhf()` soft limiter hard enough to audibly compress even a
 single patch played alone; doubled to `1/8.82`, confirmed clean up to
 full master volume. A `daisysp::Svf` pair (mirroring `GranularEngine`'s
 own bus-filter shape) sits post-mix, pre-limiter, so a resonant peak is
-still caught by the safety net rather than clipping past it. Dexed has
-no Pan control yet (see *Screen::Mixer* below for what that means for
-its own Mixer channel) — a later increment.
+still caught by the safety net rather than clipping past it. Dexed now
+has a real Pan control too (see below) — added after this engine's own
+initial "no Pan yet" gap turned out to have a real, audible consequence.
+
+**Pan, added after a real hardware report**: same linear pan law every
+other engine here uses (`panL = 1-v`, `panR = v`), applied to the same
+mono `s` right after the limiter/output-level stage, feeding both the
+dry output and the reverb send (same position and reasoning
+`GranularEngine::Process()` already uses). This didn't exist initially
+-- Dexed's own live signal reached the master mix completely unscaled,
+with no pan-law attenuation at all, while every OTHER source (loop
+layers, Grains) already took the usual -6dB-at-center cut before
+reaching `out[]`. The result: a user reported Dexed sounding
+disproportionately loud playing live compared to a recorded-and-played-
+back loop layer at the same nominal settings -- not a bug in either
+signal path, just a real structural gap in Dexed's own gain-staging
+that every other engine here didn't have. Saved as `pan01` in
+`DexedPresetData` (see below), and reachable from Dexed's own Mixer
+channel (see *Screen::Mixer* below) -- not from a dedicated page on
+`Screen::Dexed` itself, since the existing Mix page had no free knob
+slot to add it without a Button-toggle idiom for just one control.
 
 **Macros — Brightness and Envelope Speed**: both bipolar, knob-center
 (0.5) = "exactly as the loaded preset stored it," scaling relative to a
@@ -599,82 +621,89 @@ this). Algorithm can be cycled three ways: Knob 1 (quantized bucket
 selection across all 32, soft pickup), Button 1 (step back), Button 2
 (step forward).
 
-**Factory presets — 3834 across 41 folders, real sourced data, never
+**Factory presets — 3129 across 54 folders, real sourced data, never
 invented**: real, freely-distributed SysEx bank dumps drawn from the
 broader Dexed/MicroDexed open-source ecosystem this whole port's msfa
 lineage already traces through (not one single traceable upstream
-repo), each a real, standard 32-voice SysEx bulk-dump bank. The original
-15: 11 folders organized by real
-sound type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/
-Perc/Choir/Bells — `kDexedFactoryCategories` in `dexed_factory_data.cpp`,
-two source banks each, 64 voices, except Perc at 65 — see below), plus 4
-more, **Rom 1** through **Rom 4**, each the real, unsorted 64-voice
-contents of an actual Yamaha factory ROM cartridge pair (ROM1=1A+1B ...
-ROM4=4A+4B) kept in their own original folders rather than re-sorted by
-sound type. Real quality/popularity rankings for DX7 patches aren't
-something that can be sourced reliably, so the ROM folders stand in as
-an objective proxy instead — genuine factory data every real DX7 shipped
-with (ROM1) or that Yamaha sold as official cartridges (ROM2-4). One
-single voice (the classic ROM1A "MARIMBA") was hand-picked into the Perc
-folder on top of its two source banks, after a user report that no
-marimba sound existed anywhere in the set.
+repo), each a real, standard 32-voice SysEx bulk-dump bank. **Rom 1**
+through **Rom 4** (`kDexedFactoryCategories` in `dexed_factory_data.cpp`)
+are each the real, unsorted 64-voice contents of an actual Yamaha
+factory ROM cartridge pair (ROM1=1A+1B ... ROM4=4A+4B), kept in their
+own original folders rather than sorted by sound type. Real quality/
+popularity rankings for DX7 patches aren't something that can be
+sourced reliably, so these stand in as an objective proxy instead --
+genuine factory data every real DX7 shipped with (ROM1) or that Yamaha
+sold as official cartridges (ROM2-4).
 
-**26 more, added later from a second, much larger real patch
-collection** (a genuine ~100-bank, ~2900-voice set, found already
-organized into named categories by its own upstream source manifest):
-13 named categories -- **Synth 2/Piano 2/EPiano/Bass 2/Strings 2/
-Woodwind 2/Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div** — kept in their
-own separate folders (a " 2" suffix where a same-named folder already
-existed above, a plain new name where it didn't) rather than merged
-into the original folders, since the two collections were sourced and
-reviewed independently; an 8th category in that same source collection,
-its own "ROM" folder, was confirmed byte-for-byte identical to this
-project's own Rom 1-4 (same ultimate origin) and skipped rather than
-duplicated. Voices that were entirely empty (all-zero patch bytes, ~2%
-of the raw set — real banks aren't always fully populated) were filtered
-out during import rather than embedded as dead presets.
+**The other 50, from one real ~100-bank, ~2900-voice collection** that
+came already organized into 13 named categories by its own upstream
+source manifest -- Synth/Piano/EPiano/Bass/Strings/Woodwind/Brass/
+Organ/Perc/Voice/Bells/FX/Div. An 8th category in that same collection,
+its own "ROM" folder, was confirmed byte-for-byte identical to Rom 1-4
+above (same ultimate origin) and skipped rather than duplicated. Voices
+that were entirely empty (all-zero patch bytes, ~2% of the raw set --
+real banks aren't always fully populated) were filtered out during
+import rather than embedded as dead presets. Each of the 13 categories
+is split into as many same-named numbered folders (Synth 1, Synth 2,
+...) as it takes to keep every single one at or under 64 voices -- 2
+source bank files (64 voices) per folder, 1 for any odd file left over.
 
-**Each of those 13 was then split into two roughly-equal halves**
-(e.g. "Synth 2-1"/"Synth 2-2", "FX 1"/"FX 2") after a real user report
-that the largest ones — up to 320 voices in one folder, versus the
-original categories' own 64-65 — were too fine-grained to scroll
-accurately with a single knob's worth of physical rotation. Split by
-source-file boundary within each category (keeping each source bank's
-own 32 voices together, rather than a mid-bank byte split) so every half
-still corresponds to a clean, real subset of the original bank files;
-halves land in the 64-160 voice range, the same rough scale the original
-15 categories already proved comfortable at.
+This went through two real iterations on hardware. An
+earlier version of this project also shipped 11 hand-picked "Synth/
+Piano/E.Piano/..." categories of its own (2 bank files each, sourced
+independently, before this much larger collection was found) -- removed
+once the larger collection made them a smaller, redundant duplicate
+covering the same sound types (one hand-picked voice, the classic
+ROM1A "MARIMBA", that had been added to the old Percussion folder after
+a user report that no marimba existed anywhere in the set, turned out
+unnecessary too -- the larger collection's own Perc/Div folders already
+contain over 20 real marimba voices). The 13-category collection was
+also initially embedded as one folder per category (up to 320 voices in
+"Synth 2" alone) -- a real user report that this was too fine-grained
+to land on a specific preset with one knob's worth of physical rotation
+led to a first pass splitting each into two halves, then a second pass
+(after a follow-up "still too many, cap every folder at 64") splitting
+by source-file boundary (never a mid-bank byte split, so every folder
+is still a clean, real subset of the original bank files) into however
+many same-named numbered folders it actually takes.
 
 Stored as raw 128-byte-per-
 voice **packed** payloads (never pre-expanded and held in flash/RAM
 unpacked) — `DexedSynth::GetFactoryPreset()` unpacks on demand via
 `DexedSysex::UnpackVoice()`, verified byte-exact via a native (non-
 embedded) round-trip test against real bank data before ever being
-embedded. The original `.syx` bank files themselves (both collections)
-are kept in the repo under `addon/SD/DEXED/<category>/`, mirroring the
-firmware's own folder names, for reference/attribution — not read by
+embedded. The original `.syx` bank files themselves are kept in the
+repo under `addon/SD/DEXED/<category>/`, mirroring the firmware's own
+folder names, for reference/attribution — not read by
 the firmware build itself.
 
 **Duplicate factory names, and why some folders auto-number them**: real
 factory banks occasionally have a long run of voices someone saved
-without ever renaming from a generic default (the Bells folder's source
-bank has ~30 voices literally all named bare "BELL") — indistinguishable
+without ever renaming from a generic default -- indistinguishable
 from each other while scrolling the preset browser, confirmed by a real
-user report. `DexedSynth::GetFactoryPresetName()` disambiguates any name
+user report (against an earlier factory bank this project has since
+replaced, but the same real-world data quirk can recur in any bank).
+`DexedSynth::GetFactoryPresetName()` disambiguates any name
 that repeats anywhere within its own category with a running " N" suffix
 (numbering every occurrence, including the first, so no two presets in
 the same folder ever display identically) — a display-only fix; the
 underlying patch data/sound is untouched.
 
 **Preset data & save/load** (`DexedSynth::DexedPresetData`): patch bytes
-plus `reverb_send01`/`output_level01`/filter mode+cutoff+resonance — a
+plus `reverb_send01`/`output_level01`/filter mode+cutoff+resonance/
+`pan01` — a
 flat snapshot via `ApplyPreset()`/`CapturePreset()`, the same shape every
-other engine's own preset struct already uses. `output_level01` defaults
+other engine's own preset struct already uses. `pan01` was added later,
+once Dexed got a real Pan control (see below) -- a trailing field with a
+0.5 (centered) default member initializer, same convention PadSynth's
+own tune01/pan01 fields used when THEY were added later, so every
+existing positional/aggregate initializer still gets a sensible neutral
+value. `output_level01` defaults
 to **0.6** (not 1.0), and since factory presets never set this field
-themselves, that's the level every one of the 3834 factory presets
+themselves, that's the level every one of the 3129 factory presets
 actually loads at. User presets save/load to `DEXP/PRESnnn.DAT` via
-`PerformanceStore` (up to `kMaxDexedPresets = 4200` total slot numbers,
-headroom above the 3834 factory presets for up to ~366 of your own) — the
+`PerformanceStore` (up to `kMaxDexedPresets = 3500` total slot numbers,
+headroom above the 3129 factory presets for up to ~371 of your own) — the
 factory range is served straight from `GetFactoryPreset()` with zero card
 I/O and, unlike the user range, is never subject to Delete/Duplicate's
 own slot-renumbering (`CompactSlotsAfterDelete()` is fundamentally
@@ -717,6 +746,22 @@ independent of the loop layers) was extended the same way, to also
 include Dexed's generated audio (not Grains' own — that would be a
 self-capture feedback loop).
 
+**Reverb never gets recorded, for either instrument -- not a bug**: a
+real user question ("if reverb is active on Dexed, why doesn't it
+record with that reverb?"). `mixed_in` above is built entirely from dry
+per-source signals; the shared `ReverbSc` bus (fed by every source's own
+Reverb Send, loop layers included) is computed once per sample and
+added straight into `out[]` afterward, never routed back into
+`mixed_in`. This has always been true for the loop layers' own reverb
+sends too -- reverb here is a genuinely live/monitoring-only effect
+across the whole project, never "printed" into a recording. Making it
+print would need either a separate reverb instance per source (defeats
+the deliberate "one shared bus" CPU-saving design) or feeding the wet
+output back into `mixed_in` (which would pull in every source's reverb,
+not just one, and risks a real feedback buildup across successive
+overdubs) -- a real architecture change with real tradeoffs, not
+attempted here.
+
 **Grains' own output level, raised for the same underlying reason**:
 real-hardware testing after the recording fix above surfaced that Grains
 sounded much quieter than Dexed even at Grains' own Output Level knob
@@ -724,14 +769,116 @@ maxed — traced to two real, structural facts about `GranularEngine`'s own
 gain chain that Dexed simply doesn't share: overlap-gain compensation
 (dividing by however many grain slots are active, a deliberate,
 documented anti-clipping tradeoff) and the shared linear center-pan law
-(a real -6dB dip at center that Dexed currently skips entirely, having no
-Pan control yet). `GranularEngine::SetOutputLevel01()`'s ceiling was
+(a real -6dB dip at center that Dexed skipped entirely at the time,
+having no Pan control yet -- see *Dexed*'s own note above; it since
+got one, closing that specific gap, though the overlap-gain difference
+remains a genuine structural one). `GranularEngine::SetOutputLevel01()`'s ceiling was
 raised from 1.4x to 12x (in two real-hardware-driven steps, 4x first,
 then further after that still measured too quiet) specifically to give
 that knob enough real headroom to compensate — paired with a new
 `tanhf()` soft limiter in `Process()` (same convention as Dexed's own)
 so pushing the knob that hard drives it into deliberate, audible
 saturation rather than harsh digital clipping.
+
+**A real tradeoff surfaced while chasing a separate ADSR report below**:
+pushing Output Level high enough that the pre-limiter signal sits deep
+into `tanhf()`'s saturation zone doesn't just add the intended
+loudness/drive character -- it also compresses away most of the
+audible difference between different envelope stages, since values as
+different as 0.3 and 1.0 both land close to the same near-1.0 ceiling
+once heavily saturated. This isn't a bug in the ADSR itself (the engine
+settings are applied correctly throughout), but a real consequence of
+how far this ceiling can now push a signal into the limiter -- worth
+knowing before assuming a "no audible ADSR effect" report is a wiring
+bug rather than an Output Level setting.
+
+## Dexed advanced editor (Screen::DexedOperator)
+
+The per-operator FM editor referenced in *Dexed*'s own Presets section
+above as a later phase -- built once the simple-page macros (Brightness/
+EnvSpeed) proved not to be enough on their own for actually shaping a
+patch from scratch.
+
+**Navigation**: reached from `Screen::Dexed`'s own **Advanced** page
+(`DexedParamPage::Advanced`, positioned directly before Preset in the
+page order -- an explicit user placement decision, not the "last page"
+default the plan's own initial write-up assumed) via encoder click, the
+same "click on this specific page enters a real screen" idiom
+`GlobalPage::Granular`/`GlobalPage::Dexed` already use, just triggered
+from a Screen::Dexed page instead of a Global one. A short encoder
+click inside `Screen::DexedOperator` returns to `Screen::Dexed` (landing
+back on Advanced); long-press still goes all the way to Home from
+there, same as every other screen -- no special-casing needed, since
+the existing "long-press from anywhere goes Home" handling in
+`HandleEncoder()` is already screen-agnostic.
+
+**Operator select, pages, and the v1 core scope**: Button 1 cycles
+through the 6 operators (shown as the real HW op number, `6 -
+dexed_op_index_`, matching the Algo diagram's own convention) --
+encoder rotate stays reserved for `DexedOpParamPage` navigation
+(RatioLevel, Detune, EgRate, EgLevel), matching every other screen's
+own "rotate cycles pages" rule. This is the "Core set for v1" scope
+chosen earlier in this project's own planning: Ratio (coarse only --
+fine is left at whatever the loaded preset stored, not exposed),
+Output Level, Detune, and the 4 EG Rates + 4 EG Levels via the existing
+AD/SR Button-toggle idiom every ADSR-shaped page in this codebase
+already uses. Keyboard scaling, velocity sensitivity, and amp-mod
+sensitivity remain deliberately deferred.
+
+**EgRate/EgLevel's AD/SR toggle is Button2-only, not Button1+Button2**:
+unlike Granular's own ADSR page (which uses Button1 to explicitly
+select AD and Button2 to select SR), Button1 here is already committed
+to operator-select duty, so Button2 alone has to cover both directions
+-- it toggles (flips) the bool rather than just setting it, since
+there's no second button free to jump straight back to AD.
+
+**The 4 EG stages are labeled Attack/Decay/Sustain/Release, not
+Rate1..4/Level1..4**: the real DX7 R1-R4/L1-L4 envelope isn't literally
+an ADSR, but a direct user request after real hardware testing found
+the numbered labels didn't communicate what the knobs were actually
+doing. Reusing the same AD/SR-pair naming this codebase's own ADSR
+toggle idiom already implies (Attack+Decay one pair, Sustain+Release
+the other) reads far more clearly, and the page title ("Op N:EG Rate"
+vs "...EG Level") already disambiguates which of the two parameter
+sets is being edited, so reusing identical stage names on both pages
+isn't ambiguous.
+
+**KnobContext reuse across all 6 operators**: `DexedOpRatioLevel`/
+`DexedOpDetune`/`DexedOpEgRateAD`/`DexedOpEgRateSR`/`DexedOpEgLevelAD`/
+`DexedOpEgLevelSR` are each ONE context shared across all 6 operators
+(branching internally on `dexed_op_index_`), the same "one context,
+branch on which target" idiom `KnobContext::LayerStatus` already uses
+for `cursor_layer_` -- chosen specifically to avoid a 6x blowup of the
+`KnobContext` enum a naive per-operator-per-page context would cause.
+
+**A real bug this idiom introduced, found on hardware**: unlike
+rotating between `LayerStatus`'s own layers (which always passes back
+through Home first, a genuine context change), changing
+`dexed_op_index_` via Button1 does NOT change which `KnobContext` enum
+value `CurrentKnobContext()` returns -- so `ApplyKnobs()`'s own
+automatic "re-arm pickup on context change" never fired. Left
+unguarded, an already-engaged knob would immediately re-apply its last
+raw position against the newly-selected operator's bytes on the very
+next tick -- exactly what a real user report showed ("change one rate
+[on one operator], all the other operators' rates change to that
+value"), and confirmed to affect every `DexedOpParamPage`, not just
+`EgRate`, since they all share the same root cause. Fixed the same way
+`Screen::Mixer`'s own `mixer_position_` handling already had to for the
+identical class of bug: `OnButton1Short()`'s `Screen::DexedOperator`
+case explicitly re-runs the pickup reset/reseed (`k1_pickup_engaged_`/
+`k2_pickup_engaged_` cleared, `SyncPickupTargets()` re-run,
+`last_knob_context_` updated) every time it changes `dexed_op_index_`,
+rather than relying on the automatic path.
+
+**Byte offsets**: each operator's 21-byte block (`base = dexed_op_index_
+* 21`) exposes output level (`base+16`), coarse ratio (`base+18`),
+detune (`base+20`), the 4 EG rates (`base+0..3`), and the 4 EG levels
+(`base+4..7`) -- all written via the existing generic
+`DexedSynth::SetPatchByte()`, the same low-level single-byte-edit
+mechanism the simple pages' Algo/Feedback/Vibrato controls already use,
+with the same "did this actually change" guard on every write (see
+*Dexed*'s own note on `KnobPickUp()`'s lack of one, above) since these
+trigger the same expensive per-held-voice `Dx7Note::update()` path.
 
 ## Grains (Screen::Granular / GranularEngine)
 
@@ -807,6 +954,26 @@ prevents clicks within a single grain, it has no swell-in/tail-off of
 its own, which is what the ADSR adds. Same curved-seconds convention as
 Pad Synth's own ADSR.
 
+**A real release-tail bug, found from a user report**: "if I set a long
+release and let go of the note it should sound on but it doesn't". Both
+grain clusters' triggering was gated on plain `gate` (`held_note_ >=
+0`), so new grains stopped being scheduled the instant a note was
+released, regardless of how long Release was set to -- the only "tail"
+that could ever be heard was whatever grain(s) happened to already be
+in flight at that moment, capped at one grain's own Size (up to
+500ms), never the actual configured Release duration. The engine-side
+ADSR itself was never broken (`Adsr::Process()` correctly kept
+producing a slowly-decaying `env` for as long as Release said it
+should), but with no new grain material being generated to apply that
+envelope to, there was nothing left to hear well before Release
+actually finished. Fixed by triggering on `gate ||
+adsr_.IsRunning()` instead (`daisysp::Adsr::IsRunning()` stays true
+until the envelope genuinely reaches its idle/finished state) --
+`NoteOff()` already leaves `note_gain_`/`note_rate_` untouched (only
+`held_note_` changes), so grains triggered during this extended tail
+still use the same pitch/velocity the held note did, no extra state
+needed.
+
 **Monophonic voice logic**: `NoteOn()` always retriggers the single
 voice (last-note priority, plain retrigger, no legato/portamento).
 `NoteOff()` only releases if it matches the currently-held note, so
@@ -818,7 +985,10 @@ slot, not one shared slot, so several simultaneously-active grains each
 fade independently) rather than an audible instant cut.
 
 **Capture**: three sources, all landing in the same SDRAM-owned buffer
-`main.cpp` allocates:
+`main.cpp` allocates (`kGranularCaptureSamples`, ~10s @ 48kHz -- raised
+from an original ~5s after a real imported WAV file turned out longer
+than that; anything captured/imported past this length is simply
+truncated, not refused):
 - **Direct Record** — Button 2 held on the Capture page streams live
   input straight into the buffer for as long as it's held (or until the
   buffer's fixed capacity is reached).
@@ -826,11 +996,23 @@ fade independently) rather than an audible instant cut.
   selected as the capture source (independent of Home's own cursor) into
   the same buffer, then points the engine at it via `SetSource()`.
 - **Import** — reads a user-supplied `.wav` file from the SD card's
-  `IMPORT/` folder (16-bit PCM, mono or stereo, 48000 or 44100 Hz; 44.1kHz
-  files are resampled up to the engine's native 48kHz with the same
-  exact-ratio linear resampler `ExportWav()` already uses in the other
-  direction). Anything else (24-bit, non-PCM, other rates) is cleanly
-  refused rather than misread.
+  `IMPORT/` folder. Originally 16-bit PCM only; widened to also accept
+  24-bit and 32-bit PCM, plus 32-bit IEEE float, after a real user's
+  commercial sample-pack loop (an otherwise perfectly ordinary stereo/
+  44.1kHz file, just 24-bit) failed to import with no path to fix it
+  short of re-encoding on a computer first -- 24-bit in particular is
+  extremely common for commercial sample packs. `ImportWav()`'s
+  previously `int16_t`-only read buffer became a generic byte buffer,
+  decoded per-sample based on the file's own (constant-for-the-whole-
+  stream) `audio_format`/`bits_per_sample`: 24-bit has no native integer
+  type, so it's reconstructed by shifting its 3 little-endian bytes into
+  the top 24 bits of a 32-bit int and arithmetic-shifting back down by
+  8, sign-extending and rescaling in one step. Sample rate support is
+  unchanged (48000 or 44100 Hz only, 44.1kHz resampled up to the
+  engine's native 48kHz with the same exact-ratio linear resampler
+  `ExportWav()` already uses in the other direction) -- arbitrary
+  sample-rate conversion is a genuinely separate, much bigger problem
+  than decoding an already-recognized format, and wasn't attempted here.
 - **Trim**: non-destructive start/end trim over whatever's currently
   captured — the underlying buffer is untouched, only the sub-range
   passed to `SetSource()` changes, so re-trimming always works from the
@@ -885,13 +1067,13 @@ for exactly this one screen was the least-surprising option, rather than
 inventing a second, competing "rotate" gesture.
 
 **Each of the 7 non-Master channels** shows a Detail page with real
-Volume/Reverb-Send vertical bars: Button 1 tap maps the knobs to
+Volume/Pan/Reverb-Send vertical bars: Button 1 tap maps the knobs to
 Volume+Pan, Button 2 tap maps them to Reverb Send — the same
 Button-1/Button-2-toggle-which-pair idiom already used elsewhere (Grains'
-merged Grain/ADSR/Mix pages). **DXD (Dexed)** is the one exception among
-those 7 — Dexed has no Pan control yet (see *Dexed* above), so its own
-Pan bar/readout is simply omitted rather than showing a value that
-wouldn't do anything; Volume and Reverb Send both still work normally.
+merged Grain/ADSR/Mix pages). DXD (Dexed) used to be the one exception
+among those 7, back when Dexed had no Pan control of its own (see
+*Dexed* above for the real user report that changed that) -- it now
+behaves identically to every other non-Master channel.
 **Master** (the 8th channel) has no toggle at all — Knob 1 is Volume,
 Knob 2 is Reverb Size, always, since there's no per-channel Pan/Send
 concept for the master bus itself.
@@ -1196,7 +1378,7 @@ A few things that are intentional, not bugs:
 - `dexed_sysex.h/.cpp` — this project's own clean-room packed↔unpacked
   DX7 SysEx converter, written from the public 1993 Yamaha MIDI SysEx
   spec (see *Dexed* above for why msfa itself doesn't include one)
-- `dexed_factory_data.h/.cpp` — the 3834 embedded factory presets (see
+- `dexed_factory_data.h/.cpp` — the 3129 embedded factory presets (see
   *Dexed* above), stored packed and unpacked on demand
 - `granular_engine.h/.cpp` — the Grains instrument (see *Grains* above)
 - `ui.h/.cpp` — encoder/button/knob handling + OLED menu rendering, for

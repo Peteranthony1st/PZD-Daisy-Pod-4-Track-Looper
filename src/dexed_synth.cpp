@@ -144,6 +144,13 @@ void DexedSynth::SetOutputLevel01(float v01)
     output_level_ = powf(output_level01_, 2.5f) * 1.4f;
 }
 
+void DexedSynth::SetPan01(float v01)
+{
+    pan01_      = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    pan_l_gain_ = 1.f - pan01_;
+    pan_r_gain_ = pan01_;
+}
+
 bool DexedSynth::VoiceIsIdle(int voice_index)
 {
     VoiceStatus st;
@@ -291,10 +298,14 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
         // Post-mix bus filter, same shape/position as GranularEngine's
         // own (before the soft limiter, so a resonant peak still gets
         // caught by it) -- both filter_l_/filter_r_ process the same
-        // mono input for now (Dexed has no Pan control yet, a later
-        // increment), matching the pair-of-filters convention every
-        // other engine here uses rather than a single mono filter, so
-        // stereo behavior is a smaller change to add later.
+        // mono input, since every voice is already summed to one mono
+        // signal well before this point (Pan, added later, only splits
+        // this same mono value into two differently-scaled channels
+        // further down -- it doesn't make the signal itself stereo).
+        // Kept as a real pair rather than one shared filter instance
+        // purely to match the convention every other engine here uses,
+        // so genuine per-channel filtering is a smaller change later if
+        // this ever does become truly stereo.
         if(filter_mode_ != FilterMode::Off)
         {
             filter_l_.Process(s);
@@ -318,12 +329,19 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
         // (tanhf(0.5) attenuates only ~8%) and only compresses hard once
         // a peak actually approaches/exceeds unity.
         s = tanhf(s) * output_level_;
-        out_l[i] = s;
-        out_r[i] = s;
+        // Pan applied last, same position GranularEngine's own Process()
+        // uses (post-limiter/output-level, feeding both the dry output
+        // and the reverb send) -- both channels fed the same mono s
+        // pre-pan, since Dexed sums every voice to one mono signal
+        // before this point (no per-voice stereo positioning).
+        float sl = s * pan_l_gain_;
+        float sr = s * pan_r_gain_;
+        out_l[i] = sl;
+        out_r[i] = sr;
         if(send > 0.f)
         {
-            reverb_send_l[i] += s * send;
-            reverb_send_r[i] += s * send;
+            reverb_send_l[i] += sl * send;
+            reverb_send_r[i] += sr * send;
         }
     }
 }
@@ -419,6 +437,7 @@ DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
     p.filter_mode     = (int32_t)filter_mode_;
     p.filter_cutoff01 = filter_cutoff01_;
     p.filter_res01    = filter_res01_;
+    p.pan01           = pan01_;
     return p;
 }
 

@@ -118,24 +118,20 @@ there), built around Google's own **msfa** DX7 emulation core — the real
 32 algorithms, the real envelope/scaling model, not an approximation.
 Off by default; switch it on from `Global:Dexed` (independent of
 Grains — no mutex, both can run together).
-- **3834 factory presets** across 41 folders — 11 organized by real sound
-  type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/Perc/Choir/
-  Bells), **Rom 1**-**Rom 4** (the real, unsorted contents of the
-  actual Yamaha factory ROM cartridges), and 26 more from a second, much
-  larger collection (13 named categories: Synth 2/Piano 2/EPiano/Bass 2/
-  Strings 2/Woodwind 2/Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div, kept
-  in their own separate folders rather than merged into the originals —
-  then each split into two roughly-equal halves, e.g. "Synth 2-1"/
-  "Synth 2-2", once the largest ones (up to 320 in one folder) turned
-  out too fine-grained to scroll accurately with one knob) — real,
-  freely-distributed SysEx data from the broader Dexed/MicroDexed
-  open-source ecosystem, never invented (the raw source `.syx` banks
-  themselves are kept in `addon/SD/DEXED/` for reference). Browsed as
-  folders:
-  rotate to scroll, Button 1 opens a folder or backs out, a
-  short Button 2 tap previews the highlighted patch live without leaving
-  the browser, hold to commit — plus up to ~366 of your own on the SD
-  card.
+- **3129 factory presets** across 54 folders — **Rom 1**-**Rom 4** (the
+  real, unsorted contents of the actual Yamaha factory ROM cartridges),
+  plus 50 more from one real ~100-bank collection that came already
+  organized into named categories (Synth/Piano/EPiano/Bass/Strings/
+  Woodwind/Brass/Organ/Perc/Voice/Bells/FX/Div), each split into as many
+  same-named numbered folders (Synth 1, Synth 2, ...) as it takes to
+  keep every one at or under 64 presets, so scrolling with Knob 1 always
+  stays accurate — real, freely-distributed SysEx data from the broader
+  Dexed/MicroDexed open-source ecosystem, never invented (the raw
+  source `.syx` banks are kept in `addon/SD/DEXED/` for reference).
+  Browsed as folders: rotate to scroll, Button 1 opens a folder or backs
+  out, a short Button 2 tap previews the highlighted patch live without
+  leaving the browser, hold to commit — plus up to ~371 of your own on
+  the SD card.
 - **Algorithm page** shows a real box-and-arrow diagram of whichever of
   the 32 algorithms is loaded (carriers filled, modulators outlined, feedback
   tagged) — drawn fresh from the actual routing data, not 32 fixed
@@ -144,8 +140,13 @@ Grains — no mutex, both can run together).
   level, or every operator's envelope rate, together — centered at "as
   the preset saved it," so they're a quick sound-shaping layer on top of
   any patch rather than a replacement for editing it.
-- Feedback, Vibrato (LFO speed/depth), its own filter, reverb send, and
-  output level round out the simple pages.
+- Feedback, Vibrato (LFO speed/depth), its own filter, Pan, reverb send,
+  and output level round out the simple pages.
+- **Advanced editor** — the last simple page before Preset drills into a
+  real per-operator editor (encoder click to enter, short click to
+  return, long-press to Home like everywhere else): pick one of the 6
+  operators (Button 1) and edit its Ratio/Level, Detune, and Attack/
+  Decay/Sustain/Release for both its pitch-EG rate and level pairs.
 
 **Grains** — a MIDI-played, monophonic granular instrument
 (`Global:Granular`), also running alongside the looper. Capture audio
@@ -156,9 +157,14 @@ grain layers: a fixed-position **Grain** cloud and a sweeping **Scan**
 layer, both sharing Size/Fill/Gap controls, plus Position, Tune (with
 optional note-tracking), Direction (forward/reverse/random), its own
 ADSR/filter/reverb send/pan, and a full-sample waveform display with live
-grain markers. Presets save the captured audio itself alongside every
+grain markers. A long Release now genuinely sustains a tail (new grains
+keep triggering through the whole release, not just while a note is
+held). Presets save the captured audio itself alongside every
 parameter, so loading one restores the exact sound, not just settings.
-Also switchable off from `Global:Granular` to free its CPU share.
+Capture buffer holds up to ~10 seconds; importing a `.wav` from the SD
+card's `IMPORT/` folder accepts 16/24/32-bit PCM or 32-bit float, mono
+or stereo, 44.1kHz or 48kHz. Also switchable off from `Global:Granular`
+to free its CPU share.
 
 **Recording Dexed or Grains into a loop layer** — playing either
 instrument while a layer is actively recording/overdubbing captures its
@@ -166,13 +172,11 @@ live sound directly into the take, mixed with your physical input, with
 no patch cable needed.
 
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
-there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains,
-and Bypass, Volume/Reverb-Send for Dexed (no Pan yet — a later
-increment), plus
-Volume/Reverb-Size for the final Master bus, ending in a live
-oscilloscope of the actual output mix. Rotate the encoder to step through
-each channel in turn; `Global:Mixer` itself shows an at-a-glance overview
-grid of all 8 channels' levels.
+there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains, Dexed,
+and Bypass, plus Volume/Reverb-Size for the final Master bus, ending in
+a live oscilloscope of the actual output mix. Rotate the encoder to
+step through each channel in turn; `Global:Mixer` itself shows an
+at-a-glance overview grid of all 8 channels' levels.
 
 **SD card management** — `Global:SdMgmt` lets you browse any of the 3
 save categories (Performances/Dexed Presets/Grains Presets) and
@@ -286,13 +290,30 @@ hit Export gets baked into the file on purpose.
 | EnvSpeed | Envelope rate scale (center = as saved) | — | — | — |
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Mix | Reverb send | Output level | — | — |
+| Advanced | — | — | — | — (push encoder to enter the operator editor) |
 | Preset | Rotate = scroll folders/presets | — | Save / Open folder / Back | Tap = preview, Hold 800ms = confirm |
 
 The Algo page shows a real box-and-arrow diagram of whichever algorithm
 is loaded (filled boxes = carriers, outlined = modulators, "FB" tags the
 one operator with feedback), redrawn fresh from the actual routing data
 for all 32 rather than 32 fixed pictures. Clicking the encoder on any
-Dexed page mutes/unmutes all 4 loop layers, same as every Global page.
+Dexed page other than Advanced mutes/unmutes all 4 loop layers, same as
+every Global page. Pan isn't on this screen — it's on Dexed's own Mixer
+channel instead (see Mixer below).
+
+**Dexed advanced editor (`Screen::DexedOperator`, entered from the
+Advanced page above, rotate to cycle pages)**
+
+| Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
+|---|---|---|---|---|
+| Ratio | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
+| Detune | Detune (0-14, 7=centered) | — | Cycle operator (1-6) | — |
+| EG Rate | Attack | Decay (or Sustain/Release) | Cycle operator (1-6) | Toggle AD/SR |
+| EG Level | Attack Level | Decay Level (or Sustain/Release Level) | Cycle operator (1-6) | Toggle AD/SR |
+
+A short encoder click here returns to Screen::Dexed's own Advanced
+page; long-press still goes all the way to Home, same as everywhere
+else. The real DX7 operator number (1-6) is always shown in the title.
 
 **Grains (`Screen::Granular`, rotate to cycle pages)**
 
@@ -319,8 +340,7 @@ oscilloscope of the final output mix, then wraps back to Layer 1.
 
 | Channel | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
-| Layer 1–4 / Grains / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
-| DXD (Dexed) | Volume | — (no Pan yet) | Knobs → Volume | Knobs → Reverb send |
+| Layer 1–4 / Grains / Dexed / Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
 | Master | Volume | Reverb size | — | — |
 
 ## Building and flashing
@@ -387,5 +407,5 @@ cd src && make
   (Apache License 2.0) — the real DX7 emulation core Dexed is built
   around, vendored unmodified into `src/msfa/`.
 - The broader **Dexed/MicroDexed** open-source ecosystem — source of
-  Dexed's 3834 factory presets, freely distributed real DX7 SysEx
+  Dexed's 3129 factory presets, freely distributed real DX7 SysEx
   bank dumps.

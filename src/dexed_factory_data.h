@@ -13,26 +13,28 @@ struct DexedFactoryCategory
     int            count;
 };
 
-// 11 categories organized by real sound type (Synth/Piano/E.Piano/Bass/
-// Strings/Woodwind/Brass/Organ/Percussion/Choir/Bells), not by source
-// ROM bank -- real DX7 ROM banks mix categories internally, which would
-// make for poor folder-browsing by sound type -- plus 4 more, "Rom 1"
-// through "Rom 4", each the real, unsorted 64-voice contents of the
-// actual Yamaha factory ROM cartridges (ROM1=1A+1B ... ROM4=4A+4B).
-// Real quality/popularity rankings for DX7 patches aren't something
-// that can be sourced reliably, so these stand in as an objective proxy
-// instead: genuine factory data every real DX7 shipped with (ROM1) or
-// that Yamaha sold as official cartridges (ROM2-4), kept in their own
-// folders exactly as originally organized rather than re-sorted into
-// the sound-type categories above -- plus 26 more, a second, much
-// larger real patch collection added later (13 named categories:
-// Synth 2/Piano 2/EPiano/Bass 2/Strings 2/Woodwind 2/Brass 2/Organ 2/
-// Perc 2/Voice/Bells 2/FX/Div, kept in their own separate folders --
-// a " 2" suffix, or a plain new name -- where none collided with the
-// same-named folders above, rather than merged into them, since the
-// two were sourced and reviewed separately), each then further split
-// into two roughly-equal halves ("-1"/"-2" or "1"/"2") once real
-// hardware testing showed the largest ones (up to 320 voices in one
-// folder) were too fine-grained to scroll accurately with one knob.
-constexpr int kDexedNumFactoryCategories = 41;
+// 4 categories, "Rom 1" through "Rom 4", each the real, unsorted
+// 64-voice contents of an actual Yamaha factory ROM cartridge pair
+// (ROM1=1A+1B ... ROM4=4A+4B) -- kept in their own folders exactly as
+// originally organized, real quality/popularity rankings for DX7
+// patches not being something that can be sourced reliably otherwise.
+//
+// Plus 50 more, all from one real ~100-bank, ~2900-voice patch
+// collection (found already organized into 13 named categories --
+// Synth/Piano/EPiano/Bass/Strings/Woodwind/Brass/Organ/Perc/Voice/
+// Bells/FX/Div -- by its own upstream source manifest; an 8th category
+// in that same source, its own "ROM" folder, was confirmed byte-
+// identical to Rom 1-4 above and skipped). Each of those 13 is split
+// into as many same-named "N" folders (Synth 1, Synth 2, ...) as it
+// takes to keep every single one at or under 64 voices -- 2 source
+// bank files (64 voices) per folder, 1 for any odd file left over --
+// after real hardware testing showed a single knob's worth of physical
+// rotation can't reliably land on one of e.g. 320 presets crammed into
+// one folder. An earlier version of this project also carried 11
+// hand-picked "Synth/Piano/E.Piano/..." categories of its own (2 bank
+// files each) sourced independently of this collection; once this
+// much larger, already-categorized collection was added, those were
+// removed rather than kept alongside it as a smaller, redundant
+// duplicate covering the same sound types.
+constexpr int kDexedNumFactoryCategories = 54;
 extern const DexedFactoryCategory kDexedFactoryCategories[kDexedNumFactoryCategories];
