@@ -599,7 +599,7 @@ this). Algorithm can be cycled three ways: Knob 1 (quantized bucket
 selection across all 32, soft pickup), Button 1 (step back), Button 2
 (step forward).
 
-**Factory presets — 3834 across 28 folders, real sourced data, never
+**Factory presets — 3834 across 41 folders, real sourced data, never
 invented**: real, freely-distributed SysEx bank dumps drawn from the
 broader Dexed/MicroDexed open-source ecosystem this whole port's msfa
 lineage already traces through (not one single traceable upstream
@@ -619,20 +619,31 @@ single voice (the classic ROM1A "MARIMBA") was hand-picked into the Perc
 folder on top of its two source banks, after a user report that no
 marimba sound existed anywhere in the set.
 
-**13 more, added later from a second, much larger real patch
+**26 more, added later from a second, much larger real patch
 collection** (a genuine ~100-bank, ~2900-voice set, found already
 organized into named categories by its own upstream source manifest):
-**Synth 2/Piano 2/EPiano/Bass 2/Strings 2/Woodwind 2/Brass 2/Organ 2/
-Perc 2/Voice/Bells 2/FX/Div** — kept in their own separate folders
-(a " 2" suffix where a same-named folder already existed above, a plain
-new name where it didn't) rather than merged into the original folders,
-since the two collections were sourced and reviewed independently; an
-8th category in that same source collection, its own "ROM" folder, was
-confirmed byte-for-byte identical to this project's own Rom 1-4 (same
-ultimate origin) and skipped rather than duplicated. Voices that were
-entirely empty (all-zero patch bytes, ~2% of the raw set — real banks
-aren't always fully populated) were filtered out during import rather
-than embedded as dead presets.
+13 named categories -- **Synth 2/Piano 2/EPiano/Bass 2/Strings 2/
+Woodwind 2/Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div** — kept in their
+own separate folders (a " 2" suffix where a same-named folder already
+existed above, a plain new name where it didn't) rather than merged
+into the original folders, since the two collections were sourced and
+reviewed independently; an 8th category in that same source collection,
+its own "ROM" folder, was confirmed byte-for-byte identical to this
+project's own Rom 1-4 (same ultimate origin) and skipped rather than
+duplicated. Voices that were entirely empty (all-zero patch bytes, ~2%
+of the raw set — real banks aren't always fully populated) were filtered
+out during import rather than embedded as dead presets.
+
+**Each of those 13 was then split into two roughly-equal halves**
+(e.g. "Synth 2-1"/"Synth 2-2", "FX 1"/"FX 2") after a real user report
+that the largest ones — up to 320 voices in one folder, versus the
+original categories' own 64-65 — were too fine-grained to scroll
+accurately with a single knob's worth of physical rotation. Split by
+source-file boundary within each category (keeping each source bank's
+own 32 voices together, rather than a mid-bank byte split) so every half
+still corresponds to a clean, real subset of the original bank files;
+halves land in the 64-160 voice range, the same rough scale the original
+15 categories already proved comfortable at.
 
 Stored as raw 128-byte-per-
 voice **packed** payloads (never pre-expanded and held in flash/RAM

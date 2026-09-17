@@ -118,16 +118,20 @@ there), built around Google's own **msfa** DX7 emulation core — the real
 32 algorithms, the real envelope/scaling model, not an approximation.
 Off by default; switch it on from `Global:Dexed` (independent of
 Grains — no mutex, both can run together).
-- **3834 factory presets** across 28 folders — 11 organized by real sound
+- **3834 factory presets** across 41 folders — 11 organized by real sound
   type (Synth/Piano/E.Piano/Bass/Strings/Woodwind/Brass/Organ/Perc/Choir/
   Bells), **Rom 1**-**Rom 4** (the real, unsorted contents of the
-  actual Yamaha factory ROM cartridges), and 13 more from a second, much
-  larger collection (Synth 2/Piano 2/EPiano/Bass 2/Strings 2/Woodwind 2/
-  Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div) kept in their own separate
-  folders rather than merged into the originals — real, freely-distributed
-  SysEx data from the broader Dexed/MicroDexed open-source ecosystem, never
-  invented (the raw source `.syx` banks themselves are kept in
-  `addon/SD/DEXED/` for reference). Browsed as folders:
+  actual Yamaha factory ROM cartridges), and 26 more from a second, much
+  larger collection (13 named categories: Synth 2/Piano 2/EPiano/Bass 2/
+  Strings 2/Woodwind 2/Brass 2/Organ 2/Perc 2/Voice/Bells 2/FX/Div, kept
+  in their own separate folders rather than merged into the originals —
+  then each split into two roughly-equal halves, e.g. "Synth 2-1"/
+  "Synth 2-2", once the largest ones (up to 320 in one folder) turned
+  out too fine-grained to scroll accurately with one knob) — real,
+  freely-distributed SysEx data from the broader Dexed/MicroDexed
+  open-source ecosystem, never invented (the raw source `.syx` banks
+  themselves are kept in `addon/SD/DEXED/` for reference). Browsed as
+  folders:
   rotate to scroll, Button 1 opens a folder or backs out, a
   short Button 2 tap previews the highlighted patch live without leaving
   the browser, hold to commit — plus up to ~366 of your own on the SD
