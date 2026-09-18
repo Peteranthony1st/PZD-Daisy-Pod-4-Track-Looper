@@ -897,7 +897,7 @@ struct GranularPresetFileHeader
     uint32_t version;
     uint32_t audio_len;
 };
-constexpr uint32_t kGranularPresetFileVersion = 1;
+constexpr uint32_t kGranularPresetFileVersion = 3; // bumped again: Scan split into 2 fields
 
 // Same shape as GranularPresetFileHeader above, own magic/version. No
 // audio, so no audio_len field -- just the header plus one raw

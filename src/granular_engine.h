@@ -68,20 +68,64 @@ class GranularEngine
     void  SetGap01(float v01);
     float GetGap01() const { return gap01_; }
 
+    // --- Rhythm -- gates WHICH of the Grain layer's already-scheduled
+    // hops actually spawn a grain, rather than changing the timing
+    // itself -- a skipped hop is a real silence, not a re-timed one,
+    // which is what makes the gaps genuinely uneven instead of just
+    // quantized-but-still-flat. Discrete, Button1-cycled (see
+    // CycleRhythm()): Off (every hop fires -- exactly this engine's
+    // original behaviour), a small named bank of fixed grooves, then two
+    // fixed Euclidean stops. Only gates the Grain layer (Position
+    // anchor) -- Scan is untouched. The step clock resets to 0 on every
+    // NoteOn so a pattern always starts the same way.
+    void        CycleRhythm();
+    int         GetRhythmIndex() const { return rhythm_index_; }
+    const char* GetRhythmName() const { return rhythm_name_cached_; }
+
+    // --- Speed -- how often a Rhythm pattern's steps actually happen,
+    // completely decoupled from Fill (see CycleGrainSpeed()'s own
+    // comment for why that decoupling matters). Only takes effect once a
+    // Rhythm pattern is selected -- has no effect at Rhythm=Off.
+    enum class GrainSpeed
+    {
+        Slow,
+        Medium,
+        Fast,
+        Sync // locks to the Looper's live tempo, see SetExternalBpm()
+    };
+    void        CycleGrainSpeed();
+    GrainSpeed  GetGrainSpeed() const { return grain_speed_; }
+    const char* GetGrainSpeedName() const;
+    // Pushed in live from Ui (which already owns the TempoClock) once
+    // per main-loop tick -- this engine has no tempo concept of its own
+    // otherwise, see ComputeRhythmStepSamples()'s Sync case.
+    void SetExternalBpm(float bpm) { external_bpm_ = bpm; }
+
     // --- Position (Grain layer's fixed anchor) -----------------------
     void  SetPosition01(float v01);
     float GetPosition01() const { return position01_; }
 
-    // --- Scan (Scan layer's sweep) -- same dead-zone-centered
-    // bidirectional curve the old engine used: center (0.5, default) is
-    // off, above/below picks which end it heads toward first, speed
-    // proportional to distance from center. ---------------------------
+    // --- Scan -- TWO separate controls, on two different pages, not one
+    // knob wearing two labels:
+    //
+    //   - Scan (Grain page's own K2): speed + direction, dead-zone
+    //     centered on 50% -- center is off (genuinely silent, not just
+    //     frozen-but-audible -- see SetScan01()'s own comment for the
+    //     real bug reports that shaped this twice), either side sets
+    //     bounce speed and which way it heads first. Same shape this
+    //     engine originally had.
+    //   - Scan Position (POS+RHY page's own K2): just the sweep's
+    //     STARTING point, default 0 (buffer start) -- carries no mute
+    //     meaning of its own, only matters once Scan (above) is actually
+    //     on.
+    //
+    // The bounce always runs between Scan Position (live-adjustable
+    // lower bound) and the end of the buffer (fixed).
     void  SetScan01(float v01);
     float GetScan01() const { return scan01_; }
-    void  SetScanStart01(float v01);
-    float GetScanStart01() const { return scan_start01_; }
-    void  SetScanEnd01(float v01);
-    float GetScanEnd01() const { return scan_end01_; }
+    void  SetScanPosition01(float v01);
+    float GetScanPosition01() const { return scan_start01_; }
+    bool  IsScanMuted() const { return scan_speed_ == 0.f || scan_volume01_ <= 0.001f; }
 
     // --- Tune / Map to Note -- both restored from the old engine
     // unchanged: Tune is a fixed per-grain pitch offset independent of
@@ -208,9 +252,8 @@ class GranularEngine
         float   fill01            = 0.667f; // matches the class's own default fill_count_=2
         float   gap01             = 0.1f;
         float   position01        = 0.f;
-        float   scan01            = 0.5f; // center = off
-        float   scan_start01      = 0.f;
-        float   scan_end01        = 1.f;
+        float   scan01            = 0.5f; // Scan speed/direction, center = off
+        float   scan_start01      = 0.f;  // Scan Position, buffer start
         float   grain_tune01      = 0.5f; // 0 semitones
         bool    grain_follows_note = false;
         float   direction01       = 0.1667f; // Forward
@@ -223,6 +266,8 @@ class GranularEngine
         float   filter_res01      = 0.f;
         float   grain_volume01    = 0.8f;
         float   scan_volume01     = 0.5f;
+        int32_t rhythm_index      = 0; // 0 = Off, see CycleRhythm()
+        int32_t grain_speed       = (int32_t)GrainSpeed::Slow;
     };
     void               ApplyPreset(const GranularPresetData& p);
     GranularPresetData CapturePreset() const;
@@ -297,16 +342,42 @@ class GranularEngine
     static constexpr float kMaxGrainMs      = 500.f;
     static constexpr float kMaxSparseFactor = 6.f; // same as the old engine's Density range
 
+    // --- Rhythm pattern gate (Grain layer only) + Speed ---------------
+    // rhythm_mask_cached_/rhythm_name_cached_ are resolved from
+    // rhythm_index_ by RecomputeRhythmPattern() whenever CycleRhythm()
+    // changes it, NOT recomputed per-hop -- the per-hop check in
+    // Process() is just one bit test. kRhythmSteps is fixed (not a user
+    // control any more) now that Speed owns timing independently of
+    // Fill -- see CycleGrainSpeed()'s own .cpp comment.
+    static constexpr int kRhythmSteps     = 16;
+    static constexpr int kNumRhythmStates = 7; // Off + 4Floor/Tresillo/OffBeat/Sparse + 2 Euclid
+    int         rhythm_index_        = 0;      // 0 = Off
+    int         rhythm_step_         = 0;      // which step the NEXT hop lands on
+    uint16_t    rhythm_mask_cached_  = 0xFFFF; // Off = every bit set = every hop fires
+    const char* rhythm_name_cached_  = "Off";
+    void        RecomputeRhythmPattern();
+
+    GrainSpeed  grain_speed_   = GrainSpeed::Slow;
+    float       external_bpm_ = 120.f;
+    float       ComputeRhythmStepSamples() const;
+    float       CurrentGrainIntervalSamples() const;
+
     float position01_ = 0.f;
 
-    float scan01_              = 0.5f; // center = off
+    // Scan: two independent values (see the public API's own comment) --
+    // scan01_/scan_speed_/scan_initial_sign_ are the Grain page's own
+    // "Scan" (speed+direction+dead-zone-mute), scan_start01_ is the
+    // POS+RHY page's own "Scan Position" (just where the bounce's lower
+    // bound sits, no mute meaning). scan_position_samples_/
+    // scan_direction_sign_ are the live, per-sample bounce state both
+    // feed into.
+    float scan01_              = 0.5f; // center = off, see SetScan01()
     float scan_speed_          = 0.f;
     float scan_initial_sign_   = 1.f;
-    float scan_start01_        = 0.f;
-    float scan_end01_          = 1.f;
-    float scan_position_samples_ = 0.f;
-    float scan_direction_sign_   = 1.f;
     static constexpr float kMaxScanFractionPerSecond = 1.f;
+    float scan_start01_        = 0.f;  // sweep's starting point -- 0 = buffer start
+    float scan_position_samples_ = 0.f; // live sweep position, advanced in Process()
+    float scan_direction_sign_   = 1.f;
 
     int   grain_tune_semitones_ = 0;
     float grain_tune_rate_      = 1.f; // 2^(semitones/12)

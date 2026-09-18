@@ -564,6 +564,20 @@ class Ui
                         float decay_s,
                         float sustain01,
                         float release_s);
+    // Real DX7 4-segment operator envelope (R1/L1..R4/L4) -- genuinely
+    // different shape from DrawAdsrShape() above, not a reuse of it:
+    // each of the 4 equal-width zones ramps from wherever the previous
+    // segment left off to its OWN target level (rates/levels[0..3], raw
+    // 0-99 patch bytes), holding flat for whatever's left of that zone
+    // once it gets there -- unlike a classic ADSR, a real DX7 envelope
+    // can rise and fall repeatedly across its 4 stages, so the fixed
+    // up/down/flat/down topology DrawAdsrShape() assumes doesn't apply.
+    // Higher rate = faster = reaches its target sooner within the zone
+    // (the opposite direction from DrawAdsrShape()'s own seconds
+    // parameters, where smaller = faster). Shared by
+    // DexedOpParamPage::EgRate/EgLevel -- both show the same real shape
+    // regardless of which pair is currently the editable one.
+    void DrawDx7EnvelopeShape(int top, int bottom, const uint8_t rates[4], const uint8_t levels[4]);
     // Live auto-scaled waveform trace from a small ring buffer -- shared
     // by whichever page wants a live timbre reference (Grains' own
     // Filter page shows its actual output changing as you turn its

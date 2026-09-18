@@ -216,6 +216,14 @@ void Ui::Update(const UiControlEvents& events)
     HandleButton2(events);
     ApplyKnobs();
 
+    // Grains' Rhythm Speed has a "Sync" option that locks to the
+    // project's live tempo -- the engine has no tempo concept of its
+    // own otherwise, so Ui (which already owns the TempoClock) pushes
+    // the current BPM in once per tick, cheap enough to do unconditionally
+    // rather than only when Speed is actually set to Sync.
+    if(granular_ && tempo_)
+        granular_->SetExternalBpm(tempo_->GetBpm());
+
     // Once any layer holds a recording, lock the tempo so BPM/Bars can't
     // be changed out from under it; unlock once every layer is empty
     // again so a fresh song can pick a new tempo.
@@ -935,6 +943,8 @@ void Ui::OnButton1Short()
                 granular_adsr_target_sr_ = false; // knobs -> Attack+Decay
             else if(granular_param_page_ == GranularParamPage::TuneDirection && granular_)
                 granular_->SetGrainFollowsNote(!granular_->GetGrainFollowsNote());
+            else if(granular_param_page_ == GranularParamPage::Position && granular_)
+                granular_->CycleRhythm();
             else if(granular_param_page_ == GranularParamPage::Filter && granular_)
             {
                 // Same "Button1 cycles" idiom as Layer:Filter/Pad:Filter.
@@ -1147,6 +1157,9 @@ void Ui::OnButton2Short()
         dexed_op_eglevel_target_sr_ = !dexed_op_eglevel_target_sr_;
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Grain)
         granular_grain_target_gap_scan_ = true; // knobs -> Gap+Scan
+    else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Position
+            && granular_)
+        granular_->CycleGrainSpeed();
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::ADSR)
         granular_adsr_target_sr_ = true; // knobs -> Sustain/Release
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Mix)
@@ -1414,7 +1427,10 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             break;
         case KnobContext::GranularPosition:
             if(granular_)
+            {
                 k1_pickup_raw_[i] = granular_->GetPosition01();
+                k2_pickup_raw_[i] = granular_->GetScanPosition01();
+            }
             break;
         case KnobContext::GranularTuneDirection:
             if(granular_)
@@ -1754,6 +1770,8 @@ void Ui::ApplyKnobs()
                 case GranularParamPage::Position:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         granular_->SetPosition01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        granular_->SetScanPosition01(k2);
                     break;
                 case GranularParamPage::TuneDirection:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
@@ -3149,7 +3167,7 @@ void Ui::DrawGranularScreen()
     switch(granular_param_page_)
     {
         case GranularParamPage::Grain: page_name = "Grain"; break;
-        case GranularParamPage::Position: page_name = "Pos"; break;
+        case GranularParamPage::Position: page_name = "POS+RHY"; break;
         case GranularParamPage::TuneDirection: page_name = "Tune"; break;
         case GranularParamPage::ADSR: page_name = "ADSR"; break;
         case GranularParamPage::Filter: page_name = "Filter"; break;
@@ -3244,21 +3262,36 @@ void Ui::DrawGranularScreen()
             // Same full-sample waveform + live anchor markers as the
             // Grain page (just DrawGranularWaveform() again -- it already
             // draws both the Grain layer's anchor and the Scan layer's),
-            // so turning the Position knob visibly moves the Grain
-            // marker across the sample instead of only being a number.
+            // so turning either knob visibly moves its own marker across
+            // the sample instead of only being a number.
+            //
+            // Rhythm (Button1) and Speed (Button2) both share this page
+            // as button-cycled modes -- same "top text shows the
+            // button-controlled mode" treatment as Filter's "Mode: X"
+            // and Capture's "Source: X", just two of them since there
+            // are two buttons doing mode-cycling duty here now.
             char line1[24];
-            snprintf(line1, sizeof(line1), "Position: %d%%",
-                      (int)(granular_->GetPosition01() * 100.f + 0.5f));
+            snprintf(line1, sizeof(line1), "Rhy:%s  Spd:%s", granular_->GetRhythmName(),
+                      granular_->GetGrainSpeedName());
             TomThumbDrawText(disp_, 0, 15, line1, true);
 
             DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
                                   granular_->GetScanAnchor01(), granular_->HasSource());
 
-            char pos_val[8];
+            char pos_val[8], scan_val[8];
             snprintf(pos_val, sizeof(pos_val), "%d%%",
                       (int)(granular_->GetPosition01() * 100.f + 0.5f));
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Position", pos_val, "", "");
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            if(granular_->IsScanMuted())
+                snprintf(scan_val, sizeof(scan_val), "Mute");
+            else
+                snprintf(scan_val, sizeof(scan_val), "%d%%",
+                          (int)(granular_->GetScanPosition01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Position", pos_val, scan_val,
+                             "ScanPos");
+            // Button hints, same "left label = Button1, right label =
+            // Button2" idiom as DexedOperator's own "Op"/"AD/SR" row.
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Rhythm", "", "",
+                             "Speed");
             break;
         }
         case GranularParamPage::TuneDirection:
@@ -4273,8 +4306,13 @@ void Ui::DrawDexedScreen()
                 int count = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
                                 ? DexedSynth::GetFactoryCategoryCount(dexed_preset_folder_cursor_)
                                 : dexed_preset_user_slot_count_;
+                // No "Folder: " label -- Font_6x8 is fixed 6px/char, and
+                // "Folder: Woodwind 3 (64)" (23 chars) overflows the
+                // 128px display (21 chars max), pushing the count off
+                // the right edge. The longest real name+count ("Woodwind
+                // 3 (64)", 15 chars) fits comfortably without the label.
                 char line2[24];
-                snprintf(line2, sizeof(line2), "Folder: %s (%d)",
+                snprintf(line2, sizeof(line2), "%s (%d)",
                           dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
                               ? DexedSynth::GetFactoryCategoryName(dexed_preset_folder_cursor_)
                               : "User",
@@ -4404,9 +4442,14 @@ void Ui::DrawDexedOperatorScreen()
             // same AD/SR-toggle idiom's own "AD"/"SR" pairing) reads far
             // more clearly than "Rate1..4" -- requested directly after
             // real hardware testing.
-            bool sr = dexed_op_egrate_target_sr_;
-            disp_->SetCursor(0, 20);
-            WriteUpper(sr ? "Sustain+Release" : "Attack+Decay");
+            bool    sr = dexed_op_egrate_target_sr_;
+            uint8_t rates[4], levels[4];
+            for(int i = 0; i < 4; i++)
+            {
+                rates[i]  = dexed_->GetPatchByte(base + i);
+                levels[i] = dexed_->GetPatchByte(base + 4 + i);
+            }
+            DrawDx7EnvelopeShape(14, 44, rates, levels);
             char v1[8], v2[8];
             snprintf(v1, sizeof(v1), "%d", dexed_->GetPatchByte(sr ? base + 2 : base + 0));
             snprintf(v2, sizeof(v2), "%d", dexed_->GetPatchByte(sr ? base + 3 : base + 1));
@@ -4422,9 +4465,14 @@ void Ui::DrawDexedOperatorScreen()
             // ("Op N:EG Level" vs "...EG Rate") already disambiguates
             // level from rate, so reusing identical stage names here
             // instead of "Level1..4" is consistent, not ambiguous.
-            bool sr = dexed_op_eglevel_target_sr_;
-            disp_->SetCursor(0, 20);
-            WriteUpper(sr ? "Sustain+Release" : "Attack+Decay");
+            bool    sr = dexed_op_eglevel_target_sr_;
+            uint8_t rates[4], levels[4];
+            for(int i = 0; i < 4; i++)
+            {
+                rates[i]  = dexed_->GetPatchByte(base + i);
+                levels[i] = dexed_->GetPatchByte(base + 4 + i);
+            }
+            DrawDx7EnvelopeShape(14, 44, rates, levels);
             char v1[8], v2[8];
             snprintf(v1, sizeof(v1), "%d", dexed_->GetPatchByte(sr ? base + 6 : base + 4));
             snprintf(v2, sizeof(v2), "%d", dexed_->GetPatchByte(sr ? base + 7 : base + 5));
@@ -4589,6 +4637,43 @@ void Ui::DrawAdsrShape(int top, int bottom, float attack_s, float decay_s, float
     disp_->DrawLine(zone2, sustain_y, zone3, sustain_y, true);         // Sustain (flat, untimed)
     disp_->DrawLine(zone3, sustain_y, x_release_peak, bottom_y, true); // Release ramp
     disp_->DrawLine(x_release_peak, bottom_y, zone4, bottom_y, true);  // hold at 0
+}
+
+void Ui::DrawDx7EnvelopeShape(int top, int bottom, const uint8_t rates[4], const uint8_t levels[4])
+{
+    const int total_w = disp_->Width() - 2;
+    const int x0       = 1;
+
+    int prev_x = x0;
+    int prev_y = bottom; // the envelope always starts silent before Rate1/Level1 fires
+
+    for(int seg = 0; seg < 4; seg++)
+    {
+        int zone_start = x0 + total_w * seg / 4;
+        int zone_end   = x0 + total_w * (seg + 1) / 4;
+
+        // Higher rate = faster = reaches its own target level sooner
+        // within the zone (a narrower ramp, more flat hold afterward) --
+        // same "ramp then hold flat for the rest of the zone" idiom
+        // DrawAdsrShape() above uses, just driven by a 0-99 rate byte
+        // (bigger = faster) instead of a seconds value.
+        float rate01 = Clampf((float)rates[seg] / 99.f, 0.f, 1.f);
+        int   ramp_w = (int)((1.f - rate01) * (float)(zone_end - zone_start));
+        if(ramp_w < 1)
+            ramp_w = 1;
+        int target_x = zone_start + ramp_w;
+        if(target_x > zone_end)
+            target_x = zone_end;
+        int target_y
+            = bottom - (int)(Clampf((float)levels[seg] / 99.f, 0.f, 1.f) * (float)(bottom - top));
+
+        disp_->DrawLine(prev_x, prev_y, target_x, target_y, true); // this segment's own ramp
+        if(target_x < zone_end)
+            disp_->DrawLine(target_x, target_y, zone_end, target_y, true); // hold for the rest
+
+        prev_x = zone_end;
+        prev_y = target_y;
+    }
 }
 
 void Ui::DrawOscilloscope(int top, int bottom, const float* buf, size_t capacity)

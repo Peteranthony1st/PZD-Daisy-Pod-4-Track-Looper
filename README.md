@@ -159,7 +159,11 @@ optional note-tracking), Direction (forward/reverse/random), its own
 ADSR/filter/reverb send/pan, and a full-sample waveform display with live
 grain markers. A long Release now genuinely sustains a tail (new grains
 keep triggering through the whole release, not just while a note is
-held). Presets save the captured audio itself alongside every
+held). The Grain layer can also be given a **rhythmic pattern** (Off, a
+small named groove bank, or two Euclidean density stops) and its own
+independent **Speed** (including syncing to the Looper's live tempo) —
+Fill still controls how thick each hit sounds, Speed controls how often
+they happen. Presets save the captured audio itself alongside every
 parameter, so loading one restores the exact sound, not just settings.
 Capture buffer holds up to ~10 seconds; importing a `.wav` from the SD
 card's `IMPORT/` folder accepts 16/24/32-bit PCM or 32-bit float, mono
@@ -320,7 +324,7 @@ else. The real DX7 operator number (1-6) is always shown in the title.
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
 | Grain | Size / Gap | Fill / Scan | Knobs → Size+Fill | Knobs → Gap+Scan |
-| Position | Position | — | — | — |
+| POS+RHY | Position | Scan Position | Cycle Rhythm pattern | Cycle Speed |
 | Tune/Direction | Tune | Direction | Toggle Map-to-Note | — |
 | ADSR | Attack / Sustain | Decay / Release | Knobs → Attack+Decay | Knobs → Sustain+Release |
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
