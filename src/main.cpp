@@ -77,6 +77,21 @@ daisysp::Phaser DSY_SDRAM_BSS fx_phaser[kNumLayers];
 // fx_phaser above.
 daisysp::ReverbSc DSY_SDRAM_BSS fx_reverb_shared;
 
+// ONE shared cross-feedback ("ping-pong") delay, same "one shared
+// instance, fed by per-engine sends" architecture as fx_reverb_shared
+// above -- added so Dexed and Grains can each have their own Delay
+// Send into the SAME delay (turn up Time/Feedback from either engine's
+// own FX page, or Global:FX, and it changes for both). Deliberately the
+// cheapest real delay topology: two plain daisysp::DelayLine reads/
+// writes and a couple of multiplies per sample, nowhere near
+// fx_reverb_shared's own cost. kMaxDelaySamples (1.5s @ 48kHz) sized
+// generously -- at ~562KB total for both channels this is a rounding
+// error against the 64MB SDRAM budget, unlike the reverb instance
+// above.
+constexpr size_t kMaxDelaySamples = 72000;
+daisysp::DelayLine<float, kMaxDelaySamples> DSY_SDRAM_BSS fx_delay_l;
+daisysp::DelayLine<float, kMaxDelaySamples> DSY_SDRAM_BSS fx_delay_r;
+
 // Master-bus filter -- applied once to the final mix (layers + their
 // reverb, summed) rather than per-layer, so it's a plain Svf pair
 // living in ordinary SRAM (tiny, no big internal buffer like the
@@ -231,6 +246,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // not once per layer any more, see fx_reverb_shared's comment.
     static float reverb_send_l[256];
     static float reverb_send_r[256];
+    // Same idea, for the shared delay bus (fx_delay_l/r) further below.
+    static float delay_send_l[256];
+    static float delay_send_r[256];
     static float gran_l[256];
     static float gran_r[256];
     static float dexed_l[256];
@@ -269,6 +287,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         out[1][i] = 0.f;
         reverb_send_l[i] = 0.f;
         reverb_send_r[i] = 0.f;
+        delay_send_l[i]  = 0.f;
+        delay_send_r[i]  = 0.f;
 
         if(looper_enabled)
         {
@@ -287,7 +307,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // GranularEngine::Process() ever running.
     if(ui.IsGranularEnabled())
     {
-        granular.Process(size, gran_l, gran_r, reverb_send_l, reverb_send_r);
+        granular.Process(size, gran_l, gran_r, reverb_send_l, reverb_send_r, delay_send_l,
+                          delay_send_r);
     }
     else
     {
@@ -313,7 +334,8 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // are already valid when mixed_in is built from them.
     if(ui.IsDexedEnabled())
     {
-        dexed.Process(size, dexed_l, dexed_r, reverb_send_l, reverb_send_r);
+        dexed.Process(size, dexed_l, dexed_r, reverb_send_l, reverb_send_r, delay_send_l,
+                      delay_send_r);
     }
     else
     {
@@ -376,15 +398,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     if(looper_enabled)
     {
         float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
+        float* delay_send_ptrs[2]  = {delay_send_l, delay_send_r};
         for(int L = 0; L < kNumLayers; L++)
         {
             LayerState st = layers[L].GetState();
             bool       is_recording_ish = st == LayerState::Recording
                                            || st == LayerState::Overdubbing
-                                           || st == LayerState::ArmedCountIn;
+                                           || st == LayerState::ArmedCountIn
+                                           || st == LayerState::ArmedOverdubCountIn;
             AudioHandle::InputBuffer layer_in
                 = is_recording_ish ? mixed_in : in;
-            layers[L].Process(layer_in, out, reverb_send_ptrs, size, ticks,
+            layers[L].Process(layer_in, out, reverb_send_ptrs, delay_send_ptrs, size, ticks,
                                tempo, project_speed);
         }
     }
@@ -436,6 +460,24 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // replacing what used to be an independent SetFeedback() per layer.
     fx_reverb_shared.SetFeedback(ui.GetReverbSize01());
 
+    // Shared delay's Time/Feedback -- same "one Global:FX setting drives
+    // the single shared instance" pattern as the reverb above. Time maps
+    // exponentially (more resolution at short, slapback-style delays,
+    // same curve shape ADSR times use) from 20ms up to kMaxDelaySamples'
+    // own ~1.5s ceiling; Feedback is capped below 1.0 to keep the
+    // cross-feedback pair from self-oscillating.
+    constexpr float kMinDelayMs      = 20.f;
+    constexpr float kMaxDelayMs      = (float)kMaxDelaySamples / 48000.f * 1000.f;
+    constexpr float kMaxDelayFeedback = 0.9f;
+    float delay_ms      = kMinDelayMs * powf(kMaxDelayMs / kMinDelayMs, ui.GetDelayTime01());
+    float delay_samples = delay_ms * 0.001f * hw.AudioSampleRate();
+    delay_samples = delay_samples < 1.f ? 1.f
+                    : delay_samples > (float)kMaxDelaySamples - 1.f ? (float)kMaxDelaySamples - 1.f
+                                                                      : delay_samples;
+    fx_delay_l.SetDelay(delay_samples);
+    fx_delay_r.SetDelay(delay_samples);
+    float delay_feedback = ui.GetDelayFeedback01() * kMaxDelayFeedback;
+
     for(size_t i = 0; i < size; i++)
     {
         // Bypass's own Send into the shared reverb bus -- independent of
@@ -461,6 +503,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         fx_reverb_shared.Process(reverb_send_l[i], reverb_send_r[i], &rev_wet_l, &rev_wet_r);
         out[0][i] += rev_wet_l;
         out[1][i] += rev_wet_r;
+
+        // Shared delay: read both lines BEFORE either Write() below, so
+        // the cross-feedback (L's output feeds R's input and vice versa,
+        // the "ping-pong" part) uses this sample's actual output, not a
+        // half-updated value from writing one channel first.
+        float delay_wet_l = fx_delay_l.Read();
+        float delay_wet_r = fx_delay_r.Read();
+        fx_delay_l.Write(delay_send_l[i] + delay_wet_r * delay_feedback);
+        fx_delay_r.Write(delay_send_r[i] + delay_wet_l * delay_feedback);
+        out[0][i] += delay_wet_l;
+        out[1][i] += delay_wet_r;
 
         if(byp)
         {
@@ -529,6 +582,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         g_master_scope_l[g_master_scope_write_pos] = out[0][i];
         g_master_scope_write_pos = (g_master_scope_write_pos + 1) % kMasterScopeSamples;
     }
+
 }
 
 // Linker-provided symbols from STM32H750IB_qspi_custom.lds -- .itcm_text
@@ -607,6 +661,15 @@ int main(void)
     // SetFeedback() itself is applied every block in AudioCallback() from
     // Ui::GetReverbSize01() (see there), same live-update pattern as the
     // master filter's cutoff/res just above -- no need to set it here too.
+
+    // Same zero-before-Init() safety as fx_reverb_shared above --
+    // DelayLine::Init()/Reset() does zero its own buffer either way, but
+    // this matches the established convention for every .sdram_bss
+    // object here rather than relying on that being true forever.
+    memset(&fx_delay_l, 0, sizeof(fx_delay_l));
+    memset(&fx_delay_r, 0, sizeof(fx_delay_r));
+    fx_delay_l.Init();
+    fx_delay_r.Init();
 
     // I2C1 defaults already target the Pod's header pins (D11=SCL,
     // D12=SDA) and address 0x3C -- most cheap SSD1306/SSD1309 modules

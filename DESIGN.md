@@ -1,4 +1,4 @@
-# Ouroboros on Daisy Pod — design notes
+# PZD-4LOOP-DEXED-GRAINS — design notes
 
 ## Credit
 
@@ -85,22 +85,25 @@ One consistent grammar everywhere:
   `Screen::Granular`/`Screen::Mixer` — goes back to Home.
 
 ```
-Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Speed / Filter /
-  │                                             Effect / Reverb / Gain
+Home ──(click layer)──► Layer[n] ──(rotate)──► Status / Gain / Speed /
+  │                                             Filter / Effect / LYR-FX
   │                                                     (long-press ⤴ back to Home)
-  └──(long-press)──► Global ──(rotate)──► Tempo / Filter / Reverb / File /
-       │                                    SdMgmt / Export / Dexed /
+  └──(long-press)──► Global ──(rotate)──► Tempo / Speed / Filter / GLB-FX /
+       │                                    File / SdMgmt / Export / Dexed /
        │                                    Granular / Looper / Mixer
        │                                       (long-press ⤴ back to Home)
        ├──(click on Global:Dexed)──► Screen::Dexed ──(rotate)──► Algo / Feedback /
        │                                                   Vibrato / Brightness /
-       │                                                   EnvSpeed / Filter /
-       │                                                   Mix / Preset
+       │                                                   EnvSpeed / Filter / Mix /
+       │                                                   DX-FX / Advanced / Preset
        │                                                        (click ⤴ mute loop layers)
        │                                                        (long-press ⤴ back to Home)
+       │                                                   Advanced ──(click)──►
+       │                                                   Screen::DexedOperator
        ├──(click on Global:Granular)──► Screen::Granular ──(rotate)──► Grain / Position /
-       │                                                     TuneDirection / ADSR / Filter /
-       │                                                     Mix / Capture / Trim / Preset
+       │                                                     Scan / ScanRange / Tune / ADSR /
+       │                                                     Filter / Mix / GR-FX / Capture /
+       │                                                     Trim / Preset
        │                                                        (click ⤴ mute loop layers)
        │                                                        (long-press ⤴ back to Home)
        └──(click on Global:Mixer)──► Screen::Mixer ──(rotate)──► 8 channel stops, then
@@ -131,15 +134,15 @@ Full control map:
 |---|---|---|---|---|
 | Home | Master volume | Metronome volume | Rec/Pause/Overdub cycle for cursor layer (see transport state machine) | Toggle bypass |
 | Layer: Status | Volume | Pan | Same transport as Home, for this layer | Hold 800ms = Clear |
+| Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Layer: Speed | Speed (0.3x-2x, deadzone-centered on 1.0x) | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
-| Layer: Reverb | Send (into the shared reverb bus, see below) | — | — | — |
-| Layer: Gain | Input gain (1x-4x) | — | — | — |
+| Layer: LYR-FX | Send (into the shared reverb bus, see below) | — | — | — |
 | Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
+| Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Cycle transport mode: Normal/Scrub/Freeze (see below) | Reset to 1.0x |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
-| Global: Reverb | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
-| Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Toggle scrub mode (see below) | Reset to 1.0x |
+| Global: GLB-FX | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
 | Global: File | Idle: nothing. ChoosingSave: Overwrite/Save New. BrowsingLoad chooser: Files/New, drilled-in: browse files | — | Idle: tap = reveal Save; chooser: tap = drill into file list (Files) or Back (New); elsewhere: tap = Back | Idle: tap = reveal Load; ChoosingSave/drilled-into-Load: hold 800ms = confirm |
 | Global: SD Mgmt | Folder select / file browse (same list, always "Scroll") | — | Tap = drill into folder / back up a level; hold 800ms = Duplicate the browsed file | Hold `kSdMgmtDeleteHoldMs` (1500ms) = Delete the browsed file |
 | Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
@@ -154,18 +157,22 @@ Full control map:
 | Dexed: EnvSpeed | All-operator envelope rate scale (0x..2x, center = as saved) | — | — | — |
 | Dexed: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Dexed: Mix | Reverb send | Output level | — | — |
+| Dexed: DX-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
 | Dexed: Advanced | — | — | — | — (push encoder to enter Screen::DexedOperator) |
-| Dexed: Preset | Folder list: scroll folders. Inside a folder: scroll presets | — | Save / Open folder (or Select at top chooser) / Back | Tap = preview live (stays in browser); Hold 800ms = confirm + exit |
+| Dexed: Preset | Top: Files/Import/Load New. Files → group (Roms/Dexed/Imports/User) → folder list (not User) → presets | — | Save / Select (top+group) / Back (group+folder levels) | Open (group+folder levels) / Hold: Import (Import list) / Tap: preview, Hold 800ms: confirm (a real preset) |
 | DexedOperator: RatioLevel | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
 | DexedOperator: Detune | Detune (0-14, 7=centered) | — | Cycle operator (1-6) | — |
 | DexedOperator: EgRate | Attack (or Sustain) | Decay (or Release) | Cycle operator (1-6) | Toggle AD/SR |
 | DexedOperator: EgLevel | Attack Level (or Sustain Level) | Decay Level (or Release Level) | Cycle operator (1-6) | Toggle AD/SR |
-| Granular: Grain | Size (or Gap) | Fill (or Scan) | Knobs → Size+Fill | Knobs → Gap+Scan |
-| Granular: Position | Position (Grain layer's fixed anchor) | — | — | — |
-| Granular: TuneDirection | Tune (grain pitch, ±24 semitones) | Direction (Forward/Reverse/Random) | Toggle Map-to-Note | — |
+| Granular: Grain | Size (or Grain's own Gap) | Fill (or Jitter) | Knobs → Size+Fill | Knobs → Gap+Jitter |
+| Granular: Position | Position (Grain layer's fixed anchor) | Direction (Grain's own, Forward/Reverse/Random) | Cycle Rhythm pattern | Cycle Speed |
+| Granular: Scan | Scan speed/direction (dead-zone-centered, off at center) | Scan's own Fill | Toggle Bounce/Wrap | Cycle Scan's own Direction |
+| Granular: ScanRange | Scan Start (or Scan's own Gap) | Scan End | Knobs → Start+End | Knob → Gap |
+| Granular: Tune | Tune (grain pitch, ±24 semitones) | — | Toggle Map-to-Note | — |
 | Granular: ADSR | Attack (or Sustain) | Decay (or Release) | Knobs → Attack+Decay | Knobs → Sustain+Release |
 | Granular: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Granular: Mix | Grain volume (or Reverb send) | Scan volume | Knobs → Grain+Scan volume | Knobs → Reverb send |
+| Granular: GR-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
 | Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
 | Granular: Trim | Trim start | Trim end | — | — |
 | Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
@@ -269,26 +276,66 @@ return to 1.0x — the classic tape vari-speed trick — because what got
 captured is honestly in the same coordinate space as everything else, at
 whatever relative pitch you performed it against.
 
-**Scrub**: Button 1 on Global:Speed toggles `scrub_mode_active_`, which
-`HandleEncoder()` checks *before* its normal page-cycling logic — while
-it's on, encoder rotation calls `Ui::ScrubBy()` instead of moving between
-Global's sub-pages. `ScrubBy()` nudges every non-empty layer's `play_pos_`
-by the same raw-sample amount via `SetPlayPosRaw()` (the same accessor
-`PerformanceStore::ExportWav()`'s snapshot/restore already proven safe for
-direct position manipulation), with **turn-speed acceleration**: it
-tracks the time between consecutive scrub ticks (`daisy::System::GetNow()`)
-and scales the per-click distance up when ticks arrive close together (a
-fast spin), from a base ~50ms of audio per click up to an 8x cap
-(~400ms/click) for fast turns — slow, deliberate turns stay fine-grained.
-Scrubbing also calls `TempoClock::SetPhaseToPosition()` (using the same
-lowest-indexed non-empty layer the composite waveform's playhead reads)
-so the metronome/beat indicator/bar-start jump to match wherever scrub
-moved the audio, instead of continuing to free-run from wherever they
-already were — without this, scrubbing back would leave the audio and
-the metronome permanently out of sync by however far you scrubbed.
-Scrub mode auto-clears the instant you leave Global:Speed (including via
-the normal long-press-to-Home), so the encoder can never get stuck
-scrubbing somewhere it shouldn't.
+**Scrub/Freeze**: Button 1 on Global:Speed cycles a 3-state
+`Ui::SpeedTransportMode` — Normal → Scrub → Freeze → Normal
+(`speed_transport_mode_`, replacing an earlier plain `scrub_mode_active_`
+bool once Freeze needed a second, mutually-exclusive encoder-repurposing
+mode on the same page). `HandleEncoder()` checks this state *before* its
+normal page-cycling logic, exactly as the original Scrub-only version
+did — while either mode is active, encoder rotation is repurposed
+instead of moving between Global's sub-pages.
+
+- **Scrub** (unchanged from the original design): rotation calls
+  `Ui::ScrubBy()`, nudging every non-empty layer's `play_pos_` by the
+  same raw-sample amount via `SetPlayPosRaw()` (the same accessor
+  `PerformanceStore::ExportWav()`'s snapshot/restore already proven safe
+  for direct position manipulation), with **turn-speed acceleration**: it
+  tracks the time between consecutive scrub ticks
+  (`daisy::System::GetNow()`) and scales the per-click distance up when
+  ticks arrive close together (a fast spin), from a base ~50ms of audio
+  per click up to an 8x cap (~400ms/click) for fast turns — slow,
+  deliberate turns stay fine-grained. Scrubbing also calls
+  `TempoClock::SetPhaseToPosition()` (using the same lowest-indexed
+  non-empty layer the composite waveform's playhead reads) so the
+  metronome/beat indicator/bar-start jump to match wherever scrub moved
+  the audio, instead of continuing to free-run from wherever they
+  already were — without this, scrubbing back would leave the audio and
+  the metronome permanently out of sync by however far you scrubbed.
+  Normal playback keeps advancing underneath the whole time — Scrub only
+  ever nudges the shared position, it never stops the transport.
+
+- **Freeze**, added after a direct request for "the playhead to just
+  hold still on whatever part of the wave it's on, so I can scrub through
+  it without the looper pushing forward" — genuinely different from
+  Scrub, which nudges position but leaves normal tempo-driven playback
+  running underneath. Freeze actually stops that advance: each
+  `LooperLayer` gets its own `freeze_active_`/`freeze_anchor_`/
+  `freeze_phase_` state (`SetFreezeActive()`/`NudgeFreeze()`), and while
+  active, `Process()`'s audible-playback branch reads a small
+  (`kFreezeWindowMs` = 60ms) window starting at `freeze_anchor_` on a
+  continuous loop instead of advancing through the rest of the buffer.
+  Chosen as a smooth "freeze drone," not a stuttery one-shot retrigger —
+  a genuinely silent hold, or a hard-looped raw sample, were both
+  considered and rejected (silence isn't a "freeze," and a raw loop
+  clicks at the seam); instead each pass through the window is
+  Hann-windowed (0 at phase 0 *and* 1, the exact same click-avoidance
+  principle `GranularEngine`'s own per-grain envelope already uses), so
+  the loop point never clicks and the frozen window genuinely sustains a
+  texture instead of holding one static sample. `play_pos_` is kept
+  synced to the live freeze read position throughout, so un-freezing
+  resumes exactly where the drone left off with no jump. While Freeze is
+  active, encoder rotation calls `Ui::NudgeFreezeBy()` instead of
+  `ScrubBy()` — same per-layer raw-sample nudge and turn-speed
+  acceleration as Scrub, just moving each layer's frozen window instead
+  of its live `play_pos_`, so scrubbing while frozen picks which part of
+  the loop the drone plays from. All 4 layers freeze and un-freeze
+  together (there's no per-layer Freeze toggle) so the whole mix holds
+  on the same instant.
+
+Both modes auto-clear the instant you leave Global:Speed (including via
+the normal long-press-to-Home) — leaving while Freeze is active also
+un-freezes every layer first — so the encoder can never get stuck
+scrubbing or the transport stuck frozen somewhere it shouldn't.
 
 Global:Speed's display is a composite waveform (per-column max across all
 4 layers' existing `waveform_peaks_` caches, not just one layer) with a
@@ -543,6 +590,23 @@ still caught by the safety net rather than clipping past it. Dexed now
 has a real Pan control too (see below) — added after this engine's own
 initial "no Pan yet" gap turned out to have a real, audible consequence.
 
+**Voice-count headroom compensation, found from a real multi-note
+distortion report**: "when I play more than 1 note at the same time in
+Dexed it seems to distort a little." Root-caused (via a native, off-
+target patch-byte inspection tool, not guessed at) to a genuinely *hot*
+factory patch — BRASS 1, feedback set to 7 (the maximum) with several
+operators near-unity output level — where several simultaneous voices'
+summed peaks could exceed what the fixed `kHeadroomScale` margin above
+was tuned against (that margin was measured against single-voice and
+modest-chord playing, not several loud, high-feedback voices stacked at
+once). Fixed with `voice_headroom_scale_`, computed once per
+`RenderQuantum()` from the live count of currently-held voices
+(`held_note_ != -1`): for N > 1 held voices, an additional `1/sqrt(N)`
+scale is applied before the existing `kHeadroomScale`, leaving
+single-note loudness completely untouched (N=1 applies no extra scaling
+at all) while giving multi-voice chords proportionally more headroom
+before they'd otherwise clip into the limiter.
+
 **Pan, added after a real hardware report**: same linear pan law every
 other engine here uses (`panL = 1-v`, `panR = v`), applied to the same
 mono `s` right after the limiter/output-level stage, feeding both the
@@ -672,10 +736,10 @@ voice **packed** payloads (never pre-expanded and held in flash/RAM
 unpacked) — `DexedSynth::GetFactoryPreset()` unpacks on demand via
 `DexedSysex::UnpackVoice()`, verified byte-exact via a native (non-
 embedded) round-trip test against real bank data before ever being
-embedded. The original `.syx` bank files themselves are kept in the
-repo under `addon/SD/DEXED/<category>/`, mirroring the firmware's own
-folder names, for reference/attribution — not read by
-the firmware build itself.
+embedded. The original `.syx` bank files themselves aren't kept in the
+repo (they were only ever needed for that one-time offline extraction,
+never read by the firmware build itself) — attribution for the source
+material lives here and in `README.md`'s own Thanks section instead.
 
 **Duplicate factory names, and why some folders auto-number them**: real
 factory banks occasionally have a long run of voices someone saved
@@ -719,14 +783,142 @@ own slot-renumbering (`CompactSlotsAfterDelete()` is fundamentally
 incompatible with a fixed factory bank, the same reasoning Grains'
 preset range already established).
 
-**Preset folder browsing & live preview**: identical two-level
-folder-then-preset browsing, and the identical "a short Button 2 tap
-while a folder's open previews the highlighted preset live, without
-resetting `save_load_mode_`" behavior, as the removed Fm Synth's own
-preset browser — confirmed directly from that engine's own source
+**Preset folder browsing & live preview**: the identical "a short Button
+2 tap while a folder's open previews the highlighted preset live,
+without resetting `save_load_mode_`" behavior as the removed Fm Synth's
+own preset browser — confirmed directly from that engine's own source
 (`git show fm-synth-experiment:src/ui.cpp`) that live preview and commit
 were always literally the same function call, just with or without also
-exiting back to `Idle`; reused as-is here rather than redesigned.
+exiting back to `Idle`; reused as-is here rather than redesigned. The
+folder browsing itself grew a third level (see *SysEx import* below)
+once a real Import feature meant the folder list could no longer stay a
+single flat sweep.
+
+**SysEx import** (`DEXP/`, `DXIMPORT/`): added directly after confirming Dexed's factory data has no import path
+of its own for a user's own real DX7 patches — the clean-room packed
+↔ unpacked SysEx converter already existed (`dexed_sysex.h/.cpp`, built
+for embedding the factory banks themselves, see above), so wiring up a
+real *import* path reused that converter rather than needing new
+decoding logic.
+
+**A separate SD folder from Grains' own Import, on purpose**: `.syx`
+files are dropped into `DXIMPORT/` (not created automatically — same
+"you make this folder yourself" convention Grains' own WAV `IMPORT/`
+folder already uses), kept completely separate from Grains' `IMPORT/`
+so the two file types and their listings never collide, per a direct
+request once a user initially (reasonably) assumed the two importable
+formats might share one folder.
+
+**Two real SysEx wire shapes recognized, both fully validated before
+anything is trusted** (Yamaha ID byte, message length, a real 7-bit
+checksum — never just assumed correct): a **Single Voice Dump** (format
+0, 163 bytes on the wire) turned out to be, byte-for-byte, *already* this
+project's own internal 156-byte unpacked `patch_[]` layout — confirmed
+directly against the public DX7 SysEx spec, so importing one is a
+straight `memcpy`, no `UnpackVoice()` step needed at all. A **32-Voice
+Bulk Dump** (format 9, 4104 bytes) uses the same packed 128-byte-per-
+voice layout the embedded factory banks already ship in, so it reuses
+`DexedSysex::UnpackVoice()` unchanged, once per voice.
+
+**A real hardware bug in the read path itself, found and fixed through
+several rounds of on-device diagnosis**: a byte-perfect bulk-dump file
+(independently verified via a Python replica of the exact same
+validation logic, confirming the file itself was never the problem)
+consistently failed its own header check on real hardware — its very
+first byte came back one position early, as if the read had silently
+skipped it. An isolated 1-byte probe read at the same file offset came
+back correct every time, isolating the fault to something specific
+about a *single large* (multi-sector, direct-to-caller-buffer) SD
+transfer, not the file, not the file position, and not a simple
+alignment fix (splitting the same read into "one sector-aligned call,
+one small remainder call" was tried first and didn't fix it either).
+The real fix sidesteps the faulty code path entirely rather than
+chasing its root cause further: reading the whole file through repeated
+small (128-byte) chunks instead of one large transfer, the same shape
+proven correct by the passing 1-byte probe, every single time.
+
+**One named folder per import, since the SysEx data itself carries no
+overall "bank name" field** (only each voice's own 10-character name) —
+each import is named after its own `.syx` filename (extension stripped),
+so importing `vrc112a.syx` creates a folder named "VRC112A" holding just
+that bank's own voices, rather than dumping everything into one flat,
+ever-growing list. Recorded in its own small per-import file
+(`DEXP/IMPORTS/IMPnnn.DAT`, one file per import — an earlier version
+kept a single shared, appended manifest file instead; switched to one
+file per import, per a direct request, so a single import's own record
+can be found, backed up, or removed independently of every other one,
+matching this project's own established "one numbered file per item"
+convention already used everywhere else (`PERF/`, `GRNP/`, `DEXP/`
+itself). A one-time migration reads any leftover copy of the old shared
+manifest format, splits it into the new per-file scheme, and deletes the
+old file, so an import made before this change doesn't lose its folder
+grouping.
+
+**A new group level, added once the folder list itself couldn't stay
+flat any longer**: Dexed's own 54 factory categories plus a "User"
+folder was already a lot for one knob sweep before any import existed;
+each completed import adds one more folder on top of that. Picking
+"Files" from the Preset page's own top chooser now opens a **group**
+chooser first — **Roms** (the 4 real, unmodified "Rom 1"–"Rom 4"
+cartridge categories), **Dexed** (the other ~50 curated-by-sound-type
+categories), **Imports** (one folder per completed import, above), and
+**User** (every hand-saved preset that ISN'T part of a recorded import
+range — filtered out during the same refresh that scans the import
+folder list, so an imported preset never shows up twice). Roms/Dexed/
+Imports each still open onto their own folder list beneath the group;
+User has no folder level of its own (there's nothing to sub-group), so
+opening it goes straight to its own flat list, the same one-level shape
+Global:File's own numbered list always used.
+
+**Back (Button 1) / Open (Button 2) split, at the group and folder-list
+levels only**: a direct request ("within these we need a back button")
+once the group level made "how do I get back out of Files without
+abandoning the whole Save/Load flow" a real, previously-unaddressed gap
+— the original two-level browser never had a way back out of "Files"
+short of leaving the whole chooser. Button 2 is otherwise idle at these
+two levels (nothing there is a real preset yet to preview/commit), so
+it was free to take over "drill deeper" duty, freeing Button 1 to mean
+"back" consistently at every level of this browser. Once inside an
+actual folder (or User's own flat list) — a real preset, not a
+container — Button 2 goes back to its own established Load-preview/
+hold-to-commit job, since there's nothing further to open from there.
+
+**Real names, not slot numbers, for every USER preset — not just
+imports**: a saved preset's real 10-character DX7 name already lived
+inside its own patch bytes the whole time (a manual save keeps whatever
+name was in the live patch at save time; an import keeps the bank's own
+original name verbatim), but the browser only ever displayed it for
+factory presets, showing a bare slot number for anything else — a
+direct request ("they have proper names... not user saves") to fix that
+gap for every user slot, not just newly-imported ones.
+`DexedSynth::GetPresetDataName()` reads that name straight out of an
+already-decoded patch (no unpacking needed, since a user slot's saved
+data is already in the unpacked layout); the currently-loaded preset
+reads it for free from the live engine already in RAM, while a
+highlighted-but-not-yet-loaded slot needs one small SD read, cached by
+slot number so scrolling doesn't re-read it every screen refresh. A
+genuinely blank name (some presets predate this whole factory-bank/
+naming system and never had one) falls back to showing the slot number
+rather than a bare "?", so an old save doesn't read as a fresh
+regression.
+
+**Two real performance bugs found from a single "why does this look
+frozen" report on a full 32-voice bank import**: (1) finding a free slot
+for each of the 32 voices called `NextFreeDexedPresetSlot()` fresh every
+time, each call re-scanning the *entire* user slot range from its own
+start — O(n) work called n times is O(n²) for the whole batch. Fixed
+with an optional `search_from` parameter so the import loop resumes each
+search exactly where the last one left off, turning the batch into one
+continuous forward sweep. (2) nothing drew anything to the screen for
+the whole multi-second batch, so it looked completely frozen with no
+way to tell it was doing real work at all — fixed by reusing the exact
+same "WORKING..." progress overlay (`Ui::OnSaveLoadProgress()`) every
+other multi-step SD operation in this project already shows. A related,
+smaller lag was found and fixed on the group chooser itself: scrolling
+through Roms/Dexed/Imports/User (a screen that shows no counts at all)
+was triggering a real SD directory re-scan on every group the knob swept
+past, not just the one it settled on — removed, since the real refresh
+this data actually needs already happens once a group is opened.
 
 **Filter/Mix**: one bus-level `Svf` pair (post-mix, pre-limiter, see
 above) and Reverb Send/Output Level, both reachable identically from
@@ -908,61 +1100,129 @@ grain's position was computed against the *old* `src_len_` and could
 otherwise read out of bounds against a shorter new capture.
 
 **Two grain layers, one mechanism**: both **Grain** (a fixed-Position
-anchor) and **Scan** (a continuously-sweeping anchor, bouncing between
-Scan Start/End at a speed/direction set by the Scan knob) are the exact
-same `GrainCluster` — `kGrainsPerVoice` = 3 overlapping grain slots
-(3-way overlap is the standard granular-synthesis compromise for a
-smooth, click-free texture at any grain size), scheduled from the same
-Size/Fill/Gap values. This is a deliberate redesign, not a port: the
-earlier engine's Scan was a single retriggered grain on its own timer,
-and even after several rounds of tuning it stayed thinner/choppier than
-the main grain cloud, because one voice retriggering periodically is
-inherently less smooth than several overlapping ones. Giving Scan the
-identical multi-slot scheduling the Grain layer already uses fixes that
-by construction rather than by tuning constants further.
+anchor) and **Scan** (a continuously-sweeping anchor, bouncing or
+wrapping between an independently adjustable Start/End range) are the
+exact same `GrainCluster` — `kGrainsPerVoice` = 10 overlapping grain
+slots (raised from an original 3, see *A real periodic-click bug* below
+for why headroom to go well past a bare minimum overlap turned out to
+matter), scheduled independently per cluster. This is a deliberate
+redesign, not a port: the earlier engine's Scan was a single retriggered
+grain on its own timer, and even after several rounds of tuning it
+stayed thinner/choppier than the main grain cloud, because one voice
+retriggering periodically is inherently less smooth than several
+overlapping ones. Giving Scan the identical multi-slot scheduling the
+Grain layer already uses fixes that by construction rather than by
+tuning constants further.
 
-**Size/Fill/Gap** (shared by both layers, since they're reading the same
-kind of grains, just from different anchors):
-- **Size**: grain length, `kMinGrainMs`(1ms)..`kMaxGrainMs`(500ms).
-- **Fill**: how many of the `kGrainsPerVoice` slots are active (0 =
-  silence). Renamed from the earlier engine's "Grain Count" to match the
-  reference hardware granular device this redesign is modeled after.
-- **Gap**: 0 = grains packed with no gap (hop = grain length / Fill), 1 =
-  maximally sparse (real silence between grains). Renamed AND
+**Size is shared, Fill/Gap/Direction are fully independent per
+cluster** — an explicit redesign from an earlier version where Fill/Gap
+were one shared pair governing both layers at once. A direct user
+question ("so to confirm gap on grains page only affects grain and gap
+on scan range only affects scan grain?") surfaced that a fixed Position
+anchor holding a stable drone and a sweeping Scan layer underneath it
+are genuinely different textures that want different overlap/spacing
+— locking them together meant tuning one always disturbed the other:
+- **Size** (Grain page): grain length, `kMinGrainMs`(0ms)..`kMaxGrainMs`
+  (1000ms) — widened from an original 1-500ms range per a direct
+  request, once the shorter ceiling turned out to rule out longer,
+  more ambient textures.
+- **Fill** (Grain page Knob 2, Scan page Knob 2, independently): how many
+  of the `kGrainsPerVoice` slots each cluster uses (0 = silence).
+  Renamed from the earlier engine's "Grain Count" to match the reference
+  hardware granular device this redesign is modeled after.
+- **Gap** (Grain page Knob 1 under Button2's Gap+Jitter toggle for
+  Grain's own; ScanRange page Knob 1 under its own Button2 toggle for
+  Scan's own): 0 = grains packed with no gap (hop = grain length /
+  Fill), 1 = maximally sparse (real silence between grains). Renamed AND
   polarity-flipped from the earlier engine's "Density" (where 1.0 meant
   "packed") to match that same reference device's own "Gap" vocabulary,
-  which goes the other way.
+  which goes the other way. Scan's own Gap defaults to 0 (packed),
+  matching Grain's own default.
+- **Direction** (per-grain read direction, Forward/Reverse/Random):
+  Grain's own lives on the Position page (Knob 2, moved there from the
+  removed Tune/Direction pairing once that page's own K2 slot freed up,
+  per a direct request); Scan's own is a separate, independently-set
+  control, Button2-cycled on the Scan page itself
+  (`GranularEngine::CycleScanDirection()`/`ResolveScanDirectionSign()`,
+  mirroring `ResolveDirectionSign()`'s own logic exactly, just kept as
+  fully separate state) — confirmed via a direct user question ("does
+  jitter affect the scan grain too?") that Jitter, similarly, is a
+  Grain-layer-only refinement and never reads into Scan's own triggering
+  at all.
 
-**Position/Scan**: Position is a real knob-controlled fixed anchor for
-the Grain layer, on its own page (`GranularParamPage::Position`,
-labeled **POS+RHY** on screen — see Rhythm/Speed below for why). Scan is
-**two genuinely separate controls on two different pages**, not one
-knob wearing two labels:
-- **Scan** (the Grain page's own Knob 2, under Button2's Gap+Scan
-  toggle) — speed and direction, the same dead-zone-centered
-  bidirectional curve as this project's own vari-speed/scrub controls:
-  center (0.5, default) is off, above/below picks which end it heads
-  toward first, speed proportional to distance from center.
-- **Scan Position** (the POS+RHY page's own Knob 2) — just the sweep's
-  starting point, default 0 (the buffer's own start). Carries no mute
-  meaning of its own; it only matters once Scan (above) is actually on.
+**Position, Scan, and Scan Range** are three separate pages, each
+pairing one layer's "what plays" control with its own "where it reads
+from" control, deliberately kept adjacent to each other in the page
+order (Grain → Position → Scan → ScanRange):
+- **Position** (`GranularParamPage::Position`) — Knob 1 is the Grain
+  layer's own fixed anchor; Knob 2 is Grain's own Direction (above).
+- **Scan** (`GranularParamPage::Scan`) — Knob 1 is the sweep's own
+  speed/direction, the same dead-zone-centered bidirectional curve as
+  this project's own vari-speed/scrub controls (center = off, above/
+  below picks which end it heads toward first, speed proportional to
+  distance from center); Knob 2 is Scan's own Fill (above). Button 1
+  toggles **Bounce vs Wrap** at the range edges
+  (`GranularEngine::ToggleScanBounce()`) — Bounce (the original,
+  default behaviour) reverses direction at each edge; Wrap jumps
+  straight to the opposite edge and keeps sweeping the same way, added
+  after a direct request for the sweep to restart from its own original
+  edge instead of ping-ponging back. Button 2 cycles Scan's own
+  Direction (above).
+- **Scan Range** (`GranularParamPage::ScanRange`) — Knob 1/Knob 2 are
+  Scan's own Start/End under Button 1 (default), or Knob 1 is Scan's own
+  Gap (above) under Button 2. Both Start and End are independently
+  adjustable — previously Scan's own end was fixed to the buffer's own
+  end and only the start (then folded into the Position page as "Scan
+  Position") was adjustable at all; split out to its own page, with a
+  genuinely independent End, once that turned out not to be enough. The
+  waveform display draws both boundaries as full-height vertical lines
+  (extended up past the normal peak-meter band specifically so they read
+  clearly against the rest of the wave, per a direct follow-up: "the
+  vertical lines need to extend up some more").
 
-This split exists because of two real, sequential user reports on the
-same control. First: with the original single Scan knob, its own
-dead-zone center froze the anchor's movement but left it *still
-audible* from wherever it froze ("scan is set to 50% (off) but its
-starting grain still sounds"). The first fix collapsed Scan into a
+This three-page split (and the Fill/Gap/Direction independence above)
+replaced an earlier design that tried to cover Scan with a single
+knob wearing two jobs (speed/direction and a static starting position)
+on the Grain page itself, worked through across two real, sequential
+user reports on that single control. First: with that single Scan
+knob, its own dead-zone center froze the anchor's movement but left it
+*still audible* from wherever it froze ("scan is set to 50% (off) but
+its starting grain still sounds"). The first fix collapsed Scan into a
 single static-position knob with a real center-mute — which fixed the
 audibility bug but, in trying to solve it, accidentally deleted the
 sweeping motion Scan is named for entirely ("now scan does not scan at
-all"). The actual fix needed both ideas kept *separate*: one control for
-whether/how fast it sweeps (with a center that's genuinely silent,
-matching what the original dead zone was supposed to do), and another,
-independent control for where the sweep starts from. `IsScanMuted()`
-reflects the current combination of both: `scan_speed_ == 0.f` (Scan's
-own dead zone) or Mix's Scan Volume at/near zero.
+all"). The actual fix needed the ideas kept *separate*, and — once Scan
+was clearly its own independent layer rather than a Grain-page
+accessory — kept growing into the full independent-page treatment
+above as Fill, Gap, Direction, and a real adjustable range all turned
+out to need the same treatment in turn. `IsScanMuted()` reflects the
+current combination: `scan_speed_ == 0.f` (Scan's own dead zone) or
+Mix's Scan Volume at/near zero.
 
-**Rhythm/Speed** (POS+RHY page, Button1/Button2): a pattern gate on top
+**A real periodic-click bug, found while chasing a user report on a
+specific imported sample** ("when I import the sample mleckert82-synth-
+pad, I get clicking when playing grains"): reproduced natively (a
+standalone off-target harness against the real captured audio, not
+guessed at) down to a fixed Position anchor with Jitter at zero —
+replaying the *exact* same buffer offset on every retrigger means any
+source with a strong feature sitting inside the grain's window (not at
+its very edge, where the Hann window already silences it) repeats that
+feature identically forever, audible as a perfectly periodic click.
+**Jitter** (Grain page Knob 2, under Button2's Gap+Jitter toggle) fixes
+this at the root: a per-grain random offset around the fixed Position
+anchor, scaled to a fraction of the current grain length
+(`GranularEngine::SetJitter01()`), smearing consecutive grains across
+nearby offsets instead of hammering one exact sample repeatedly —
+confirmed against the same real exported capture that first reproduced
+the bug. Jitter only ever affects the Grain cluster, never Scan (whose
+own continuously-moving anchor doesn't have this failure mode in the
+first place). Two smaller, genuinely real contributing factors were
+found and fixed alongside the root cause during the same investigation
+(kept, not reverted, once confirmed real): grain/scan overlap-gain
+headroom compensation, and steal-fade phase correctness during a
+`ChokeCluster()` cutover.
+
+**Rhythm/Speed** (Position page, Button1/Button2): a pattern gate on top
 of the Grain layer's existing hop scheduling, added after a direct
 request for the layer to sound "more rhythmic" without being flat --
 plain evenly-spaced hops (whether Fill/Gap-driven or naively tempo-
@@ -1010,10 +1270,13 @@ every save/reload) — a real bug once found and fixed here, and
 deliberately avoided when `PadSynth::GetTuneSemitones01()` was written
 afterward using the same pattern.
 
-**Direction**: per-grain read direction, Forward/Reverse/Random,
-quantized from one knob. Spray (randomized per-grain timing jitter) was
-dropped in this redesign — it was a source of real, hard-to-diagnose
-jitter bugs in the earlier engine.
+(Grain's own Direction, and Scan's own independent Direction, are both
+covered under *Position, Scan, and Scan Range* above — both are the
+same Forward/Reverse/Random per-grain read direction, quantized from one
+knob/button, just set fully independently per cluster. Spray, a
+randomized per-grain timing jitter distinct from the Jitter feature
+above, was dropped in this redesign — it was a source of real,
+hard-to-diagnose jitter bugs in the earlier engine.)
 
 **Note-level ADSR**: shapes the whole voice's overall loudness across a
 held note, layered ON TOP of (not instead of) a fixed per-grain Hann
@@ -1064,23 +1327,36 @@ truncated, not refused):
   selected as the capture source (independent of Home's own cursor) into
   the same buffer, then points the engine at it via `SetSource()`.
 - **Import** — reads a user-supplied `.wav` file from the SD card's
-  `IMPORT/` folder. Originally 16-bit PCM only; widened to also accept
-  24-bit and 32-bit PCM, plus 32-bit IEEE float, after a real user's
-  commercial sample-pack loop (an otherwise perfectly ordinary stereo/
-  44.1kHz file, just 24-bit) failed to import with no path to fix it
-  short of re-encoding on a computer first -- 24-bit in particular is
-  extremely common for commercial sample packs. `ImportWav()`'s
-  previously `int16_t`-only read buffer became a generic byte buffer,
-  decoded per-sample based on the file's own (constant-for-the-whole-
-  stream) `audio_format`/`bits_per_sample`: 24-bit has no native integer
-  type, so it's reconstructed by shifting its 3 little-endian bytes into
-  the top 24 bits of a 32-bit int and arithmetic-shifting back down by
-  8, sign-extending and rescaling in one step. Sample rate support is
-  unchanged (48000 or 44100 Hz only, 44.1kHz resampled up to the
-  engine's native 48kHz with the same exact-ratio linear resampler
-  `ExportWav()` already uses in the other direction) -- arbitrary
-  sample-rate conversion is a genuinely separate, much bigger problem
-  than decoding an already-recognized format, and wasn't attempted here.
+  `IMPORT/` folder. Originally 16-bit PCM, 48kHz/44.1kHz only; widened in
+  two real, user-driven passes. First: also accept 24-bit and 32-bit
+  PCM, plus 32-bit IEEE float, after a real user's commercial sample-pack
+  loop (an otherwise perfectly ordinary stereo/44.1kHz file, just 24-bit)
+  failed to import with no path to fix it short of re-encoding on a
+  computer first -- 24-bit in particular is extremely common for
+  commercial sample packs. `ImportWav()`'s previously `int16_t`-only read
+  buffer became a generic byte buffer, decoded per-sample based on the
+  file's own (constant-for-the-whole-stream) `audio_format`/
+  `bits_per_sample`: 24-bit has no native integer type, so it's
+  reconstructed by shifting its 3 little-endian bytes into the top 24
+  bits of a 32-bit int and arithmetic-shifting back down by 8,
+  sign-extending and rescaling in one step.
+
+  Second: sample rate support widened from just 48000/44100 Hz to every
+  common real-world WAV rate -- 8000/11025/16000/22050/24000/32000/
+  44100/48000/88200/96000/176400/192000 Hz (24000 Hz specifically added
+  in a follow-up fix after a real file at that exact rate was missed by
+  the first widening pass). Anything other than 48000 Hz is resampled to
+  the engine's native rate: the existing exact-ratio `Resampler44_1to48`
+  was generalized from a hardcoded ratio into a runtime `Init(in_hz,
+  out_hz)` (GCD-reduced, so every listed rate still gets an exact
+  integer up/downsampling ratio, not an approximation) for upsampling
+  below 48kHz; a genuine downsample from a rate above 48kHz additionally
+  gets a real anti-aliasing prefilter first (two cascaded `daisysp::Svf`
+  lowpass stages) before decimating, rather than just dropping samples
+  and letting them alias. Arbitrary (non-integer-ratio) sample-rate
+  conversion remains out of scope -- every rate on the list above has a
+  clean integer relationship to 48kHz, which is what makes the
+  GCD-reduced exact-ratio approach viable at all.
 - **Trim**: non-destructive start/end trim over whatever's currently
   captured — the underlying buffer is untouched, only the sub-range
   passed to `SetSource()` changes, so re-trimming always works from the
@@ -1092,10 +1368,24 @@ Grain-layer and Scan-layer volumes summed before a single Output Level
 stage — raised from a 1.4x to a 12x ceiling, plus a new `tanhf()` soft
 limiter, after real-hardware testing showed Grains reading much quieter
 than Dexed even maxed (see *Dexed*'s own note on this above for the full
-story) — a continuous Reverb Send knob, and the same linear pan law
+story) — a continuous Reverb Send knob (also reachable, alongside Delay
+Send/Time, from the FX page below), and the same linear pan law
 `LooperLayer` uses, applied to the already-stereo captured signal (Grains
 reads real L/R from whatever was captured/imported, unlike a mono voice
 sum).
+
+**FX page** (`GranularParamPage::FX`, labeled **GR-FX** on screen):
+full reverb/delay control from within Grains itself, same shape as
+`DexedParamPage::FX`/`LayerPage::Reverb` — Button toggles between Reverb
+(own Send + the shared bus Size) and Delay (own Send + the shared bus
+Time); Mix's own Reverb Send is untouched by this, a genuinely reachable-
+from-two-places value like every other Send-shaped control here. The
+**GR-FX**/**DX-FX**/**LYR-FX**/**GLB-FX** naming (Grains/Dexed/Layer/
+Global's respective reverb-and-delay pages) replaced four pages that all
+used to just say "FX" or "Reverb" — indistinguishable from each other at
+a glance while navigating, and from Global's own page specifically
+easy to mistake for a master-bus control rather than one specific
+source's own send.
 
 **Presets** (`GranularEngine::GranularPresetData`): unlike Dexed,
 Grains presets are **audio-inclusive** — a Grains preset IS a specific
@@ -1184,16 +1474,23 @@ universal rule.
 
 ## SD card management (Global:SdMgmt)
 
-Lets you browse any of the 3 save categories — Performances, Dexed
-Presets, Grains Presets — and Duplicate or Delete individual
-files directly from the Pod, no computer needed. Reuses the exact same
-cached slot-list arrays and dirty-flag/`Refresh*()` functions the 3 save
-pages already scan and cache — no duplicate directory-scanning logic
-anywhere.
+Lets you browse either of 2 save categories — Performances, Grains
+Presets — and Duplicate or Delete individual files directly from the
+Pod, no computer needed. Reuses the exact same cached slot-list arrays
+and dirty-flag/`Refresh*()` functions those save pages already scan and
+cache — no duplicate directory-scanning logic anywhere.
+`DeleteDexedPreset()`/`DuplicateDexedPreset()` already exist in
+`PerformanceStore` with the identical shape, but **`SdMgmtFolder` has
+never actually been extended to cover Dexed Presets** — a real,
+currently-open gap (see *Known limitations* below), not a deliberate
+omission; the only way to remove a Dexed preset today is deleting its
+`DEXP/PRESnnn.DAT` file directly from a computer.
 
 - **Duplicate** (Button 1 held 800ms): byte-for-byte chunked copy into
   the next free slot in that category (`CopyFileChunked()`, shared by
-  all 3 categories) — `FA_CREATE_NEW`, not `FA_CREATE_ALWAYS`, so an
+  all 3 categories at the `PerformanceStore` level, 2 of which are
+  actually reachable from this screen today, see above) — `FA_CREATE_NEW`,
+  not `FA_CREATE_ALWAYS`, so an
   unexpected filename collision fails loudly instead of silently
   overwriting something; any failure partway through deletes the partial
   destination file rather than leaving a corrupt copy behind.
@@ -1228,23 +1525,27 @@ convention never needs re-learning between them:
   Overwrite (only offered once something's actually loaded) vs. Save
   New — picked with Knob 1, confirmed with Button 2 held 800ms.
 - **Load** (Button 2 tap from idle): reveals the *same shape* of
-  two-line choice — **Files** vs. **Load New** — picked with Knob 1.
-  Selecting Files and tapping Button 1 drills in: the chooser is
-  replaced by the actual numbered file list (or, for Dexed Preset only, a
-  folder list one level above that — see *Preset folder browsing & live
-  preview* under *Dexed* above), and Knob 1 now scrolls it directly.
-  Button 1 is "Back" everywhere else inside Load (drilled-in → back to
-  the chooser or folder list; chooser-with-New-highlighted → back to
-  idle). Button 2
-  held 800ms confirms whichever is actually selected — a specific
-  browsed file, or New — and does nothing yet at the chooser with Files
-  highlighted (or, for Dexed, at its folder list), since there's no
-  specific target picked at that level ("nothing if it does nothing",
-  the same footer-label rule this project already applies everywhere
-  else). Dexed's own Preset page additionally lets a *short* Button 2 tap
-  preview the highlighted file live without leaving the browser (see
-  *Preset folder browsing & live preview* under *Dexed* above) — the one
-  real difference from this otherwise-identical convention.
+  two-line choice on Global:File/Grains Preset — **Files** vs. **Load
+  New** — picked with Knob 1; Dexed Preset's own version is three-way
+  (**Files** / **Import** / **Load New**, see *SysEx import* under
+  *Dexed* above for what Import opens onto). Selecting Files and
+  tapping Button 1 drills in: on Global:File/Grains Preset, the chooser
+  is replaced by the actual numbered file list directly, Knob 1 scrolls
+  it, and Button 1 is "Back" from there straight to the chooser. Dexed's
+  own Files goes one level deeper first (group chooser → folder list →
+  presets, see *SysEx import* above) — Button 1 is "Back" and Button 2
+  is "Open" specifically at those two extra levels, a genuine, deliberate
+  exception to this convention's usual "Button 1 drills in" rule, added
+  once Dexed's own browsing grew a level Global:File/Grains Preset never
+  needed. Button 2 held 800ms confirms whichever is actually selected —
+  a specific browsed file, or New — and does nothing yet at a level with
+  no specific target picked ("nothing if it does nothing", the same
+  footer-label rule this project already applies everywhere else). Every
+  one of these Preset pages additionally lets a *short* Button 2 tap
+  preview the highlighted file live without leaving the browser, once
+  actually inside a real file/preset list (see *Preset folder browsing &
+  live preview* under *Dexed* above for where this convention first
+  came from).
 - **New**, reached this way instead of a separate hidden gesture, means:
   Global:File clears every layer's recorded audio (keeping every
   setting); Dexed Preset resets to its own first factory patch; Grains
@@ -1302,8 +1603,9 @@ see *The Files/New Load chooser* above) only wipes each layer's recorded
 *audio* (`LooperLayer::Clear()`) — every global and per-layer setting is
 left exactly as it was. It's deliberately not the same as applying the
 startup default (see below); those are two different, independent
-actions. Delete/Duplicate for all 3 save categories live on
-`Global:SdMgmt` instead (see *SD card management* above), not on these
+actions. Delete/Duplicate for Performances and Grains Presets live on
+`Global:SdMgmt` instead (see *SD card management* above, including its
+own note on Dexed Presets not being covered there yet), not on these
 individual save/load pages.
 
 ## Startup defaults
@@ -1439,6 +1741,16 @@ A few things that are intentional, not bugs:
   vari-speed, they're live-performance controls that always reset to
   their defaults on boot and after Load — not part of a saved
   performance, and not covered by Startup Defaults either.
+- **No on-device Delete/Duplicate for Dexed Presets**: `Global:SdMgmt`
+  (see its own section above) only covers Performances and Grains
+  Presets — `DeleteDexedPreset()`/`DuplicateDexedPreset()` already exist
+  in `PerformanceStore` with the identical shape, but `SdMgmtFolder` was
+  never extended to add a third stop for them. The only way to remove a
+  Dexed preset today is deleting its `DEXP/PRESnnn.DAT` file directly on
+  a computer — safe for a plain User preset, but doing this to one
+  covered by a recorded Import folder (see *SysEx import* above) leaves
+  that folder's own manifest record pointing at a slot range with a
+  hole in it, since the manifest doesn't verify each slot still exists.
 - **No SD card hot-swapping while powered on**: the SD socket is
   hand-wired with no card-detect pin (see *Hardware* above), so the
   firmware has no way to know a card was physically pulled and
@@ -1467,7 +1779,9 @@ A few things that are intentional, not bugs:
   *Dexed* above)
 - `dexed_sysex.h/.cpp` — this project's own clean-room packed↔unpacked
   DX7 SysEx converter, written from the public 1993 Yamaha MIDI SysEx
-  spec (see *Dexed* above for why msfa itself doesn't include one)
+  spec (see *Dexed* above for why msfa itself doesn't include one) --
+  used both to unpack the embedded factory banks below AND, later, for
+  real user SysEx import (see *SysEx import* under *Dexed* above)
 - `dexed_factory_data.h/.cpp` — the 3129 embedded factory presets (see
   *Dexed* above), stored packed and unpacked on demand
 - `granular_engine.h/.cpp` — the Grains instrument (see *Grains* above)

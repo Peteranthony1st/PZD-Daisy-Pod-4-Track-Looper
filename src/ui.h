@@ -3,6 +3,7 @@
 #include "dev/oled_ssd130x.h"
 #include "tempo_clock.h"
 #include "looper_layer.h"
+#include "performance_store.h"
 #include "font_tomthumb.h"
 
 class GranularEngine;
@@ -113,6 +114,14 @@ class Ui
     // comment for why). Raw 0..1, applied via SetFeedback() directly
     // (same range DaisySP's ReverbSc expects), no curve needed.
     float GetReverbSize01() const { return reverb_size01_; }
+    // Shared delay bus's Time/Feedback (see main.cpp's fx_delay_l/r) --
+    // same "one shared instance, everyone sends into it" relationship to
+    // Dexed's/Grains' own Delay Send as Reverb Size has to their Reverb
+    // Send. Raw 0..1 -- main.cpp maps Time onto an actual ms value with
+    // its own exponential curve, and scales Feedback below 1.0 to avoid
+    // runaway self-oscillation in the cross-feedback pair.
+    float GetDelayTime01() const { return delay_time01_; }
+    float GetDelayFeedback01() const { return delay_feedback01_; }
     // How much of the Bypass live-monitor signal feeds the shared reverb
     // bus above -- independent of every layer's own Send, same shared
     // bus though (see main.cpp's AudioCallback()). 0 (default) = none,
@@ -174,7 +183,7 @@ class Ui
     // Global:Looper, Button1 tap -- a REAL stop, not TogglePauseAll()'s
     // own phase-locked pause: main.cpp's AudioCallback() skips every
     // LooperLayer::Process() call entirely while this is false, so
-    // someone using only Plaits/Grains gets that CPU back rather than 4
+    // someone using only Dexed/Grains gets that CPU back rather than 4
     // idle-but-still-processing layers. Defaults true (unlike Pad/
     // Granular's own false default) since the loop is this project's
     // original core feature, not an add-on someone opts into.
@@ -231,22 +240,40 @@ class Ui
         ChoosingSave,
         BrowsingLoad
     };
+    // Global:Speed's own transport sub-mode, cycled by a Button1 short
+    // tap. Normal: encoder rotation does nothing here. Scrub: encoder
+    // rotation nudges every layer's play_pos_ together (see ScrubBy()),
+    // normal tempo-driven playback keeps advancing underneath. Freeze:
+    // encoder rotation moves a small frozen "drone" window instead (see
+    // NudgeFreeze()) -- normal playback genuinely stops advancing while
+    // active, see LooperLayer::SetFreezeActive()'s own doc comment.
+    enum class SpeedTransportMode
+    {
+        Normal,
+        Scrub,
+        Freeze
+    };
     enum class LayerPage
     {
         Status,
+        // Recording input gain (SetInputGain01() -- boosts a quiet mic/
+        // line source before capture), not a playback volume control.
+        // Sits right after Status, before the playback-shaping pages
+        // below (Speed/Filter/Effect/FX), since it only matters before
+        // or during recording, not to what's already been captured.
+        Gain,
         Speed,
         Filter,
         Effect,
         Reverb,
-        Gain,
         kCount
     };
     enum class GlobalPage
     {
         Tempo,
+        Speed, // Sits right after Tempo -- both are project-wide timing/transport controls
         Filter,
         Reverb,
-        Speed,
         File,
         // File management: Knob1 picks which of the 2 save folders
         // (Performances/Grains Presets) then Button1 tap drills in; once
@@ -265,17 +292,16 @@ class Ui
         // Entry point into Screen::Dexed, plus the on/off toggle -- same
         // Button1-tap convention as Granular's own above.
         Dexed,
-        // On/off toggle only, same treatment as Pad/Granular above --
+        // On/off toggle only, same treatment as Granular/Dexed above --
         // but for the whole 4-layer loop system, and a REAL stop (see
         // IsLooperEnabled()'s doc comment), not TogglePauseAll()'s own
-        // phase-locked pause. Lets someone using only Plaits/Grains skip
+        // phase-locked pause. Lets someone using only Dexed/Grains skip
         // all 4 LooperLayer::Process() calls entirely for the CPU back,
         // not just silence.
         Looper,
-        // Knob1 = Plaits' overall output level, Knob2 = Grains' overall
-        // output level -- both engines' own SetOutputLevel01(), so this
-        // is genuinely "how loud is each in the master mix" rather than
-        // a separate/competing level control.
+        // Entry point into Screen::Mixer -- no knobs of its own any more
+        // (the real per-engine level controls live there), same "entry
+        // point only" idiom as Granular/Dexed above.
         Mixer,
         kCount
     };
@@ -293,20 +319,64 @@ class Ui
     enum class GranularParamPage
     {
         // The showcase page: full-sample waveform + live grain-anchor
-        // markers, Size/Fill/Gap/Scan values shown live -- Button1 maps
-        // the knobs to Size+Fill, Button2 maps them to Gap+Scan (see
-        // granular_grain_target_gap_scan_), same toggle idiom as Pad's
-        // own merged ADSR page.
+        // markers, Size/Fill/Gap/Jitter values shown live -- Button1 maps
+        // the knobs to Size+Fill, Button2 maps them to Gap+Jitter (see
+        // granular_grain_target_gap_jitter_), same toggle idiom as Pad's
+        // own merged ADSR page. Jitter lives here (not its own page) --
+        // it's a Grain-layer-only refinement, same family as Size/Fill/
+        // Gap, not a separate feature; see GranularEngine::SetJitter01()
+        // for what it actually does (a fixed Position anchor replays the
+        // exact same buffer offset every retrigger, so a source with a
+        // strong feature sitting inside the grain's window -- not at its
+        // very edge, where the Hann window would silence it -- repeats
+        // it identically forever, audible as a perfectly periodic click;
+        // Jitter smears consecutive grains across nearby offsets
+        // instead -- confirmed via a real exported capture on a
+        // sustained pad sample).
         Grain,
-        Position, // Knob1 only, same single-knob convention as LayerPage::Speed
-        // Knob1 = Tune (semitones), Knob2 = Direction; Button1 cycles
-        // Map-to-Note on/off.
-        TuneDirection,
+        // Knob1 = Position (Grain layer's fixed anchor), Knob2 =
+        // Direction (moved here from TuneDirection, below -- that page's
+        // K2 slot is now free since this one was, per a real user
+        // request). Button1/2 cycle Rhythm/Speed. Sits right after Grain
+        // so the Grain layer's own two pages (what plays, then where it
+        // reads from) are adjacent.
+        Position,
+        // Knob1 = Scan (speed/direction, dead-zone-centered mute -- moved
+        // here from the Grain page), Knob2 = Scan's own Fill (how many
+        // concurrent grains the Scan layer uses, independent of the
+        // Grain layer's own Fill -- see GranularEngine::SetScanFill01()).
+        // Split into its own page specifically so these two live
+        // together: Scan is a genuinely separate layer from Grain (its
+        // own anchor, its own density), so it gets its own independent
+        // density control instead of being forced to always match
+        // whatever the Grain layer's Fill happens to be. Sits right
+        // after Position and before ScanRange, below, so the Scan
+        // layer's own two pages are adjacent to each other, mirroring
+        // Grain/Position's own pairing.
+        Scan,
+        // Knob1 = Scan Start, Knob2 = Scan End -- the Scan layer's own
+        // sweep range, fully adjustable at both ends (see
+        // GranularEngine::SetScanEnd01()'s own doc comment). Sits right
+        // after Scan specifically since it's that page's own direct
+        // sibling -- Scan is "what plays" for that layer, this is "where
+        // it reads from," same relationship Position has to Grain.
+        // Previously Scan's end was fixed to the buffer's own end and
+        // only the start (then called "Scan Position") lived on the
+        // Position page's K2; moved out to its own page once End became
+        // independently adjustable too, per a real user request.
+        ScanRange,
+        // Knob1 only = Tune (semitones); Button1 cycles Map-to-Note
+        // on/off. Direction (previously this page's own K2) moved to
+        // Position's own K2 -- see its own doc comment above.
+        Tune,
         // Attack/Decay/Sustain/Release graph, same merged-page idiom as
         // Grain's Size/Fill/Gap/Scan and Pad's own ADSR page.
         ADSR,
         Filter, // Cutoff + Resonance, mode cycled by Button1; live oscilloscope
         Mix,    // Grain layer volume + Scan layer volume
+        // Full reverb/delay control from within Grains itself -- same
+        // shape/reasoning as DexedParamPage::FX.
+        FX,
         // Button1 cycles the source (Direct Record / From the currently
         // selected loop layer); Button2 held either records live input
         // for as long as it's held (Direct) or, past an 800ms threshold,
@@ -356,6 +426,14 @@ class Ui
         EnvSpeed,
         Filter, // Cutoff + Resonance, mode cycled by Button1
         Mix,    // Reverb Send + Output Level
+        // Full reverb/delay control from within Dexed itself: Button1/
+        // Button2 toggle between Reverb (own Send + shared Size) and
+        // Delay (own Send + shared Time) -- Mix's own Reverb Send/Output
+        // Level are untouched (this is a separate, additional page, not
+        // a replacement -- Reverb Send is genuinely reachable from both
+        // places, same "same value, multiple entry points" idiom already
+        // established for Reverb Send across Mix/Global Mixer).
+        FX,
         // Entry point into Screen::DexedOperator (encoder click) -- no
         // continuous knobs of its own, same "entry point only" idiom as
         // GlobalPage::Granular/Dexed. Positioned right before Preset so
@@ -368,6 +446,35 @@ class Ui
         // the removed FmSynth's own Preset page used, generalized to
         // more/larger categories.
         Preset,
+        kCount
+    };
+
+    // Preset page's "Files" branch own group chooser -- one level above
+    // the factory-category/User folder list, entered right after
+    // picking "Files" from the top-level Save/Load chooser. Added
+    // because that flat folder list was already 54 factory categories +
+    // User before any SysEx import existed (see
+    // DexedSynth::kNumFactoryCategories's own doc comment on why so
+    // many small categories exist in the first place -- one knob sweep
+    // across a few hundred presets in ONE folder was already
+    // unreliable); every completed import now adds one MORE folder
+    // (PerformanceStore::DexedImportFolder), so a single flat sweep
+    // across ever-growing dozens of folders was never going to scale.
+    // Roms: the 4 real "Rom 1".."Rom 4" categories (real factory index
+    //   0-3 -- literal unmodified Yamaha ROM cartridge contents).
+    // Dexed: the other ~50 curated-by-sound-type categories (real
+    //   factory index 4..kNumFactoryCategories-1).
+    // Imports: one folder per completed SysEx import (see
+    //   PerformanceStore::ListDexedImportFolders()), each holding just
+    //   that one import's own contiguous slot range.
+    // User: every USER slot that ISN'T part of a recorded import folder
+    //   -- hand-saved presets only, filtered in RefreshDexedPresetSlots().
+    enum class DexedFilesGroup
+    {
+        Roms,
+        Dexed,
+        Imports,
+        User,
         kCount
     };
 
@@ -388,6 +495,14 @@ class Ui
         Detune,     // K1 only, 0-14 centered on 7
         EgRate,     // K1/K2 = Rate1/Rate2 (AD) or Rate3/Rate4 (SR), Button2 toggles
         EgLevel,    // K1/K2 = Level1/Level2 (AD) or Level3/Level4 (SR), Button2 toggles
+        // K1 only, 0-3 (patch[off+14] & 3, ampmodsenstab in msfa) -- gates
+        // whether this operator responds to the mod wheel's Amp/EG Bias
+        // targets at all (0 = never, regardless of wheel position); see
+        // DexedSynth::ModWheelTarget's own comment. Explicitly deferred in
+        // the original advanced-editor plan, added once a real user
+        // report ("I can hear no effect... on all of the cycles") traced
+        // Amp/EG's silence to this byte never being exposed anywhere.
+        AmpModSens,
         kCount
     };
 
@@ -408,6 +523,7 @@ class Ui
         GlobalTempo,
         GlobalFilter,
         GlobalReverb,
+        GlobalDelay, // Global:FX's Delay pair (Time/Feedback) -- see global_fx_target_delay_
         GlobalSpeed,
         GlobalFile,
         GlobalExport,
@@ -417,16 +533,26 @@ class Ui
         GlobalSdMgmt, // browses a list directly, no pickup used -- see GlobalPage::SdMgmt
         GlobalDexed, // entry point only -- see Screen::Dexed instead
         // Screen::Granular's Grain page -- Button1/Button2 toggle which
-        // pair the knobs reach (see granular_grain_target_gap_scan_).
+        // pair the knobs reach (see granular_grain_target_gap_jitter_).
         GranularGrainSizeFill,
-        GranularGrainGapScan,
+        GranularGrainGapJitter,
         GranularPosition,
-        GranularTuneDirection,
+        GranularScanRange,
+        GranularScanGap,
+        GranularScan,
+        GranularTune,
         GranularEnvAD,
         GranularEnvSR,
         GranularFilter,
         GranularMix,
         GranularMixReverb,
+        // Screen::Granular's own new FX page -- Button1/Button2 toggle
+        // between Reverb (own Send + shared Size) and Delay (own Send +
+        // shared Time), same shape as GranularMix/GranularMixReverb above
+        // but a separate page so Mix's own Grain/Scan volumes don't need
+        // to share room with 4 more FX parameters.
+        GranularFxReverb,
+        GranularFxDelay,
         GranularCapture, // no continuous knobs -- Button1/Button2 only
         GranularTrim,
         GranularPreset, // browses a list directly, no pickup used
@@ -448,10 +574,19 @@ class Ui
         DexedAlgo, // no continuous knobs -- Button1 cycles it
         DexedFeedback,
         DexedVibrato,
+        // MOD page's own Button2 toggle -- K1 = patch[143]&7, the global
+        // Pitch Mod Sensitivity byte that gates BOTH the automatic
+        // Vibrato Depth knob above AND the wheel's Pitch target (see
+        // DexedSynth::ModWheelTarget's own comment).
+        DexedVibratoSens,
         DexedBrightness,
         DexedEnvSpeed,
         DexedFilter,
         DexedMix,
+        // Screen::Dexed's own new FX page -- same shape/reasoning as
+        // GranularFxReverb/GranularFxDelay above.
+        DexedFxReverb,
+        DexedFxDelay,
         DexedAdvanced, // entry point only -- see Screen::DexedOperator instead
         DexedPreset, // browses a list directly, no pickup used
         // Screen::DexedOperator -- one context per sub-page, shared
@@ -466,6 +601,7 @@ class Ui
         DexedOpEgRateSR,
         DexedOpEgLevelAD,
         DexedOpEgLevelSR,
+        DexedOpAmpModSens,
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -598,15 +734,36 @@ class Ui
     // don't have. A separate function rather than extending DrawWaveform()
     // itself so Layer:Status/Global:Speed's existing, working display
     // can't regress.
+    // grain_size01: fraction of the buffer one grain spans (see
+    // GranularEngine::GetGrainSizeFraction01()) -- draws the Grain
+    // marker as a span this wide, centered on grain_anchor01, instead of
+    // a single-pixel tick, so Size is actually visible on the waveform.
+    // 0 collapses back to a plain point marker (used by Trim's own reuse
+    // of this same function for start/end points, where a size span
+    // makes no sense).
+    // range_start01/range_end01: when both are >= 0, draws a full-height
+    // vertical line at each across the whole waveform band -- used by
+    // the Scan Range page to show its own Start/End boundaries directly
+    // on the display, separate from (and in addition to) the Grain/Scan
+    // anchor ticks above. Negative (either one) disables this entirely,
+    // the default for every other caller.
     void DrawGranularWaveform(const float* peaks,
                                 float        grain_anchor01,
                                 float        scan_anchor01,
-                                bool         has_source);
-    // Encoder rotation while Global:Speed's scrub mode is on (see
-    // scrub_mode_active_) -- nudges every non-empty layer's play_pos_ by
-    // the same raw-sample amount, keeping them all pointing at the same
-    // shared timeline position, like scratching a physical tape loop.
+                                bool         has_source,
+                                float        grain_size01 = 0.f,
+                                float        range_start01 = -1.f,
+                                float        range_end01   = -1.f);
+    // Encoder rotation while Global:Speed's transport mode is Scrub (see
+    // speed_transport_mode_) -- nudges every non-empty layer's play_pos_
+    // by the same raw-sample amount, keeping them all pointing at the
+    // same shared timeline position, like scratching a physical tape loop.
     void ScrubBy(int32_t inc);
+    // Encoder rotation while Global:Speed's transport mode is Freeze --
+    // same per-layer raw-sample nudge as ScrubBy(), but moves each
+    // layer's frozen drone window instead (LooperLayer::NudgeFreeze()),
+    // so scrubbing selects which part of the loop the drone plays.
+    void NudgeFreezeBy(int32_t inc);
     // Encoder click anywhere on the Global screen: toggles every layer
     // currently Playing to Paused, or every layer currently Paused back
     // to Playing (Empty/Recording/ArmedCountIn/Overdubbing layers are
@@ -739,14 +896,25 @@ class Ui
     void TriggerNewGranularPreset();
 
     // --- Dexed presets (DexedParamPage::Preset) --------------------------
-    // Two-level folder browsing (factory categories by real sound type,
-    // plus a trailing "User" folder of SD saves) -- same shape as the
-    // removed FmSynth's own preset browser (see
-    // dexed_preset_folder_cursor_/dexed_preset_folder_open_'s own
-    // comments), generalized to DexedSynth::kNumFactoryCategories
-    // (11, real sound-type folders) instead of a fixed 8.
+    // See DexedFilesGroup's own doc comment for the current 3-level
+    // (group -> folder -> preset) shape -- was originally a flat 2-level
+    // folder browser like the removed FmSynth's own, generalized further
+    // once SysEx import made the flat folder list grow unbounded.
+    // Re-scans BOTH the User slot list (filtered, see
+    // dexed_preset_user_slots_'s own comment) and the import-folder
+    // manifest (dexed_import_folders_) together -- the former's
+    // filtering depends on the latter being current first.
     void RefreshDexedPresetSlots();
     int  ResolveDexedPresetSlot() const;
+    // Real flat 0..(kNumFactoryCategories-1) factory category index for
+    // the current dexed_files_group_ + dexed_preset_folder_cursor_
+    // selection -- valid only when the group is Roms or Dexed (Imports/
+    // User have no factory-category mapping at all, see
+    // ResolveDexedPresetSlot()'s own per-group branches). Roms group
+    // cursor 0-3 maps directly (already real); Dexed group cursor
+    // 0..(kNumFactoryCategories-5) is offset by the 4 Roms categories
+    // that come first in DexedSynth::kDexedFactoryCategories's own table.
+    int ResolveDexedRealCategory() const;
     // Button1 short tap (force_new=false): smart save -- overwrites
     // dexed_loaded_preset_slot_ if it names a real (non-factory) slot,
     // else a new one. Button2 short tap (force_new=true): always a new
@@ -765,6 +933,23 @@ class Ui
     // real behavior of the removed FmSynth's own preset browser (not a
     // separate non-committing "audition" primitive), reused as-is here.
     void TriggerLoadDexedPreset();
+    // Re-scans DXIMPORT/ on the SD card for .syx files -- called once on
+    // entry to the Preset page's own Import file list, same pattern as
+    // RefreshGranularImportFiles().
+    void RefreshDexedImportFiles();
+    // Hold-to-confirm-then-fire-once (see HandleButton2()'s own Dexed
+    // Preset handling, same weight as TriggerGranularImport()'s own real
+    // SD read). Reads/decodes whichever file dexed_import_cursor_ points
+    // at (PerformanceStore::ImportDexedSyx()) and writes every voice it
+    // contains into new, consecutively-numbered Dexed USER slots -- a
+    // Single Voice Dump becomes one new slot, a 32-Voice Bulk Dump
+    // becomes 32. The LAST voice imported is also applied live
+    // (DexedSynth::ApplyPreset()) and becomes dexed_loaded_preset_slot_,
+    // the same "land on something real" feel as TriggerLoadDexedPreset()'s
+    // own preview -- called from there when dexed_import_selected_ is
+    // set, so every existing Button1/Button2 call site reaches this
+    // automatically with no per-call-site branching needed.
+    void TriggerDexedSyxImport();
     // Two-row control legend, drawn at the bottom of every screen in
     // Tom Thumb (see font_tomthumb.h): a knob row (circle icon) and a
     // button row (square icon), each with a label flush to the screen
@@ -869,6 +1054,19 @@ class Ui
     float      master_filter_res01_     = 0.f;
 
     float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
+    float delay_time01_     = 0.3f; // shared delay bus's Time, see GetDelayTime01()
+    float delay_feedback01_ = 0.35f; // shared delay bus's Feedback, see GetDelayFeedback01()
+    // Global:FX's own toggle between the Reverb pair (Size/Bypass Send,
+    // existing) and the Delay pair (Time/Feedback, new) -- same "Button1
+    // = pair A, Button2 = pair B" idiom as Grain's Gap+Scan toggle.
+    bool global_fx_target_delay_ = false;
+    // Same toggle, one per engine's own new FX page (Reverb Send+Size vs
+    // Delay Send+Time) -- independent of Global:FX's own toggle above
+    // and of each other.
+    bool dexed_fx_target_delay_    = false;
+    // MOD page's own Button2 toggle -- see KnobContext::DexedVibratoSens.
+    bool dexed_vibrato_target_sens_ = false;
+    bool granular_fx_target_delay_ = false;
     float bypass_reverb_send01_ = 0.f; // see GetBypassReverbSend01()
     float bypass_mix_volume01_  = 0.8f; // see GetBypassMixVolume01()
     float bypass_mix_volume_    = 1.f;  // curved, set properly in the ctor below
@@ -880,7 +1078,7 @@ class Ui
     // extra Init()-time recompute is needed the way master_volume_ needs.
     float project_speed01_   = 0.5f; // raw 0..1
     float project_speed_     = 1.f;  // actual multiplier, read every audio block
-    bool  scrub_mode_active_ = false; // Global:Speed only -- see HandleEncoder()
+    SpeedTransportMode speed_transport_mode_ = SpeedTransportMode::Normal; // Global:Speed only -- see HandleEncoder()
     uint32_t last_scrub_tick_ms_ = 0; // for ScrubBy()'s turn-speed acceleration
 
     bool loop_paused_ = false; // see TogglePauseAll()
@@ -956,9 +1154,13 @@ class Ui
     // --- Granular engine (Screen::Granular) -----------------------------
     GranularEngine*    granular_             = nullptr;
     GranularParamPage  granular_param_page_  = GranularParamPage::Grain;
-    // false = knobs control Size+Fill, true = Gap+Scan -- see
+    // false = knobs control Size+Fill, true = Gap+Jitter -- see
     // GranularParamPage::Grain's Button1/Button2 handling.
-    bool granular_grain_target_gap_scan_ = false;
+    bool granular_grain_target_gap_jitter_ = false;
+    // false = knobs control Start+End, true = Gap (Scan's own, K1 only)
+    // -- see GranularParamPage::ScanRange's Button1/Button2 handling,
+    // same two-button pattern as the Grain page's own toggle.
+    bool granular_scanrange_target_gap_ = false;
     // false = knobs control Attack+Decay, true = Sustain+Release -- see
     // GranularParamPage::ADSR's Button1/Button2 handling.
     bool granular_adsr_target_sr_ = false;
@@ -979,7 +1181,7 @@ class Ui
     // pad_scope_buf_/granular_scope_buf_ above.
     const float* master_scope_buf_      = nullptr;
     size_t       master_scope_capacity_ = 0;
-    // 0..3 = Layer 1..4, 4 = Plaits, 5 = Grains, 6 = Bypass, 7 = Master,
+    // 0..3 = Layer 1..4, 4 = Grains, 5 = Dexed, 6 = Bypass, 7 = Master,
     // 8 = Overview, 9 = Scope -- see kNumMixerChannels/kNumMixerPositions/
     // MixerChannelName(). Changed by encoder rotate while on
     // Screen::Mixer (see HandleEncoder()'s own comment on why that needs
@@ -1037,6 +1239,12 @@ class Ui
     size_t granular_capture_full_len_ = 0;
     float  granular_trim_start01_     = 0.f;
     float  granular_trim_end01_       = 1.f;
+    // Throttles ApplyGranularTrim()'s own waveform-peaks recompute (an
+    // O(full capture length) scan) to well below the ~1kHz main-loop/
+    // knob-polling rate -- see GranularEngine::SetTrimRange()'s own doc
+    // comment for why redoing that scan on every single tick was a real,
+    // user-reported cause of Trim's knobs feeling laggy/slow to update.
+    uint32_t granular_trim_peaks_throttle_ = 0;
     // Peaks over the FULL untrimmed capture (see GranularParamPage::Trim's
     // own comment) -- separate from GranularEngine::GetWaveformPeaks(),
     // which only ever reflects whatever sub-range is currently active.
@@ -1062,13 +1270,21 @@ class Ui
     DexedParamPage dexed_param_page_ = DexedParamPage::Algo;
 
     // --- Dexed presets (DexedParamPage::Preset) --------------------------
-    // Two-level folder browsing, same shape as the removed FmSynth's own
-    // preset browser (fm_preset_folder_cursor_/fm_preset_folder_open_) --
-    // dexed_preset_folder_cursor_ is 0..DexedSynth::kNumFactoryCategories-1
-    // for a real sound-type category, or ==kNumFactoryCategories itself
-    // for the trailing synthetic "User" folder holding every SD-saved
-    // slot. dexed_preset_folder_open_: false = K1 scrolls the folder
-    // list, true = K1 scrolls presets/slots inside the open folder.
+    // Three levels now (see DexedFilesGroup's own doc comment for why):
+    // group (Roms/Dexed/Imports/User) -> folder (skipped entirely for
+    // User, which has no further sub-grouping) -> preset. dexed_files_group_
+    // is which group; dexed_files_group_open_: false = K1 picks the
+    // group, true = past it. Within a group, dexed_preset_folder_cursor_/
+    // dexed_preset_folder_open_ mean "index of the highlighted folder
+    // WITHIN this group" / "folder open, K1 now scrolls presets inside
+    // it" for Roms/Dexed/Imports -- resolved to a real factory category
+    // (see ResolveDexedRealCategory()) or a real PerformanceStore::
+    // DexedImportFolder (see dexed_import_folders_) depending on the
+    // group. User has no folder level at all -- dexed_files_group_open_
+    // true for User means "browsing the flat, import-filtered slot list"
+    // directly, same shape Global:File's own single-level list uses.
+    DexedFilesGroup dexed_files_group_      = DexedFilesGroup::Roms;
+    bool            dexed_files_group_open_ = false;
     int  dexed_preset_folder_cursor_ = 0;
     bool dexed_preset_folder_open_   = false;
     // Index WITHIN the open folder (not a flat index) -- resolved to a
@@ -1079,13 +1295,52 @@ class Ui
     // slots -- 200 gives real headroom without needing to keep this in
     // exact lockstep with the factory bank's own size.
     static constexpr int kMaxDexedPresetSlots = 200;
-    int  dexed_preset_user_slots_[kMaxDexedPresetSlots] = {}; // SD user slots, ascending
+    // Filtered to EXCLUDE any slot that belongs to a recorded import
+    // folder (see RefreshDexedPresetSlots()) -- this is specifically the
+    // User group's own slot list, not every user slot on the card.
+    int  dexed_preset_user_slots_[kMaxDexedPresetSlots] = {}; // ascending
     int  dexed_preset_user_slot_count_                   = 0;
     bool dexed_preset_slots_dirty_ = true; // forces one RefreshDexedPresetSlots() on entry
+    // One entry per completed SysEx import (see
+    // PerformanceStore::SaveDexedImportFolder()), refreshed by the same
+    // RefreshDexedPresetSlots() call/dirty flag above -- kept alongside
+    // it (not a separate dirty flag) since the User list's own filtering
+    // depends on this being current first.
+    PerformanceStore::DexedImportFolder
+         dexed_import_folders_[PerformanceStore::kMaxDexedImportFolders] = {};
+    int  dexed_import_folder_count_ = 0;
     // Starts at slot 1 (factory preset 0, "ARP 2600"), matching
     // DexedSynth::Init()'s own boot default.
     int  dexed_loaded_preset_slot_ = 1;
     char dexed_preset_status_[24]  = {}; // last save/load result, shown briefly
+
+    // Preset page's top-level chooser own third option -- Import (SD
+    // .syx files, DXIMPORT/, separate from Grains' own WAV IMPORT/, see
+    // PerformanceStore::ImportDexedSyx()). Mutually exclusive with
+    // load_new_selected_ (Files is neither of these two) -- see the K1
+    // 3-way quantization in ApplyKnobs()'s own DexedParamPage::Preset
+    // case. dexed_import_browsing_: false = still at the top-level
+    // chooser, true = drilled into the flat file list (one level, unlike
+    // Files' own two -- there's no factory-category structure for an
+    // arbitrary SD folder).
+    bool dexed_import_selected_ = false;
+    bool dexed_import_browsing_ = false;
+    int  dexed_import_cursor_   = 0; // which .syx file is highlighted
+    char dexed_import_names_[kMaxImportFiles][PerformanceStore::kMaxImportSyxNameLen + 1] = {};
+    int  dexed_import_file_count_  = 0;
+    bool dexed_import_files_dirty_ = true; // forces one RefreshDexedImportFiles() on entry
+
+    // Caches the real name (DexedSynth::GetPresetDataName()) of whichever
+    // USER slot is currently highlighted while browsing "Load:" -- unlike
+    // a factory slot's name (read straight out of a const embedded array,
+    // free), a user slot's name lives inside its own saved file, so
+    // showing it means an SD read; caching by slot number means that
+    // only happens once per distinct slot the cursor lands on, not once
+    // per Draw() tick while sitting still on one. -2 (never a real slot
+    // number -- see ResolveDexedPresetSlot()'s own -1 "not found") means
+    // nothing is cached yet.
+    int  dexed_browse_name_slot_   = -2;
+    char dexed_browse_name_buf_[11] = {};
 
     // --- Dexed advanced editor (Screen::DexedOperator) -------------------
     // 0-5, array index into patch_[] (op*21) -- 0 = HW OP6, 5 = OP1, same

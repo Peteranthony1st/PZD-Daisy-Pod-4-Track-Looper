@@ -43,6 +43,15 @@ namespace
 // chords, unusual phase alignment, hotter-than-average patches), not
 // something routine playing runs into; overall loudness is what the
 // master volume knob (already reaching up to 1.43x at 100%) is for.
+//
+// Even doubled, this fixed scale alone still isn't enough margin for
+// the hottest real factory patches (confirmed on a real ROM1A patch
+// using max feedback=7 and near-unity output levels on every operator
+// -- fine alone, audibly compressing tanhf() once a second note
+// stacked on top). See voice_headroom_scale_ (dexed_synth.h) for the
+// per-block voice-count compensation layered on top of this fixed
+// scale to handle that case without turning down single-note loudness
+// on any patch.
 constexpr float kQ24Scale      = 1.f / (float)(1 << 24);
 constexpr float kHeadroomScale = 1.f / 8.82f;
 } // namespace
@@ -89,7 +98,7 @@ void DexedSynth::Init(float sample_rate)
     // below) -- both have to be configured for the wheel to actually
     // move anything.
     ctrls_.wheel.setRange(50);
-    ctrls_.wheel.setTarget(1); // bit0 = pitch
+    ApplyModWheelTarget(); // defaults to Pitch (bit0) -- same as the old hardcoded setTarget(1)
     ctrls_.refresh();
 
     // LFO pitch mod SENSITIVITY note: despite the name, patch byte 143
@@ -261,15 +270,26 @@ void DexedSynth::RenderQuantum()
     // pre-init()'d, never garbage) and already cheap for a silent one
     // (msfa's own internal gain threshold collapses its real per-sample
     // cost, no bookkeeping needed here to get that).
+    int held = 0;
     for(int i = 0; i < kMaxVoices; i++)
+    {
         voices_[i].note.compute(stage_i32_, lfo_val, lfo_delay, &ctrls_);
+        if(voices_[i].held_note != -1)
+            held++;
+    }
+
+    // See voice_headroom_scale_'s own comment -- a held note is untouched
+    // (1.0), a stacked chord tapers down smoothly via the standard
+    // "equal-power" 1/sqrt(N) curve on top of kHeadroomScale's own fixed
+    // margin.
+    voice_headroom_scale_ = held > 1 ? 1.f / sqrtf((float)held) : 1.f;
 
     stage_pos_ = 0;
 }
 
 DSY_ITCM_TEXT
 void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_send_l,
-                        float* reverb_send_r)
+                        float* reverb_send_r, float* delay_send_l, float* delay_send_r)
 {
     // Block-rate filter cutoff/res -- same curve/guard every other
     // engine's own bus filter uses (see GranularEngine::Process()).
@@ -286,13 +306,15 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
         filter_r_.SetRes(filter_res01_ * 0.9f);
     }
 
-    const float send = reverb_send01_;
+    const float send       = reverb_send01_;
+    const float delay_send = delay_send01_;
     for(size_t i = 0; i < size; i++)
     {
         if(stage_pos_ >= kMsfaBlock)
             RenderQuantum();
 
-        float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale;
+        float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale
+                  * voice_headroom_scale_;
         stage_pos_++;
 
         // Post-mix bus filter, same shape/position as GranularEngine's
@@ -342,6 +364,11 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
         {
             reverb_send_l[i] += sl * send;
             reverb_send_r[i] += sr * send;
+        }
+        if(delay_send > 0.f)
+        {
+            delay_send_l[i] += sl * delay_send;
+            delay_send_r[i] += sr * delay_send;
         }
     }
 }
@@ -428,6 +455,14 @@ void DexedSynth::SetPatchByte(int byte_index, uint8_t value)
     ApplyPatchToHeldVoices();
 }
 
+void DexedSynth::ApplyModWheelTarget()
+{
+    uint8_t bits = mod_wheel_target_ == ModWheelTarget::Pitch    ? 1  // bit0 = pitch
+                   : mod_wheel_target_ == ModWheelTarget::Amp    ? 2  // bit1 = amp
+                                                                  : 4; // bit2 = eg
+    ctrls_.wheel.setTarget(bits);
+}
+
 DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
 {
     DexedPresetData p;
@@ -438,6 +473,7 @@ DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
     p.filter_cutoff01 = filter_cutoff01_;
     p.filter_res01    = filter_res01_;
     p.pan01           = pan01_;
+    p.delay_send01    = delay_send01_;
     return p;
 }
 
@@ -520,6 +556,16 @@ void UnpackTrimmedVoiceName(const uint8_t* packed_voice, char out[11])
         out[i] = '\0';
 }
 } // namespace
+
+const char* DexedSynth::GetPresetDataName(const DexedPresetData& p)
+{
+    static char name_buf[11];
+    memcpy(name_buf, p.patch + 145, 10);
+    name_buf[10] = '\0';
+    for(int i = 9; i >= 0 && name_buf[i] == ' '; i--)
+        name_buf[i] = '\0';
+    return name_buf[0] != '\0' ? name_buf : "?";
+}
 
 const char* DexedSynth::GetFactoryPresetName(int flat_index)
 {

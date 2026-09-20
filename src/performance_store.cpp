@@ -1,4 +1,5 @@
 #include "performance_store.h"
+#include "dexed_sysex.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
@@ -81,6 +82,14 @@ void DexedPresetFilename(int slot, char* out, size_t out_size)
 void ImportWavFilename(const char* filename, char* out, size_t out_size)
 {
     snprintf(out, out_size, "IMPORT/%s", filename);
+}
+
+// Own subfolder for user-supplied DX7 .syx files, deliberately separate
+// from ImportWavFilename()'s own IMPORT/ so a Grains WAV listing and a
+// Dexed SysEx listing never mix into one folder.
+void ImportSyxFilename(const char* filename, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "DXIMPORT/%s", filename);
 }
 
 // Bare filename in the SD root (unlike PERFxxx.DAT/EXPnnn.wav, this one's
@@ -209,14 +218,43 @@ struct Resampler48to44_1
     }
 };
 
-// Mirror image of Resampler48to44_1 above for ImportWav()'s own 44100 ->
-// 48000 Hz upsampling -- same exact-ratio linear interpolation, just
-// kInRate/kOutRate swapped (48000/44100 reduces to the same 160/147 as
-// the other direction, just inverted).
+// Generalized version of the exact-ratio Catmull-Rom resampler formerly
+// hardcoded to 44100->48000 only (kept its original name/shape, just
+// with kInRate/kOutRate promoted from compile-time constants to runtime
+// members set by Init() -- widened to support importing any of the
+// common real-world WAV sample rates, not just 44.1/48kHz, per a real
+// user request). Init() reduces the (in_hz, out_hz) pair by their GCD
+// via the standard Euclidean algorithm, same "smallest exact integer
+// ratio" reasoning the original 147:160 constant already relied on --
+// keeps the in_count/out_count counters growing as slowly as possible
+// over a long import, and keeps kMaxEmit (below) a real, provable bound
+// rather than a guess.
 struct Resampler44_1to48
 {
-    static constexpr uint64_t kInRate  = 147;
-    static constexpr uint64_t kOutRate = 160;
+    uint64_t in_rate  = 147;
+    uint64_t out_rate = 160;
+
+    // Every rate this project's own ImportWav() format check accepts
+    // (8000..192000, see its own comment) reduces, against a fixed
+    // 48000 Hz output, to a ratio whose numerator is at most 6 (the
+    // 8000:48000 -> 1:6 case, the widest supported upsample) -- so at
+    // most 6 output samples are ever due per input sample. 8 leaves a
+    // real margin rather than sitting exactly on that computed bound.
+    static constexpr int kMaxEmit = 8;
+
+    void Init(uint32_t in_hz, uint32_t out_hz)
+    {
+        uint64_t a = in_hz, b = out_hz;
+        while(b != 0)
+        {
+            uint64_t t = b;
+            b          = a % b;
+            a          = t;
+        }
+        uint64_t gcd = a > 0 ? a : 1;
+        in_rate      = in_hz / gcd;
+        out_rate     = out_hz / gcd;
+    }
 
     // 4-sample rolling history (s0 oldest .. s3 newest) for Catmull-Rom
     // cubic interpolation, not the 2-point linear interpolation an
@@ -249,10 +287,11 @@ struct Resampler44_1to48
                   + (3.f * p1 - p0 - 3.f * p2 + p3) * t3);
     }
 
-    // Push one 44100 Hz sample. Writes up to 2 output (48000 Hz) samples
-    // into out_l/out_r (each must have room for 2) and returns how many
-    // were actually produced -- never more than 2 since kOutRate/kInRate
-    // (160/147) is < 2 (see the dropped-sample comment this replaced).
+    // Push one input-rate sample. Writes up to kMaxEmit output samples
+    // into out_l/out_r (each must have room for kMaxEmit) and returns
+    // how many were actually produced -- see kMaxEmit's own comment for
+    // why that bound is real, not a guess (see the dropped-sample
+    // comment this replaced for the general shape).
     //
     // in_count/out_count start at 0 and only ever advance from inside the
     // real-processing branch below, in lockstep with the (already
@@ -285,10 +324,10 @@ struct Resampler44_1to48
 
         int      emitted = 0;
         uint64_t n       = in_count + 1;
-        while(emitted < 2 && out_count * kInRate < n * kOutRate)
+        while(emitted < kMaxEmit && out_count * in_rate < n * out_rate)
         {
-            uint64_t base = in_count * kOutRate;
-            float    frac = (float)(out_count * kInRate - base) / (float)kOutRate;
+            uint64_t base = in_count * out_rate;
+            float    frac = (float)(out_count * in_rate - base) / (float)out_rate;
             out_l[emitted] = CatmullRom(s0_l, s1_l, s2_l, s3_l, frac);
             out_r[emitted] = CatmullRom(s0_r, s1_r, s2_r, s3_r, frac);
             out_count++;
@@ -348,15 +387,18 @@ struct LayerHeader
     float    effect_param_a01;
     float    effect_param_b01;
     float    reverb_send01; // Size is now a global FileHeader field, not per-layer
+    // Per-layer send into the shared delay bus (main.cpp's fx_delay_l/r).
+    // Unlike Size above, the delay's own shared Time/Feedback aren't
+    // saved anywhere yet (Ui-only state) -- a real gap, not fixed here.
+    float    delay_send01;
 };
 
-// Bumped 1 -> 2 -> ... -> 9 -> 10 as FileHeader/LayerHeader's layout
-// changed (most recently: removed every pad_* field -- a performance now
-// deals only with the looper, see FileHeader's own comment) -- Load()
+// Bumped 1 -> 2 -> ... -> 10 -> 11 as FileHeader/LayerHeader's layout
+// changed (most recently: added LayerHeader::delay_send01) -- Load()
 // already rejects a version mismatch cleanly (see below), so a
 // performance saved under an older version will correctly fail to load
 // rather than being misread. Same accepted tradeoff as every past bump.
-constexpr uint32_t kFileVersion = 10;
+constexpr uint32_t kFileVersion = 11;
 
 } // namespace
 
@@ -686,6 +728,7 @@ bool Save(int                slot,
         lh.effect_param_a01   = layer.GetEffectParamA01();
         lh.effect_param_b01   = layer.GetEffectParamB01();
         lh.reverb_send01      = layer.GetReverbSend01();
+        lh.delay_send01       = layer.GetDelaySend01();
 
         fr = f_write(&file, &lh, sizeof(lh), &bw);
         ok = fr == FR_OK && bw == sizeof(lh);
@@ -843,6 +886,7 @@ bool Load(int          slot,
         layer.SetEffectParamA01(lh.effect_param_a01);
         layer.SetEffectParamB01(lh.effect_param_b01);
         layer.SetReverbSend01(lh.reverb_send01);
+        layer.SetDelaySend01(lh.delay_send01);
 
         size_t len = lh.record_len;
         if(len > layer.GetBufferSize())
@@ -897,7 +941,7 @@ struct GranularPresetFileHeader
     uint32_t version;
     uint32_t audio_len;
 };
-constexpr uint32_t kGranularPresetFileVersion = 3; // bumped again: Scan split into 2 fields
+constexpr uint32_t kGranularPresetFileVersion = 9; // bumped again: added scan_gap01
 
 // Same shape as GranularPresetFileHeader above, own magic/version. No
 // audio, so no audio_len field -- just the header plus one raw
@@ -908,7 +952,7 @@ struct DexedPresetFileHeader
     char     magic[4]; // "DEXP"
     uint32_t version;
 };
-constexpr uint32_t kDexedPresetFileVersion = 1;
+constexpr uint32_t kDexedPresetFileVersion = 2; // bumped: added delay_send01
 } // namespace
 
 bool SaveGranularPreset(int                                       slot,
@@ -1277,11 +1321,14 @@ int ListDexedPresets(int* out_numbers, int max_out)
     return count;
 }
 
-int NextFreeDexedPresetSlot()
+int NextFreeDexedPresetSlot(int search_from)
 {
     if(!card_ready)
         return -1;
-    for(int slot = DexedSynth::GetNumFactoryPresets() + 1; slot <= kMaxDexedPresets; slot++)
+    int first = DexedSynth::GetNumFactoryPresets() + 1;
+    if(search_from > first)
+        first = search_from;
+    for(int slot = first; slot <= kMaxDexedPresets; slot++)
     {
         char    fname[24];
         FILINFO fno;
@@ -1501,15 +1548,24 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
     // several DAWs/export tools default to) -- widened from 16-bit-only
     // after a real user report: a commercial sample-pack loop (24-bit,
     // otherwise perfectly ordinary stereo/44.1kHz) failed to import with
-    // no path to fix it short of re-encoding on a computer first. Real
-    // sample rate conversion beyond the existing 44.1->48kHz case isn't
-    // attempted -- that's a separate, much bigger problem (arbitrary
-    // resampling) than "this bit depth/format isn't decoded yet".
+    // no path to fix it short of re-encoding on a computer first.
+    //
+    // Sample rate: any of the common real-world WAV rates, not just
+    // 48/44.1kHz -- widened per a real user request, using the same
+    // exact-ratio Catmull-Rom resampler already proven for 44.1->48kHz
+    // (see Resampler44_1to48's own comment), now generalized to any
+    // (rate, 48000) pair via Init()'s runtime GCD reduction. Rates above
+    // 48kHz (a genuine downsample) get a real anti-aliasing prefilter
+    // first -- see kNeedsAntiAlias below -- rates at or below 48kHz are
+    // pure upsampling, no aliasing risk, unchanged from before.
     bool format_ok = (audio_format == 1 && (bits_per_sample == 16 || bits_per_sample == 24
                                               || bits_per_sample == 32))
                       || (audio_format == 3 && bits_per_sample == 32);
-    if(!format_ok || (num_channels != 1 && num_channels != 2)
-       || (sample_rate != 48000 && sample_rate != 44100))
+    bool rate_ok = sample_rate == 8000 || sample_rate == 11025 || sample_rate == 16000
+                   || sample_rate == 22050 || sample_rate == 24000 || sample_rate == 32000
+                   || sample_rate == 44100 || sample_rate == 48000 || sample_rate == 88200
+                   || sample_rate == 96000 || sample_rate == 176400 || sample_rate == 192000;
+    if(!format_ok || (num_channels != 1 && num_channels != 2) || !rate_ok)
     {
         // Not a FatFS error -- the file itself is a format this importer
         // doesn't handle (see ImportWav()'s own doc comment for exactly
@@ -1543,9 +1599,47 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
     if(data_size > bytes_left_in_file)
         data_size = bytes_left_in_file;
 
-    bool   need_resample = sample_rate == 44100;
+    bool   need_resample = sample_rate != 48000;
     static Resampler44_1to48 resampler; // see the DTCMRAM/DMA comment on Save() above
     resampler = Resampler44_1to48{};
+    resampler.Init(sample_rate, 48000);
+
+    // Anti-aliasing prefilter -- only engaged for a genuine downsample
+    // (source rate above 48kHz: 88.2/96/176.4/192kHz). Rates at or below
+    // 48kHz are pure upsampling (unchanged from the original 44.1kHz-
+    // only behavior) with no aliasing risk, so this stays a no-op there.
+    // Two cascaded daisysp::Svf lowpass stages (same filter class every
+    // other engine in this project already uses, just reused here
+    // offline) for a real ~24dB/octave rolloff -- a single one-pole
+    // stage's gentler ~6dB/octave was judged too weak to meaningfully
+    // suppress content above the new 24kHz Nyquist on a real downsample
+    // (e.g. 192kHz has up to 96kHz of content to fold down), without
+    // going as far as a full windowed-sinc filter (this project's own
+    // established "next step up if this still isn't enough" boundary --
+    // see Resampler44_1to48's own comment). Cutoff set just under the
+    // new Nyquist, not source-rate-dependent, since it only ever runs
+    // when downsampling to this same fixed 48kHz output.
+    bool kNeedsAntiAlias = sample_rate > 48000;
+    static daisysp::Svf aa_l1, aa_r1, aa_l2, aa_r2;
+    if(kNeedsAntiAlias)
+    {
+        aa_l1 = daisysp::Svf{};
+        aa_r1 = daisysp::Svf{};
+        aa_l2 = daisysp::Svf{};
+        aa_r2 = daisysp::Svf{};
+        aa_l1.Init((float)sample_rate);
+        aa_r1.Init((float)sample_rate);
+        aa_l2.Init((float)sample_rate);
+        aa_r2.Init((float)sample_rate);
+        aa_l1.SetFreq(21000.f);
+        aa_r1.SetFreq(21000.f);
+        aa_l2.SetFreq(21000.f);
+        aa_r2.SetFreq(21000.f);
+        aa_l1.SetRes(0.f);
+        aa_r1.SetRes(0.f);
+        aa_l2.SetRes(0.f);
+        aa_r2.SetRes(0.f);
+    }
 
     // Raw bytes, not int16_t -- unlike the 16-bit-only version of this
     // function, the sample width varies by file (2/3/4 bytes), so this
@@ -1626,7 +1720,16 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
             }
             else
             {
-                float rl[2], rr[2];
+                if(kNeedsAntiAlias)
+                {
+                    aa_l1.Process(l);
+                    aa_r1.Process(r);
+                    aa_l2.Process(aa_l1.Low());
+                    aa_r2.Process(aa_r1.Low());
+                    l = aa_l2.Low();
+                    r = aa_r2.Low();
+                }
+                float rl[Resampler44_1to48::kMaxEmit], rr[Resampler44_1to48::kMaxEmit];
                 int   n = resampler.Push(l, r, rl, rr);
                 for(int k = 0; k < n && written < audio_capacity; k++)
                 {
@@ -1680,6 +1783,320 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
     return ok && close_res == FR_OK;
 }
 
+int ListImportSyxFiles(char out_names[][kMaxImportSyxNameLen + 1], int max_out)
+{
+    if(!card_ready)
+        return 0;
+    static DIR dir; // see the DTCMRAM/DMA comment on Save() above
+    if(f_opendir(&dir, "DXIMPORT") != FR_OK)
+        return 0; // no DXIMPORT/ folder yet -- not an error, just nothing to list
+
+    int            count = 0;
+    static FILINFO fno; // see the DTCMRAM/DMA comment on Save() above
+    while(count < max_out)
+    {
+        if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0)
+            break; // error or end of directory
+        if(fno.fattrib & AM_DIR)
+            continue;
+        if(fno.fname[0] == '.' && fno.fname[1] == '_')
+            continue; // macOS AppleDouble sidecar file, see ListImportWavFiles()'s own comment
+        size_t len = strlen(fno.fname);
+        if(len < 4)
+            continue; // too short for a ".syx" extension
+        char ext[5];
+        for(int i = 0; i < 4; i++)
+            ext[i] = (char)tolower((unsigned char)fno.fname[len - 4 + i]);
+        ext[4] = '\0';
+        if(strcmp(ext, ".syx") != 0)
+            continue;
+        if(len > kMaxImportSyxNameLen)
+            continue; // skip, don't truncate -- see this function's doc comment
+        snprintf(out_names[count], kMaxImportSyxNameLen + 1, "%s", fno.fname);
+        count++;
+    }
+    f_closedir(&dir);
+    return count;
+}
+
+namespace
+{
+// 7-bit DX7 SysEx checksum: sum every data byte mod 128, then negate
+// within 7 bits -- the same algorithm the spec defines for both the
+// Single Voice and 32-Voice Bulk dump formats.
+uint8_t Dx7SysexChecksum(const uint8_t* data, size_t len)
+{
+    uint8_t sum = 0;
+    for(size_t i = 0; i < len; i++)
+        sum = (uint8_t)((sum + data[i]) & 0x7F);
+    return (uint8_t)((0x80 - sum) & 0x7F);
+}
+} // namespace
+
+bool ImportDexedSyx(const char*                  filename,
+                    DexedSynth::DexedPresetData out_presets[kMaxSyxBulkVoices],
+                    int*                         out_count)
+{
+    if(!out_count)
+        return false;
+    *out_count = 0;
+    if(!card_ready || !filename || !out_presets)
+    {
+        // Real bug fixed here: this early guard used to return false
+        // WITHOUT ever calling SetError()/ClearError() -- if a PRIOR
+        // call had left a stale message in last_error, this path would
+        // silently keep showing that same old message forever, making a
+        // genuinely-fixed problem look like it was still happening.
+        snprintf(last_error, sizeof(last_error), "badcall");
+        return false;
+    }
+
+    char fname[64];
+    ImportSyxFilename(filename, fname, sizeof(fname));
+
+    ClearError();
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_READ);
+    if(fr != FR_OK)
+    {
+        SetError("open", fr);
+        return false;
+    }
+
+    // 32-voice bulk (4104 bytes) is the largest real shape read here --
+    // static, see the DTCMRAM/DMA comment on Save() above (f_read() into
+    // a plain stack-local silently fails the DMA transfer on this
+    // target, leaving garbage behind while still reporting FR_OK).
+    constexpr UINT kMaxSyxFileBytes = 6 + kMaxSyxBulkVoices * 128 + 2;
+    static uint8_t buf[kMaxSyxFileBytes];
+
+    // Real bug, confirmed on hardware (a byte-perfect file on the card,
+    // verified independently on a computer, still had its own leading
+    // byte come back missing -- everything after it shifted down by
+    // one): a single large (whole-sector-multiple OR mixed) f_read()
+    // starting at file offset 0 comes back corrupted on this hardware,
+    // while an isolated 1-byte probe read at the same offset came back
+    // correct every time. Splitting into "one sector-aligned call, one
+    // small remainder call" (an earlier attempt) did NOT fix it either
+    // -- confirmed on real hardware -- meaning the trigger is a large
+    // direct-to-caller-buffer transfer specifically, not how it's split.
+    // So this sidesteps that code path entirely: read the whole file in
+    // small chunks (well under the SD card's own 512-byte sector size),
+    // the same shape as the proven-working probe read, every single
+    // time -- slower than one big transfer, but this is a one-off
+    // preset import, not a hot path, so it doesn't matter.
+    constexpr UINT kReadChunk = 128;
+    UINT           br         = 0;
+    while(br < sizeof(buf))
+    {
+        UINT want = sizeof(buf) - br;
+        if(want > kReadChunk)
+            want = kReadChunk;
+        UINT got = 0;
+        fr        = f_read(&file, buf + br, want, &got);
+        if(fr != FR_OK)
+            break;
+        br += got;
+        if(got < want)
+            break; // hit EOF
+    }
+    f_close(&file);
+    if(fr != FR_OK)
+    {
+        SetError("read", fr);
+        return false;
+    }
+    // -- Frame validation: F0 43 0S ff bb bb <data...> cs F7 -- see this
+    // function's own doc comment in performance_store.h for the two
+    // recognized ff/bb-bb shapes (single voice / 32-voice bulk). Nothing
+    // past this point is trusted until the length AND checksum both
+    // check out.
+    if(br < 8 || buf[0] != 0xF0 || buf[1] != 0x43)
+    {
+        // Rich diagnostic, kept short enough to fully fit on the 128px
+        // display -- if chunked reading (above) still doesn't fix this,
+        // seeing the actual bytes narrows it further than a bare name.
+        snprintf(last_error, sizeof(last_error), "h%02X%02X n%u", buf[0], buf[1], (unsigned)br);
+        return false;
+    }
+    uint8_t format     = buf[3];
+    int     byte_count = ((int)buf[4] << 7) | buf[5];
+    size_t  total_len  = 6 + (size_t)byte_count + 2; // header + data + checksum + F7
+
+    if(byte_count < 0 || total_len != (size_t)br || buf[total_len - 1] != 0xF7)
+    {
+        snprintf(last_error, sizeof(last_error), "len%d/%u f%02X", byte_count, (unsigned)br,
+                  format);
+        return false;
+    }
+
+    const uint8_t* data     = buf + 6;
+    uint8_t        checksum = buf[6 + byte_count];
+    if(Dx7SysexChecksum(data, (size_t)byte_count) != checksum)
+    {
+        SetError("syxcs", FR_INVALID_PARAMETER);
+        return false;
+    }
+
+    if(format == 0x00 && byte_count == 155)
+    {
+        // Single Voice Dump -- already this project's own unpacked
+        // patch_[] layout byte-for-byte (see this function's doc
+        // comment), no DexedSysex::UnpackVoice() step needed.
+        DexedSynth::DexedPresetData p;
+        memcpy(p.patch, data, 155);
+        p.patch[155]   = 0;
+        out_presets[0] = p;
+        *out_count     = 1;
+        return true;
+    }
+    else if(format == 0x09 && byte_count == kMaxSyxBulkVoices * 128)
+    {
+        for(int v = 0; v < kMaxSyxBulkVoices; v++)
+        {
+            DexedSynth::DexedPresetData p;
+            DexedSysex::UnpackVoice(data + v * 128, p.patch);
+            out_presets[v] = p;
+        }
+        *out_count = kMaxSyxBulkVoices;
+        return true;
+    }
+
+    SetError("syxfmt", FR_INVALID_PARAMETER);
+    return false;
+}
+
+namespace
+{
+// Own subfolder + numbering, same probe-based shape every other
+// numbered slot in this file uses (see DexedPresetFilename() etc.) --
+// one file per completed SysEx import, not one shared/appended
+// manifest, so a single import's own folder record can be found,
+// backed up, or manually removed independently of every other one.
+void DexedImportFolderFilename(int slot, char* out, size_t out_size)
+{
+    snprintf(out, out_size, "DEXP/IMPORTS/IMP%03d.DAT", slot);
+}
+
+// One-time compatibility step: an earlier version of this feature kept
+// every import folder appended in a single shared "DEXP/IMPORTS.DAT"
+// file instead of one file per import. If that file still exists,
+// split its records out into the new per-file scheme (so an import
+// made under the old scheme keeps its own folder instead of silently
+// falling back into the plain User list) and remove it -- this only
+// ever does real work once; every subsequent boot finds nothing there
+// and returns immediately.
+void MigrateOldDexedImportManifest()
+{
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    if(f_open(&file, "DEXP/IMPORTS.DAT", FA_READ) != FR_OK)
+        return; // nothing to migrate -- not an error
+
+    f_mkdir("DEXP/IMPORTS");
+    for(;;)
+    {
+        DexedImportFolder rec;
+        UINT              br = 0;
+        if(f_read(&file, &rec, sizeof(rec), &br) != FR_OK || br != sizeof(rec))
+            break;
+        for(int slot = 1; slot <= kMaxDexedImportFolders; slot++)
+        {
+            char fname[40];
+            DexedImportFolderFilename(slot, fname, sizeof(fname));
+            FILINFO fno;
+            if(f_stat(fname, &fno) == FR_OK)
+                continue; // already taken, try the next slot
+            static FIL out_file; // see the DTCMRAM/DMA comment on Save() above
+            if(f_open(&out_file, fname, FA_CREATE_ALWAYS | FA_WRITE) == FR_OK)
+            {
+                UINT bw = 0;
+                f_write(&out_file, &rec, sizeof(rec), &bw);
+                f_close(&out_file);
+            }
+            break;
+        }
+    }
+    f_close(&file);
+    f_unlink("DEXP/IMPORTS.DAT"); // done -- never migrate again
+}
+} // namespace
+
+bool SaveDexedImportFolder(const char* name, int first_slot, int last_slot)
+{
+    if(!card_ready || !name)
+        return false;
+    ClearError();
+    f_mkdir("DEXP"); // harmless if it already exists -- SaveDexedPreset() usually made it first
+    f_mkdir("DEXP/IMPORTS");
+    MigrateOldDexedImportManifest();
+
+    int slot = -1;
+    for(int s = 1; s <= kMaxDexedImportFolders; s++)
+    {
+        char    fname[40];
+        FILINFO fno;
+        DexedImportFolderFilename(s, fname, sizeof(fname));
+        if(f_stat(fname, &fno) != FR_OK)
+        {
+            slot = s;
+            break;
+        }
+    }
+    if(slot < 0)
+    {
+        SetError("ifull", FR_DENIED);
+        return false;
+    }
+
+    DexedImportFolder rec = {};
+    snprintf(rec.name, sizeof(rec.name), "%s", name);
+    rec.first_slot = first_slot;
+    rec.last_slot  = last_slot;
+
+    char fname[40];
+    DexedImportFolderFilename(slot, fname, sizeof(fname));
+    static FIL file; // see the DTCMRAM/DMA comment on Save() above
+    FRESULT    fr = f_open(&file, fname, FA_CREATE_ALWAYS | FA_WRITE);
+    if(fr != FR_OK)
+    {
+        SetError("iopen", fr);
+        return false;
+    }
+    UINT bw = 0;
+    fr      = f_write(&file, &rec, sizeof(rec), &bw);
+    f_close(&file);
+    if(fr != FR_OK || bw != sizeof(rec))
+    {
+        SetError("iwrite", fr);
+        return false;
+    }
+    return true;
+}
+
+int ListDexedImportFolders(DexedImportFolder* out, int max_out)
+{
+    if(!card_ready || !out)
+        return 0;
+    MigrateOldDexedImportManifest();
+
+    int count = 0;
+    for(int s = 1; s <= kMaxDexedImportFolders && count < max_out; s++)
+    {
+        char fname[40];
+        DexedImportFolderFilename(s, fname, sizeof(fname));
+        static FIL file; // see the DTCMRAM/DMA comment on Save() above
+        if(f_open(&file, fname, FA_READ) != FR_OK)
+            continue; // this slot number was never used -- not an error
+        DexedImportFolder rec;
+        UINT              br = 0;
+        FRESULT           fr = f_read(&file, &rec, sizeof(rec), &br);
+        f_close(&file);
+        if(fr == FR_OK && br == sizeof(rec))
+            out[count++] = rec;
+    }
+    return count;
+}
+
 bool ExportWav(TempoClock&  tempo,
               LooperLayer* layers,
               int          num_layers,
@@ -1687,6 +2104,8 @@ bool ExportWav(TempoClock&  tempo,
               float        master_filter_cutoff01,
               float        master_filter_res01,
               float        reverb_size01,
+              float        delay_time01,
+              float        delay_feedback01,
               bool         for_microdexed,
               float        project_speed,
               ProgressFn   on_progress)
@@ -1838,6 +2257,39 @@ bool ExportWav(TempoClock&  tempo,
     export_reverb.SetLpFreq(9000.f); // fixed damping, matches the live default
     export_reverb.SetFeedback(Clampf(reverb_size01, 0.f, 1.f));
 
+    // Local shared delay bus, mirroring main.cpp's fx_delay_l/r -- same
+    // cross-feedback ("ping-pong") pair, same reasoning as export_reverb
+    // above for why this is static/SDRAM-placed/re-zeroed every call.
+    // kExportMaxDelaySamples must match main.cpp's own kMaxDelaySamples
+    // (1.5s @ 48kHz) -- not shared via a header since neither file
+    // exposes its constant, just kept in sync by this comment.
+    constexpr size_t kExportMaxDelaySamples = 72000;
+    static daisysp::DelayLine<float, kExportMaxDelaySamples> DSY_SDRAM_BSS export_delay_l;
+    static daisysp::DelayLine<float, kExportMaxDelaySamples> DSY_SDRAM_BSS export_delay_r;
+    memset(&export_delay_l, 0, sizeof(export_delay_l));
+    memset(&export_delay_r, 0, sizeof(export_delay_r));
+    export_delay_l.Init();
+    export_delay_r.Init();
+    // Same Time curve/Feedback cap as main.cpp's AudioCallback() -- see
+    // its own comment for why Time is exponential (more resolution at
+    // short, slapback-style delays) and Feedback is capped below 1.0.
+    constexpr float kExportMinDelayMs = 20.f;
+    constexpr float kExportMaxDelayMs = (float)kExportMaxDelaySamples / 48000.f * 1000.f;
+    constexpr float kExportMaxDelayFeedback = 0.9f;
+    float export_delay_ms = kExportMinDelayMs
+                             * powf(kExportMaxDelayMs / kExportMinDelayMs,
+                                     Clampf(delay_time01, 0.f, 1.f));
+    float export_delay_samples = export_delay_ms * 0.001f * (float)sample_rate;
+    export_delay_samples
+        = export_delay_samples < 1.f
+              ? 1.f
+              : export_delay_samples > (float)kExportMaxDelaySamples - 1.f
+                    ? (float)kExportMaxDelaySamples - 1.f
+                    : export_delay_samples;
+    export_delay_l.SetDelay(export_delay_samples);
+    export_delay_r.SetDelay(export_delay_samples);
+    float export_delay_feedback = Clampf(delay_feedback01, 0.f, 1.f) * kExportMaxDelayFeedback;
+
     // Dummy input/ticks for the offline Process() calls below -- a
     // Playing-state layer never reads either (confirmed against
     // LooperLayer::Process()'s Playing/Paused/Overdubbing block), so an
@@ -1851,6 +2303,11 @@ bool ExportWav(TempoClock&  tempo,
     static float   chunk_r[kChunkSamples];
     static float   reverb_send_l[kChunkSamples];
     static float   reverb_send_r[kChunkSamples];
+    // Same idea as reverb_send_l/r above, now processed through
+    // export_delay_l/r below (mirroring main.cpp's fx_delay_l/r) so
+    // exported WAVs include Delay too, not just Reverb.
+    static float   delay_send_l[kChunkSamples];
+    static float   delay_send_r[kChunkSamples];
     static int16_t pcm_chunk[kChunkSamples * 2];
 
     // Two full passes over the loop: pass 0 is a throwaway priming pass
@@ -1902,13 +2359,16 @@ bool ExportWav(TempoClock&  tempo,
                 chunk_r[i]        = 0.f;
                 reverb_send_l[i]  = 0.f;
                 reverb_send_r[i]  = 0.f;
+                delay_send_l[i]   = 0.f;
+                delay_send_r[i]   = 0.f;
             }
             float* out_ptrs[2]         = {chunk_l, chunk_r};
             float* reverb_send_ptrs[2] = {reverb_send_l, reverb_send_r};
+            float* delay_send_ptrs[2]  = {delay_send_l, delay_send_r};
 
             for(int L = 0; L < num_layers; L++)
-                layers[L].Process(in_ptrs, out_ptrs, reverb_send_ptrs, n, dummy_ticks, tempo,
-                                    project_speed);
+                layers[L].Process(in_ptrs, out_ptrs, reverb_send_ptrs, delay_send_ptrs, n,
+                                    dummy_ticks, tempo, project_speed);
 
             for(UINT i = 0; i < n; i++)
             {
@@ -1916,6 +2376,17 @@ bool ExportWav(TempoClock&  tempo,
                 export_reverb.Process(reverb_send_l[i], reverb_send_r[i], &rev_wet_l, &rev_wet_r);
                 chunk_l[i] += rev_wet_l;
                 chunk_r[i] += rev_wet_r;
+
+                // Same cross-feedback delay as main.cpp's AudioCallback()
+                // -- read both lines before either Write() so the ping-
+                // pong feedback uses this sample's actual output, not a
+                // half-updated value from writing one channel first.
+                float delay_wet_l = export_delay_l.Read();
+                float delay_wet_r = export_delay_r.Read();
+                export_delay_l.Write(delay_send_l[i] + delay_wet_r * export_delay_feedback);
+                export_delay_r.Write(delay_send_r[i] + delay_wet_l * export_delay_feedback);
+                chunk_l[i] += delay_wet_l;
+                chunk_r[i] += delay_wet_r;
 
                 float l = chunk_l[i];
                 float r = chunk_r[i];

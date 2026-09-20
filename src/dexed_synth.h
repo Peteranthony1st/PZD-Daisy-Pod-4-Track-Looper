@@ -67,6 +67,37 @@ class DexedSynth
         ctrls_.modwheel_cc = (uint8_t)(v01 * 127.f + 0.5f);
     }
 
+    // Real DX7 hardware routing (msfa's own Controllers::wheel/FmMod, see
+    // controllers.h) -- the mod wheel can target Pitch (vibrato, the
+    // default), Amp (tremolo-style amplitude modulation), or EG Bias (the
+    // mod source biases the envelope's own level dynamically). Real DX7
+    // hardware lets these combine as a bitmask (setTarget() takes
+    // pitch|amp<<1|eg<<2); this exposes them as a single Button-cycled
+    // choice instead, matching the simpler "pick one" idiom every other
+    // cycled control in this project already uses -- not a hardware
+    // limitation, just a UI scope choice.
+    enum class ModWheelTarget
+    {
+        Pitch,
+        Amp,
+        EgBias
+    };
+    void CycleModWheelTarget()
+    {
+        mod_wheel_target_ = (ModWheelTarget)(((int)mod_wheel_target_ + 1) % 3);
+        ApplyModWheelTarget();
+    }
+    ModWheelTarget GetModWheelTarget() const { return mod_wheel_target_; }
+    const char*    GetModWheelTargetName() const
+    {
+        switch(mod_wheel_target_)
+        {
+            case ModWheelTarget::Pitch: return "Pitch";
+            case ModWheelTarget::Amp: return "Amp";
+            default: return "EG";
+        }
+    }
+
     // Same WRITES-not-adds / reverb-send-ADDS convention as every other
     // engine's own Process() in this project (see the removed FmSynth::
     // Process()'s doc comment) -- main.cpp needs this exact out_l/out_r
@@ -77,10 +108,15 @@ class DexedSynth
     // not a multiple of 48) via a small staging buffer -- see
     // dexed_synth.cpp's own comment.
     void Process(size_t size, float* out_l, float* out_r, float* reverb_send_l,
-                 float* reverb_send_r);
+                 float* reverb_send_r, float* delay_send_l, float* delay_send_r);
 
     void  SetReverbSend01(float v01) { reverb_send01_ = v01; }
     float GetReverbSend01() const { return reverb_send01_; }
+    // Own independent send into the shared delay bus (main.cpp's
+    // fx_delay_l/r) -- same relationship to it that Reverb Send above has
+    // to fx_reverb_shared, added on Dexed's own new FX page.
+    void  SetDelaySend01(float v01) { delay_send01_ = v01; }
+    float GetDelaySend01() const { return delay_send01_; }
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
@@ -169,6 +205,11 @@ class DexedSynth
         // via this trailing default, same convention PadSynth's own
         // tune01/pan01 fields used when they were added later.
         float   pan01 = 0.5f;
+        // Added once the shared delay bus existed -- same trailing-field/
+        // 0.0-default convention pan01 above used, so every
+        // DexedPresetData written before this field existed still gets a
+        // sensible "no delay" default.
+        float   delay_send01 = 0.f;
     };
     void ApplyPreset(const DexedPresetData& p)
     {
@@ -177,6 +218,7 @@ class DexedSynth
         SetFilterCutoff01(p.filter_cutoff01);
         SetFilterResonance01(p.filter_res01);
         SetPan01(p.pan01);
+        SetDelaySend01(p.delay_send01);
     }
     DexedPresetData CapturePreset() const;
 
@@ -197,6 +239,23 @@ class DexedSynth
     static DexedPresetData  GetFactoryPreset(int flat_index); // 0-based; unpacks on demand
     static const char*      GetFactoryPresetName(int flat_index); // reads the patch's own real name bytes
     static constexpr int kNumFactoryCategories = kDexedNumFactoryCategories;
+    static constexpr int kNumRomCategories     = kDexedNumRomCategories;
+
+    // Reads the same 10-character voice name (patch bytes 145-154, see
+    // dexed_sysex.h's own layout comment) out of a DexedPresetData that's
+    // already been decoded and is sitting in memory -- unlike
+    // GetFactoryPresetName() (which unpacks a factory bank's own packed
+    // bytes on demand), this never touches the SD card or the factory
+    // banks: it's for USER slots, whose DexedPresetData already carries
+    // its real name (a manual "Save New" keeps whatever name was in the
+    // live patch_ at save time; a SysEx import keeps the bank's own
+    // original name verbatim) even though the preset browser never used
+    // to display it. Trimmed the same way (trailing spaces stripped),
+    // returns "?" for an all-blank/default name so an empty result is
+    // never mistaken for a real one. Own static buffer, separate from
+    // GetFactoryPresetName()'s, so both can be used in the same
+    // expression safely.
+    static const char* GetPresetDataName(const DexedPresetData& p);
 
     // The real, committed voice count -- chosen from Phase 2's own
     // hardware CPU measurement (see the class doc comment above), not a
@@ -264,8 +323,23 @@ class DexedSynth
     float brightness01_ = 0.5f;
     float env_speed01_  = 0.5f;
 
+    // Voice-count headroom compensation -- recomputed once per
+    // RenderQuantum() from how many voices are actually held right now
+    // (held_note != -1). A single held note is untouched (1.0); a
+    // patch that's fine alone can still push kHeadroomScale's own
+    // already-tuned worst-case margin into audible tanhf() compression
+    // once a second note stacks on top of it, particularly patches
+    // using heavy feedback (e.g. a real factory patch with feedback=7
+    // measured this way) -- see kHeadroomScale's own comment. 1/sqrt(N)
+    // is the standard "equal-power" voice-count curve, applied on top
+    // of that existing fixed scale, not instead of it.
+    float voice_headroom_scale_ = 1.f;
+
     float sample_rate_     = 48000.f;
     float reverb_send01_   = 0.f;
+    float delay_send01_    = 0.f;
+    ModWheelTarget mod_wheel_target_ = ModWheelTarget::Pitch;
+    void           ApplyModWheelTarget();
     // Same default every other engine in this project uses -- real
     // headroom safety against the additive test patch's occasional
     // constructive-interference peaks comes from Process()'s own soft

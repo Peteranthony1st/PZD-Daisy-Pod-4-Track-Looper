@@ -11,6 +11,7 @@ inline float Clampf(float v, float lo, float hi)
 {
     return v < lo ? lo : (v > hi ? hi : v);
 }
+constexpr float kPi = 3.14159265358979323846f;
 // kFilterMinHz/kFilterMaxHz now live in looper_layer.h (public), shared
 // with main.cpp's master-bus filter.
 } // namespace
@@ -105,7 +106,14 @@ void LooperLayer::OnRecordButtonPressed(TempoClock& tempo)
             break;
         case LayerState::Playing: state_ = LayerState::Paused; break;
         case LayerState::Paused: state_ = LayerState::Playing; break;
-        case LayerState::Overdubbing: break; // release ends it, not a tap
+        // Manual early stop -- same idiom as Recording's own above, now
+        // that overdub runs one full pass automatically instead of
+        // lasting exactly as long as the button stays held (see
+        // OnRecordButtonLongPress()'s comment).
+        case LayerState::Overdubbing: state_ = LayerState::Playing; break;
+        case LayerState::ArmedOverdubCountIn:
+            state_ = LayerState::Playing; // cancel the count-in
+            break;
     }
 }
 
@@ -129,12 +137,20 @@ void LooperLayer::OnRecordButtonLongPress(TempoClock& tempo)
             break;
         case LayerState::Playing:
         case LayerState::Paused:
-            state_ = LayerState::Overdubbing;
-            // Fresh interpolation state -- don't blend the first sample
-            // of this overdub against whatever was captured the last
-            // time this layer recorded or overdubbed.
-            prev_input_sample_l_ = 0.f;
-            prev_input_sample_r_ = 0.f;
+            // Arms a count-in exactly like Empty's own case above,
+            // instead of jumping straight into Overdubbing -- a real
+            // user report ("the original recording and the overdub were
+            // about 1 beat late... can't we set it to also have a 4 beat
+            // count in like layer record?") wanted overdub to start
+            // precisely on a downbeat too, not whenever the button
+            // physically got pressed. Process()'s own
+            // ArmedOverdubCountIn handling below is what actually flips
+            // this to Overdubbing once the count-in finishes, and seeds
+            // overdub_remaining_ so it runs one full pass automatically
+            // -- see that state's own comment for why holding the button
+            // the whole time is no longer needed either.
+            state_ = LayerState::ArmedOverdubCountIn;
+            tempo.RequestRecordStart();
             break;
         default: break;
     }
@@ -142,8 +158,13 @@ void LooperLayer::OnRecordButtonLongPress(TempoClock& tempo)
 
 void LooperLayer::OnRecordButtonReleased()
 {
-    if(state_ == LayerState::Overdubbing)
-        state_ = LayerState::Playing;
+    // Intentionally empty now -- overdub used to last exactly as long as
+    // the button stayed held (ending right here, on release), but now
+    // runs one full pass automatically once armed (see
+    // OnRecordButtonLongPress()'s comment), so releasing the button no
+    // longer needs to do anything. Kept (rather than removed, along with
+    // Ui::OnButton1Release()'s own call to it) as a real hook for any
+    // future long-press-then-release gesture on this same button.
 }
 
 // --- Continuous controls --------------------------------------------------
@@ -171,6 +192,31 @@ void LooperLayer::SetSpeed01(float v)
         return;
     speed01_ = Clampf(v, 0.f, 1.f);
     speed_   = SpeedCurve01(speed01_);
+}
+
+void LooperLayer::SetFreezeActive(bool active)
+{
+    freeze_active_ = active;
+    if(active)
+    {
+        // Anchor the frozen window at wherever playback currently sits,
+        // fresh phase so it starts a clean fade-in from silence (see the
+        // Hann envelope in Process()) rather than picking up mid-cycle.
+        freeze_anchor_ = play_pos_;
+        freeze_phase_  = 0.f;
+    }
+}
+
+void LooperLayer::NudgeFreeze(float delta_samples)
+{
+    if(record_len_ == 0)
+        return;
+    freeze_anchor_ += delta_samples;
+    while(freeze_anchor_ >= (float)record_len_)
+        freeze_anchor_ -= (float)record_len_;
+    while(freeze_anchor_ < 0.f)
+        freeze_anchor_ += (float)record_len_;
+    freeze_phase_ = 0.f;
 }
 
 void LooperLayer::SetFilterCutoff01(float v)
@@ -225,6 +271,11 @@ void LooperLayer::SetEffectParamB01(float v)
 void LooperLayer::SetReverbSend01(float v)
 {
     reverb_send_ = Clampf(v, 0.f, 1.f);
+}
+
+void LooperLayer::SetDelaySend01(float v)
+{
+    delay_send_ = Clampf(v, 0.f, 1.f);
 }
 
 // --- Save/load ------------------------------------------------------------
@@ -344,6 +395,7 @@ DSY_ITCM_TEXT
 void LooperLayer::Process(AudioHandle::InputBuffer  in,
                           AudioHandle::OutputBuffer out,
                           AudioHandle::OutputBuffer reverb_send_out,
+                          AudioHandle::OutputBuffer delay_send_out,
                           size_t                    size,
                           const TempoClock::TempoTick* ticks,
                           TempoClock&                  tempo,
@@ -376,6 +428,30 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 // scheme degenerates to the original plain write_idx_++
                 // behavior at project_speed==1.0. See the write loop below.
                 record_write_phase_  = -project_speed;
+                prev_input_sample_l_ = 0.f;
+                prev_input_sample_r_ = 0.f;
+            }
+        }
+
+        if(state_ == LayerState::ArmedOverdubCountIn)
+        {
+            // Keeps outputting this layer's already-recorded audio the
+            // whole time -- see the "audible" check further below, which
+            // treats this state the same as Playing/Paused -- unlike
+            // ArmedCountIn above, there's nothing to reset here, just a
+            // wait for the same count-in to finish.
+            if(tick.record_start)
+            {
+                state_ = LayerState::Overdubbing;
+                // One full pass, same target the base recording itself
+                // used (record_len_ was set to exactly this at the time
+                // -- see target_len_'s own comment) -- auto-stops back to
+                // Playing once this reaches 0, in the overdub-write block
+                // below.
+                overdub_remaining_ = (float)record_len_;
+                // Fresh interpolation state -- don't blend the first
+                // sample of this overdub against whatever was captured
+                // the last time this layer recorded or overdubbed.
                 prev_input_sample_l_ = 0.f;
                 prev_input_sample_r_ = 0.f;
             }
@@ -490,9 +566,18 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             }
             prev_input_sample_l_ = sample_l;
             prev_input_sample_r_ = sample_r;
+
+            // Auto-stop after exactly one full pass -- same "runs a
+            // fixed native-space duration, not tied to the button"
+            // shape as Recording's own write_idx_ >= target_len_ check,
+            // see overdub_remaining_'s own comment.
+            overdub_remaining_ -= effective_speed;
+            if(overdub_remaining_ <= 0.f)
+                state_ = LayerState::Playing;
         }
 
         if((state_ == LayerState::Playing || state_ == LayerState::Overdubbing
+            || state_ == LayerState::ArmedOverdubCountIn
             || state_ == LayerState::Paused)
            && record_len_ > 0)
         {
@@ -501,16 +586,65 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             // time it's paused, instead of freezing and then resuming
             // from a stale position that's drifted out of sync with
             // every other (still-running) layer.
-            bool audible = state_ == LayerState::Playing || state_ == LayerState::Overdubbing;
+            bool audible = state_ == LayerState::Playing || state_ == LayerState::Overdubbing
+                           || state_ == LayerState::ArmedOverdubCountIn;
 
             if(audible)
             {
-                int   idx0 = (int)play_pos_;
-                int   idx1 = (idx0 + 1) % (int)record_len_;
-                float frac = play_pos_ - idx0;
+                float raw_l, raw_r;
 
-                float raw_l = buffer_l_[idx0] * (1.f - frac) + buffer_l_[idx1] * frac;
-                float raw_r = buffer_r_[idx0] * (1.f - frac) + buffer_r_[idx1] * frac;
+                if(freeze_active_)
+                {
+                    // Freeze drone: instead of reading play_pos_ and
+                    // advancing through the rest of the loop, loop a tiny
+                    // window (kFreezeWindowMs) around freeze_anchor_ over
+                    // and over. Hann-windowed per cycle (0 at phase 0 AND
+                    // 1, same click-avoidance principle as GranularEngine's
+                    // own grain envelope, see ReadHann()) so the loop point
+                    // never clicks and it genuinely sustains a texture
+                    // instead of holding one static sample.
+                    float window_len = kFreezeWindowMs * 0.001f * sample_rate_;
+                    if(window_len > (float)record_len_)
+                        window_len = (float)record_len_;
+                    if(window_len < 4.f)
+                        window_len = 4.f;
+
+                    float read_pos = freeze_anchor_ + freeze_phase_ * window_len;
+                    while(read_pos >= (float)record_len_)
+                        read_pos -= (float)record_len_;
+                    while(read_pos < 0.f)
+                        read_pos += (float)record_len_;
+
+                    int   idx0 = (int)read_pos;
+                    int   idx1 = (idx0 + 1) % (int)record_len_;
+                    float frac = read_pos - idx0;
+
+                    float env = 0.5f - 0.5f * cosf(freeze_phase_ * 2.f * kPi);
+
+                    raw_l = (buffer_l_[idx0] * (1.f - frac) + buffer_l_[idx1] * frac) * env;
+                    raw_r = (buffer_r_[idx0] * (1.f - frac) + buffer_r_[idx1] * frac) * env;
+
+                    // Keep play_pos_ synced to the live freeze read
+                    // position so un-freezing resumes exactly where the
+                    // drone left off, no jump.
+                    play_pos_ = read_pos;
+
+                    float speed_now = speed_ * project_speed;
+                    freeze_phase_ += speed_now / window_len;
+                    while(freeze_phase_ >= 1.f)
+                        freeze_phase_ -= 1.f;
+                    while(freeze_phase_ < 0.f)
+                        freeze_phase_ += 1.f;
+                }
+                else
+                {
+                    int   idx0 = (int)play_pos_;
+                    int   idx1 = (idx0 + 1) % (int)record_len_;
+                    float frac = play_pos_ - idx0;
+
+                    raw_l = buffer_l_[idx0] * (1.f - frac) + buffer_l_[idx1] * frac;
+                    raw_r = buffer_r_[idx0] * (1.f - frac) + buffer_r_[idx1] * frac;
+                }
 
                 meter_ = fabsf(raw_l) * 0.3f + meter_ * 0.7f;
 
@@ -577,17 +711,32 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                     reverb_send_out[0][i] += fx_l * volume_ * panL * reverb_send_;
                     reverb_send_out[1][i] += fx_r * volume_ * panR * reverb_send_;
                 }
+                // Same idea, into the shared delay bus (see
+                // SetDelaySend01()'s own comment).
+                if(delay_send_ > 0.f)
+                {
+                    delay_send_out[0][i] += fx_l * volume_ * panL * delay_send_;
+                    delay_send_out[1][i] += fx_r * volume_ * panR * delay_send_;
+                }
             }
             else
             {
                 meter_ *= 0.9f;
             }
 
-            play_pos_ += speed_ * project_speed;
-            while(play_pos_ >= (float)record_len_)
-                play_pos_ -= (float)record_len_;
-            while(play_pos_ < 0.f)
-                play_pos_ += (float)record_len_;
+            // While frozen, the audible branch above already advanced
+            // freeze_phase_ and synced play_pos_ to the live freeze read
+            // position -- the normal full-loop advance below is only for
+            // the non-frozen case (including the silent Paused state,
+            // which still needs to stay phase-locked to the beat grid).
+            if(!(audible && freeze_active_))
+            {
+                play_pos_ += speed_ * project_speed;
+                while(play_pos_ >= (float)record_len_)
+                    play_pos_ -= (float)record_len_;
+                while(play_pos_ < 0.f)
+                    play_pos_ += (float)record_len_;
+            }
         }
     }
 }

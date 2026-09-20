@@ -50,7 +50,14 @@ enum class LayerState
     Recording,
     Playing,
     Paused,
-    Overdubbing
+    Overdubbing,
+    // Waiting out the same 1-bar count-in as ArmedCountIn, but from
+    // Playing/Paused instead of Empty -- so, unlike ArmedCountIn, this
+    // layer keeps outputting its already-recorded audio the whole time
+    // (see Process()'s own "audible" check). Added so overdub starts
+    // precisely on a downbeat instead of whenever the button happened to
+    // be pressed -- see OnRecordButtonLongPress()'s own comment.
+    ArmedOverdubCountIn
 };
 
 enum class FilterMode
@@ -194,6 +201,12 @@ struct LooperLayer
     // setting shared by every layer's send -- see Ui::GetReverbSize01().
     void  SetReverbSend01(float v);
     float GetReverbSend01() const { return reverb_send_; }
+    // Own independent send into the shared cross-feedback delay bus
+    // main.cpp owns (fx_delay_l/r) -- same relationship to it Reverb
+    // Send above has to the shared ReverbSc, added once the Layer:FX
+    // page (was Layer:Reverb) grew a second knob for it.
+    void  SetDelaySend01(float v);
+    float GetDelaySend01() const { return delay_send_; }
 
     // Cheap 0..1 read-back for VU-style meters on the OLED.
     float GetLevel() const { return meter_; }
@@ -222,6 +235,23 @@ struct LooperLayer
     // afterward -- not intended for general use.
     float GetPlayPosRaw() const { return play_pos_; }
     void  SetPlayPosRaw(float p) { play_pos_ = p; }
+
+    // --- Freeze (Global:Speed's own Freeze transport mode) --------------
+    // Holds playback on a small, continuously-looping window around
+    // wherever play_pos_ currently sits, instead of advancing through the
+    // rest of the loop -- a "freeze drone," not silence: the window is
+    // Hann-windowed on each pass (same technique GranularEngine's own
+    // grains use), so it fades to zero at its own loop point instead of
+    // clicking, and genuinely sustains a texture rather than holding one
+    // static (silent) sample. See NudgeFreeze() for moving the frozen
+    // window while active (Global:Speed's own encoder-scrub, repurposed).
+    void SetFreezeActive(bool active);
+    bool IsFreezeActive() const { return freeze_active_; }
+    // Moves the frozen window by delta_samples (wrapped into the loop's
+    // own length, same as ScrubBy()'s own wrap) and restarts its loop
+    // phase fresh, so a fast series of encoder ticks always plays the
+    // window currently under the "playhead," never a stale one.
+    void NudgeFreeze(float delta_samples);
 
     // --- Save/load (see performance_store.h) ------------------------
     // Raw buffer access + a way to declare a buffer "recorded" without
@@ -255,6 +285,7 @@ struct LooperLayer
     void Process(AudioHandle::InputBuffer  in,
                  AudioHandle::OutputBuffer out,
                  AudioHandle::OutputBuffer reverb_send_out,
+                 AudioHandle::OutputBuffer delay_send_out,
                  size_t                    size,
                  const TempoClock::TempoTick* ticks,
                  TempoClock&                  tempo,
@@ -273,7 +304,21 @@ struct LooperLayer
     size_t write_idx_   = 0;
     size_t record_len_  = 0; // fixed once recording finishes
     size_t target_len_  = 0; // this recording's target length (from tempo)
+    // Native-space samples left in the current overdub pass -- seeded to
+    // record_len_ the instant ArmedOverdubCountIn's count-in finishes,
+    // counted down by effective_speed each sample while Overdubbing.
+    // Reaching 0 auto-stops back to Playing, same "runs a fixed duration
+    // automatically" shape Recording's own write_idx_/target_len_ pair
+    // already has -- added so overdub no longer needs the button held
+    // down for its whole duration, see OnRecordButtonLongPress()'s
+    // comment.
+    float  overdub_remaining_ = 0.f;
     float  play_pos_    = 0.f;
+    // See SetFreezeActive()/NudgeFreeze()'s own doc comments.
+    bool   freeze_active_ = false;
+    float  freeze_anchor_ = 0.f; // frozen window's own start, native samples
+    float  freeze_phase_  = 0.f; // 0..1 through the window's own repeating loop
+    static constexpr float kFreezeWindowMs = 60.f;
     float  input_gain_  = 1.f; // multiplier applied at record/overdub time
     float  input_gain01_ = 0.f; // raw 0..1 last passed to SetInputGain01(), for save/restore
 
@@ -321,6 +366,7 @@ struct LooperLayer
     daisysp::Phaser*       fx_phaser_     = nullptr; // externally owned, see Init()
 
     float reverb_send_ = 0.f; // 0 = nothing sent to the shared reverb bus
+    float delay_send_  = 0.f; // 0 = nothing sent to the shared delay bus
 
     float meter_ = 0.f;
     float waveform_peaks_[kWaveformCols] = {};

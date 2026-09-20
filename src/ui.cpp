@@ -35,6 +35,7 @@ const char* StateGlyph(LayerState s)
         case LayerState::Playing: return "P";
         case LayerState::Paused: return "||";
         case LayerState::Overdubbing: return "O";
+        case LayerState::ArmedOverdubCountIn: return "c";
     }
     return "?";
 }
@@ -258,9 +259,13 @@ void Ui::HandleEncoder(const UiControlEvents& events)
     int32_t inc = events.encoder_delta;
     if(inc != 0)
     {
-        if(scrub_mode_active_ && screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
+        if(speed_transport_mode_ == SpeedTransportMode::Scrub && screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
         {
             ScrubBy(inc);
+        }
+        else if(speed_transport_mode_ == SpeedTransportMode::Freeze && screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
+        {
+            NudgeFreezeBy(inc);
         }
         else if(screen_ == Screen::Home)
         {
@@ -442,13 +447,20 @@ void Ui::HandleEncoder(const UiControlEvents& events)
         encoder_long_fired_ = false;
     }
 
-    // Scrub mode is a Global:Speed-only, always-transient toggle -- clear
-    // it unconditionally the instant we're not there any more (long-press
+    // Scrub/Freeze are Global:Speed-only, always-transient modes -- clear
+    // them unconditionally the instant we're not there any more (long-press
     // to Home above is the only current exit path, but this isn't tied to
     // that one call site specifically so it can't be left silently stuck
-    // on by any future navigation change).
+    // on by any future navigation change). Leaving Freeze specifically
+    // must also un-freeze every layer, or playback would stay stuck on
+    // the tiny drone window with no way back in from this screen.
     if(!(screen_ == Screen::Global && global_page_ == GlobalPage::Speed))
-        scrub_mode_active_ = false;
+    {
+        if(speed_transport_mode_ == SpeedTransportMode::Freeze)
+            for(int i = 0; i < num_layers_; i++)
+                layers_[i].SetFreezeActive(false);
+        speed_transport_mode_ = SpeedTransportMode::Normal;
+    }
 }
 
 void Ui::HandleButton1(const UiControlEvents& events)
@@ -691,14 +703,19 @@ void Ui::HandleButton2(const UiControlEvents& events)
         // Global:File's own Button2 handling for the shared SaveLoadMode
         // this mirrors.
         bool can_confirm_save = save_load_mode_ == SaveLoadMode::ChoosingSave;
-        // Nothing concrete is highlighted while just browsing the folder
-        // list (folder names aren't presets) -- confirm only once "New"
-        // is picked at the top-level chooser, or a folder has actually
-        // been opened onto a real preset (see dexed_preset_folder_open_'s
-        // own comment).
+        // Nothing concrete is highlighted while just browsing a group or
+        // folder list (names aren't presets) -- confirm only once "New"
+        // is picked at the top-level chooser, a folder has actually been
+        // opened onto a real preset (Roms/Dexed/Imports), the User group
+        // is open (it has no folder level of its own, see
+        // DexedFilesGroup's own comment), or a real .syx file is
+        // highlighted inside the Import list.
+        bool dexed_files_ready = load_browsing_files_ && dexed_files_group_open_
+                                   && (dexed_preset_folder_open_
+                                       || dexed_files_group_ == DexedFilesGroup::User);
         bool can_confirm_load = save_load_mode_ == SaveLoadMode::BrowsingLoad
-                                 && (load_new_selected_
-                                     || (load_browsing_files_ && dexed_preset_folder_open_));
+                                 && (load_new_selected_ || dexed_files_ready
+                                     || (dexed_import_browsing_ && dexed_import_file_count_ > 0));
         bool can_confirm      = can_confirm_save || can_confirm_load;
         if(b.Pressed() && b.TimeHeldMs() > 800.f && !button2_long_fired_ && can_confirm)
         {
@@ -720,17 +737,41 @@ void Ui::HandleButton2(const UiControlEvents& events)
                 save_load_mode_ = SaveLoadMode::Idle;
             }
             else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::BrowsingLoad
-                     && load_browsing_files_ && dexed_preset_folder_open_)
+                     && dexed_files_ready)
             {
-                // Short tap while a preset is highlighted inside an open
-                // folder -- preview it immediately (apply to the live
-                // engine) WITHOUT leaving the browser, so scrolling K1
-                // and tapping B2 auditions one preset after another
+                // Short tap while a preset is highlighted (an open
+                // folder in Roms/Dexed/Imports, or anywhere in the flat
+                // User list) -- preview it immediately (apply to the
+                // live engine) WITHOUT leaving the browser, so scrolling
+                // K1 and tapping B2 auditions one preset after another
                 // without re-entering the whole Save/Load flow each
                 // time. Button2's hold gesture above still does the same
                 // load AND exits back to Idle, for once you've settled
                 // on one.
                 TriggerLoadDexedPreset();
+            }
+            else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::BrowsingLoad
+                     && load_browsing_files_ && !dexed_files_ready)
+            {
+                // "Open" -- Button2's own role specifically at the group
+                // chooser and folder-list levels (Button1 is "Back"
+                // there instead, see OnButton1Short()) -- drills one
+                // level deeper, the same target state Button1 used to
+                // set directly before this Back/Open split.
+                if(!dexed_files_group_open_)
+                {
+                    dexed_files_group_open_     = true;
+                    dexed_preset_folder_open_   = false;
+                    dexed_preset_folder_cursor_ = 0;
+                    dexed_preset_cursor_        = 0;
+                    dexed_preset_slots_dirty_   = true;
+                }
+                else if(dexed_files_group_ != DexedFilesGroup::User
+                         && !dexed_preset_folder_open_)
+                {
+                    dexed_preset_folder_open_ = true;
+                    dexed_preset_cursor_      = 0;
+                }
             }
             else if(!button2_long_fired_ && save_load_mode_ == SaveLoadMode::Idle)
             {
@@ -744,7 +785,11 @@ void Ui::HandleButton2(const UiControlEvents& events)
                     save_load_mode_           = SaveLoadMode::BrowsingLoad;
                     load_new_selected_        = false;
                     load_browsing_files_      = false;
+                    dexed_files_group_open_   = false; // always start at the group chooser
+                    dexed_files_group_        = DexedFilesGroup::Roms;
                     dexed_preset_folder_open_ = false; // always start at the folder list
+                    dexed_import_selected_    = false;
+                    dexed_import_browsing_    = false;
                 }
             }
             button2_long_fired_ = false;
@@ -833,8 +878,27 @@ void Ui::OnButton1Short()
                 int m = ((int)master_filter_mode_ + 1) % n;
                 master_filter_mode_ = (FilterMode)m;
             }
+            else if(global_page_ == GlobalPage::Reverb)
+                global_fx_target_delay_ = false; // knobs -> Reverb (Size/Bypass Send)
             else if(global_page_ == GlobalPage::Speed)
-                scrub_mode_active_ = !scrub_mode_active_;
+            {
+                // Cycle Normal -> Scrub -> Freeze -> Normal. Leaving
+                // Freeze un-freezes every layer immediately (same
+                // "reset on leaving the mode" rule as the page-leave
+                // auto-reset below).
+                if(speed_transport_mode_ == SpeedTransportMode::Freeze)
+                {
+                    for(int i = 0; i < num_layers_; i++)
+                        layers_[i].SetFreezeActive(false);
+                }
+                int n = (int)SpeedTransportMode::Freeze + 1;
+                speed_transport_mode_ = (SpeedTransportMode)(((int)speed_transport_mode_ + 1) % n);
+                if(speed_transport_mode_ == SpeedTransportMode::Freeze)
+                {
+                    for(int i = 0; i < num_layers_; i++)
+                        layers_[i].SetFreezeActive(true);
+                }
+            }
             else if(global_page_ == GlobalPage::File)
             {
                 if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
@@ -903,8 +967,26 @@ void Ui::OnButton1Short()
                 // so this is what makes "off" actually mean "reset and
                 // ready to resume cleanly", not just frozen wherever it
                 // happened to be.
-                if(!looper_enabled_ && tempo_)
-                    tempo_->ResetPhase();
+                //
+                // Every layer's own play_pos_ needs the exact same
+                // treatment -- AudioCallback() skips LooperLayer::Process()
+                // entirely while disabled, so a layer mid-loop simply
+                // freezes at whatever sample it was on, not sample 0. Left
+                // alone, re-enabling would resume playback from that
+                // frozen (often mid-loop) position while the tempo clock
+                // above restarts from bar 1 -- audibly and visually out of
+                // sync with each other, exactly the real report that
+                // prompted this ("counter is not synced" after
+                // re-enabling). Resetting both together at disable time is
+                // what actually makes "off" mean "stopped", not just
+                // "paused mid-loop".
+                if(!looper_enabled_)
+                {
+                    if(tempo_)
+                        tempo_->ResetPhase();
+                    for(int i = 0; i < num_layers_; i++)
+                        layers_[i].SetPlayPosRaw(0.f);
+                }
             }
             else if(global_page_ == GlobalPage::SdMgmt)
             {
@@ -936,13 +1018,19 @@ void Ui::OnButton1Short()
             break;
         case Screen::Granular:
             if(granular_param_page_ == GranularParamPage::Grain)
-                granular_grain_target_gap_scan_ = false; // knobs -> Size+Fill
+                granular_grain_target_gap_jitter_ = false; // knobs -> Size+Fill
             else if(granular_param_page_ == GranularParamPage::Mix)
                 granular_mix_target_reverb_ = false; // knobs -> Grain+Scan
+            else if(granular_param_page_ == GranularParamPage::FX)
+                granular_fx_target_delay_ = false; // knobs -> Reverb (Send+Size)
             else if(granular_param_page_ == GranularParamPage::ADSR)
                 granular_adsr_target_sr_ = false; // knobs -> Attack+Decay
-            else if(granular_param_page_ == GranularParamPage::TuneDirection && granular_)
+            else if(granular_param_page_ == GranularParamPage::Tune && granular_)
                 granular_->SetGrainFollowsNote(!granular_->GetGrainFollowsNote());
+            else if(granular_param_page_ == GranularParamPage::Scan && granular_)
+                granular_->ToggleScanBounce();
+            else if(granular_param_page_ == GranularParamPage::ScanRange)
+                granular_scanrange_target_gap_ = false; // knobs -> Start+End
             else if(granular_param_page_ == GranularParamPage::Position && granular_)
                 granular_->CycleRhythm();
             else if(granular_param_page_ == GranularParamPage::Filter && granular_)
@@ -1016,30 +1104,70 @@ void Ui::OnButton1Short()
                 int m = ((int)dexed_->GetFilterMode() + 1) % n;
                 dexed_->SetFilterMode((FilterMode)m);
             }
+            else if(dexed_param_page_ == DexedParamPage::FX)
+                dexed_fx_target_delay_ = false; // knobs -> Reverb (Send+Size)
+            else if(dexed_param_page_ == DexedParamPage::Vibrato && dexed_)
+                dexed_->CycleModWheelTarget();
             else if(dexed_param_page_ == DexedParamPage::Preset)
             {
-                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
+                if(save_load_mode_ == SaveLoadMode::BrowsingLoad && dexed_import_browsing_)
                 {
-                    // Two levels here, unlike Global:File's single
-                    // numbered list -- see dexed_preset_folder_open_'s
-                    // own comment. Folder open: back out to the folder
-                    // list. Folder list: open the highlighted folder
-                    // instead (Knob1 now scrolls the presets inside it).
-                    if(dexed_preset_folder_open_)
-                        dexed_preset_folder_open_ = false;
-                    else
-                    {
-                        dexed_preset_folder_open_ = true;
-                        dexed_preset_cursor_      = 0;
-                    }
+                    // Back out of the flat .syx file list to the
+                    // top-level chooser -- one level only, unlike Files'
+                    // own several (see DexedFilesGroup's own comment).
+                    dexed_import_browsing_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_
+                         && dexed_files_group_open_ && dexed_preset_folder_open_)
+                {
+                    // Inside an open folder (Roms/Dexed/Imports), already
+                    // browsing its own presets -- back out to this
+                    // group's own folder list. Button2 is "Open" at
+                    // every other Files level (see HandleButton2()), but
+                    // this one has nothing further to open, so it keeps
+                    // its own separate, established job (Load preview/
+                    // hold-to-commit) instead.
+                    dexed_preset_folder_open_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_
+                         && dexed_files_group_open_)
+                {
+                    // At a group's own folder list (Roms/Dexed/Imports),
+                    // or the User group's flat list (which has no folder
+                    // level of its own, see DexedFilesGroup's own
+                    // comment) -- Back, up to the group chooser. Button2
+                    // is "Open" at this level instead (drills into the
+                    // highlighted folder).
+                    dexed_files_group_open_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_
+                         && !dexed_files_group_open_)
+                {
+                    // At the group chooser -- Back, up to the top
+                    // Files/Import/New chooser. Button2 is "Open" here
+                    // too (drills into whichever group is highlighted).
+                    load_browsing_files_ = false;
+                }
+                else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && dexed_import_selected_)
+                {
+                    // "Import" is highlighted -- drill into the flat
+                    // DXIMPORT/ file list (Knob1 now scrolls
+                    // dexed_import_cursor_ directly), rescanning the
+                    // card fresh every time this is opened, same
+                    // "re-scan on entry" rule as Grains' own Import.
+                    dexed_import_browsing_    = true;
+                    dexed_import_files_dirty_ = true;
+                    dexed_import_cursor_      = 0;
                 }
                 else if(save_load_mode_ == SaveLoadMode::BrowsingLoad && !load_new_selected_)
                 {
-                    // "Files" is highlighted -- drill into the folder
-                    // list (Knob1 now scrolls dexed_preset_folder_cursor_
-                    // directly), always starting at its very top.
-                    load_browsing_files_     = true;
-                    dexed_preset_folder_open_ = false;
+                    // "Files" is highlighted at the TOP chooser -- drill
+                    // into the group chooser (Knob1 now scrolls
+                    // dexed_files_group_), always starting fresh at Roms.
+                    load_browsing_files_       = true;
+                    dexed_files_group_open_    = false;
+                    dexed_files_group_         = DexedFilesGroup::Roms;
+                    dexed_preset_folder_open_  = false;
                     dexed_preset_folder_cursor_ = 0;
                 }
                 else if(save_load_mode_ != SaveLoadMode::Idle)
@@ -1128,6 +1256,8 @@ void Ui::OnButton2Short()
 {
     if(screen_ == Screen::Home)
         bypass_ = !bypass_;
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::Reverb)
+        global_fx_target_delay_ = true; // knobs -> Delay (Time/Feedback)
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
     {
         SetProjectSpeed01(0.5f); // tap = reset to 1.0x, mirrors Layer:Speed's Button1 tap
@@ -1146,6 +1276,15 @@ void Ui::OnButton2Short()
         int algo = (dexed_->GetPatchByte(134) + 1) % 32;
         dexed_->SetPatchByte(134, (uint8_t)algo);
     }
+    else if(screen_ == Screen::Dexed && dexed_param_page_ == DexedParamPage::FX)
+        dexed_fx_target_delay_ = true; // knobs -> Delay (Send+Time)
+    else if(screen_ == Screen::Dexed && dexed_param_page_ == DexedParamPage::Vibrato)
+        // Toggles (not just sets true) -- same reasoning as
+        // DexedOpParamPage::EgRate's own Button2 above: Button1 on this
+        // page is already committed to cycling the mod wheel's target,
+        // so there's no second button free to select Speed/Depth
+        // explicitly; Button2 alone has to cover both directions.
+        dexed_vibrato_target_sens_ = !dexed_vibrato_target_sens_;
     else if(screen_ == Screen::DexedOperator && dexed_op_page_ == DexedOpParamPage::EgRate)
         // Toggles (not just sets true) -- unlike Granular's own ADSR
         // page, Button1 is already committed to operator-select duty
@@ -1156,14 +1295,21 @@ void Ui::OnButton2Short()
     else if(screen_ == Screen::DexedOperator && dexed_op_page_ == DexedOpParamPage::EgLevel)
         dexed_op_eglevel_target_sr_ = !dexed_op_eglevel_target_sr_;
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Grain)
-        granular_grain_target_gap_scan_ = true; // knobs -> Gap+Scan
+        granular_grain_target_gap_jitter_ = true; // knobs -> Gap+Jitter
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Position
             && granular_)
         granular_->CycleGrainSpeed();
+    else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Scan
+            && granular_)
+        granular_->CycleScanDirection();
+    else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::ScanRange)
+        granular_scanrange_target_gap_ = true; // knob -> Gap
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::ADSR)
         granular_adsr_target_sr_ = true; // knobs -> Sustain/Release
     else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::Mix)
         granular_mix_target_reverb_ = true; // knobs -> Reverb Send
+    else if(screen_ == Screen::Granular && granular_param_page_ == GranularParamPage::FX)
+        granular_fx_target_delay_ = true; // knobs -> Delay (Send+Time)
     else if(screen_ == Screen::Mixer)
         mixer_target_reverb_ = true; // knobs -> Reverb Send (ignored on Master)
     // File's and Pad Preset's short-tap behavior (Save As New) is
@@ -1194,7 +1340,9 @@ Ui::KnobContext Ui::CurrentKnobContext() const
             {
                 case GlobalPage::Tempo: return KnobContext::GlobalTempo;
                 case GlobalPage::Filter: return KnobContext::GlobalFilter;
-                case GlobalPage::Reverb: return KnobContext::GlobalReverb;
+                case GlobalPage::Reverb:
+                    return global_fx_target_delay_ ? KnobContext::GlobalDelay
+                                                      : KnobContext::GlobalReverb;
                 case GlobalPage::Speed: return KnobContext::GlobalSpeed;
                 case GlobalPage::File: return KnobContext::GlobalFile;
                 case GlobalPage::Export: return KnobContext::GlobalExport;
@@ -1210,11 +1358,16 @@ Ui::KnobContext Ui::CurrentKnobContext() const
             {
                 case DexedParamPage::Algo: return KnobContext::DexedAlgo;
                 case DexedParamPage::Feedback: return KnobContext::DexedFeedback;
-                case DexedParamPage::Vibrato: return KnobContext::DexedVibrato;
+                case DexedParamPage::Vibrato:
+                    return dexed_vibrato_target_sens_ ? KnobContext::DexedVibratoSens
+                                                          : KnobContext::DexedVibrato;
                 case DexedParamPage::Brightness: return KnobContext::DexedBrightness;
                 case DexedParamPage::EnvSpeed: return KnobContext::DexedEnvSpeed;
                 case DexedParamPage::Filter: return KnobContext::DexedFilter;
                 case DexedParamPage::Mix: return KnobContext::DexedMix;
+                case DexedParamPage::FX:
+                    return dexed_fx_target_delay_ ? KnobContext::DexedFxDelay
+                                                     : KnobContext::DexedFxReverb;
                 case DexedParamPage::Advanced: return KnobContext::DexedAdvanced;
                 case DexedParamPage::Preset: return KnobContext::DexedPreset;
                 default: return KnobContext::DexedAlgo;
@@ -1230,17 +1383,22 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case DexedOpParamPage::EgLevel:
                     return dexed_op_eglevel_target_sr_ ? KnobContext::DexedOpEgLevelSR
                                                            : KnobContext::DexedOpEgLevelAD;
+                case DexedOpParamPage::AmpModSens: return KnobContext::DexedOpAmpModSens;
                 default: return KnobContext::DexedOpRatioLevel;
             }
         case Screen::Granular:
             switch(granular_param_page_)
             {
                 case GranularParamPage::Grain:
-                    return granular_grain_target_gap_scan_ ? KnobContext::GranularGrainGapScan
+                    return granular_grain_target_gap_jitter_ ? KnobContext::GranularGrainGapJitter
                                                               : KnobContext::GranularGrainSizeFill;
                 case GranularParamPage::Position: return KnobContext::GranularPosition;
-                case GranularParamPage::TuneDirection:
-                    return KnobContext::GranularTuneDirection;
+                case GranularParamPage::ScanRange:
+                    return granular_scanrange_target_gap_ ? KnobContext::GranularScanGap
+                                                              : KnobContext::GranularScanRange;
+                case GranularParamPage::Scan: return KnobContext::GranularScan;
+                case GranularParamPage::Tune:
+                    return KnobContext::GranularTune;
                 case GranularParamPage::ADSR:
                     return granular_adsr_target_sr_ ? KnobContext::GranularEnvSR
                                                        : KnobContext::GranularEnvAD;
@@ -1248,6 +1406,9 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GranularParamPage::Mix:
                     return granular_mix_target_reverb_ ? KnobContext::GranularMixReverb
                                                           : KnobContext::GranularMix;
+                case GranularParamPage::FX:
+                    return granular_fx_target_delay_ ? KnobContext::GranularFxDelay
+                                                        : KnobContext::GranularFxReverb;
                 case GranularParamPage::Capture: return KnobContext::GranularCapture;
                 case GranularParamPage::Trim: return KnobContext::GranularTrim;
                 case GranularParamPage::Preset: return KnobContext::GranularPreset;
@@ -1288,10 +1449,8 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             k2_pickup_raw_[i] = Cur().GetEffectParamB01();
             break;
         case KnobContext::LayerReverb:
-            // Knob2 does nothing here any more -- Size moved to
-            // Global:Reverb (see the shared-bus comment on
-            // LooperLayer::SetReverbSend01()).
             k1_pickup_raw_[i] = Cur().GetReverbSend01();
+            k2_pickup_raw_[i] = Cur().GetDelaySend01();
             break;
         case KnobContext::LayerGain:
             k1_pickup_raw_[i] = Cur().GetInputGain01();
@@ -1314,6 +1473,10 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalReverb:
             k1_pickup_raw_[i] = reverb_size01_;
             k2_pickup_raw_[i] = bypass_reverb_send01_;
+            break;
+        case KnobContext::GlobalDelay:
+            k1_pickup_raw_[i] = delay_time01_;
+            k2_pickup_raw_[i] = delay_feedback01_;
             break;
         case KnobContext::GlobalSpeed:
             k1_pickup_raw_[i] = project_speed01_;
@@ -1340,6 +1503,10 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(139) / 99.f;
             }
             break;
+        case KnobContext::DexedVibratoSens:
+            if(dexed_)
+                k1_pickup_raw_[i] = (float)(dexed_->GetPatchByte(143) & 7) / 7.f;
+            break;
         case KnobContext::DexedBrightness:
             if(dexed_)
                 k1_pickup_raw_[i] = dexed_->GetBrightness01();
@@ -1360,6 +1527,20 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             {
                 k1_pickup_raw_[i] = dexed_->GetReverbSend01();
                 k2_pickup_raw_[i] = dexed_->GetOutputLevel01();
+            }
+            break;
+        case KnobContext::DexedFxReverb:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = dexed_->GetReverbSend01();
+                k2_pickup_raw_[i] = reverb_size01_;
+            }
+            break;
+        case KnobContext::DexedFxDelay:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = dexed_->GetDelaySend01();
+                k2_pickup_raw_[i] = delay_time01_;
             }
             break;
         case KnobContext::DexedAdvanced: break; // entry point only -- see Screen::DexedOperator instead
@@ -1411,6 +1592,13 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k2_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 7) / 99.f; // Level4
             }
             break;
+        case KnobContext::DexedOpAmpModSens:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)(dexed_->GetPatchByte(base + 14) & 3) / 3.f;
+            }
+            break;
         case KnobContext::GranularGrainSizeFill:
             if(granular_)
             {
@@ -1418,26 +1606,41 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k2_pickup_raw_[i] = granular_->GetFill01();
             }
             break;
-        case KnobContext::GranularGrainGapScan:
+        case KnobContext::GranularGrainGapJitter:
             if(granular_)
             {
                 k1_pickup_raw_[i] = granular_->GetGap01();
-                k2_pickup_raw_[i] = granular_->GetScan01();
+                k2_pickup_raw_[i] = granular_->GetJitter01();
             }
             break;
         case KnobContext::GranularPosition:
             if(granular_)
             {
                 k1_pickup_raw_[i] = granular_->GetPosition01();
-                k2_pickup_raw_[i] = granular_->GetScanPosition01();
-            }
-            break;
-        case KnobContext::GranularTuneDirection:
-            if(granular_)
-            {
-                k1_pickup_raw_[i] = granular_->GetGrainTuneSemitones01();
                 k2_pickup_raw_[i] = granular_->GetDirection01();
             }
+            break;
+        case KnobContext::GranularScanRange:
+            if(granular_)
+            {
+                k1_pickup_raw_[i] = granular_->GetScanPosition01();
+                k2_pickup_raw_[i] = granular_->GetScanEnd01();
+            }
+            break;
+        case KnobContext::GranularScanGap:
+            if(granular_)
+                k1_pickup_raw_[i] = granular_->GetScanGap01();
+            break;
+        case KnobContext::GranularScan:
+            if(granular_)
+            {
+                k1_pickup_raw_[i] = granular_->GetScan01();
+                k2_pickup_raw_[i] = granular_->GetScanFill01();
+            }
+            break;
+        case KnobContext::GranularTune:
+            if(granular_)
+                k1_pickup_raw_[i] = granular_->GetGrainTuneSemitones01();
             break;
         case KnobContext::GranularEnvAD:
             if(granular_)
@@ -1470,6 +1673,20 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GranularMixReverb:
             if(granular_)
                 k1_pickup_raw_[i] = granular_->GetReverbSend01();
+            break;
+        case KnobContext::GranularFxReverb:
+            if(granular_)
+            {
+                k1_pickup_raw_[i] = granular_->GetReverbSend01();
+                k2_pickup_raw_[i] = reverb_size01_;
+            }
+            break;
+        case KnobContext::GranularFxDelay:
+            if(granular_)
+            {
+                k1_pickup_raw_[i] = granular_->GetDelaySend01();
+                k2_pickup_raw_[i] = delay_time01_;
+            }
             break;
         case KnobContext::GranularCapture: break; // no continuous knobs, Button1/Button2 only
         case KnobContext::GranularTrim:
@@ -1550,6 +1767,27 @@ void Ui::ScrubBy(int32_t inc)
         layers_[i].SetPlayPosRaw(pos);
         if(i == rep)
             tempo_->SetPhaseToPosition(pos);
+    }
+}
+
+void Ui::NudgeFreezeBy(int32_t inc)
+{
+    // Same base distance/acceleration feel as ScrubBy() -- shares
+    // last_scrub_tick_ms_ since Scrub and Freeze are mutually exclusive
+    // (only one mode is ever active on Global:Speed at a time).
+    constexpr float kScrubSamplesPerClick = 2400.f;
+
+    uint32_t now  = System::GetNow();
+    uint32_t dt   = now - last_scrub_tick_ms_;
+    last_scrub_tick_ms_ = now;
+    float accel = dt > 0 ? Clampf(150.f / (float)dt, 1.f, 8.f) : 8.f;
+
+    float delta = (float)inc * kScrubSamplesPerClick * accel;
+    for(int i = 0; i < num_layers_; i++)
+    {
+        if(!layers_[i].HasContent())
+            continue;
+        layers_[i].NudgeFreeze(delta);
     }
 }
 
@@ -1639,12 +1877,15 @@ void Ui::ApplyKnobs()
                         Cur().SetEffectParamB01(k2);
                     break;
                 case LayerPage::Reverb:
-                    // Only Send is per-layer -- Size is a shared
-                    // Global:Reverb setting now (see the shared-bus
-                    // comment on LooperLayer::SetReverbSend01()), so
-                    // Knob2 does nothing on this page.
+                    // Send is per-layer for both effects -- Size/Time/
+                    // Feedback are shared Global:FX settings (see the
+                    // shared-bus comment on LooperLayer::SetReverbSend01()/
+                    // SetDelaySend01()), so this page is just the two Send
+                    // knobs, no toggle needed.
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         Cur().SetReverbSend01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        Cur().SetDelaySend01(k2);
                     break;
                 case LayerPage::Gain:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
@@ -1671,10 +1912,20 @@ void Ui::ApplyKnobs()
             }
             else if(global_page_ == GlobalPage::Reverb)
             {
-                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
-                    reverb_size01_ = Clampf(k1, 0.f, 1.f);
-                if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                    bypass_reverb_send01_ = Clampf(k2, 0.f, 1.f);
+                if(!global_fx_target_delay_)
+                {
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        reverb_size01_ = Clampf(k1, 0.f, 1.f);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        bypass_reverb_send01_ = Clampf(k2, 0.f, 1.f);
+                }
+                else
+                {
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        delay_time01_ = Clampf(k1, 0.f, 1.f);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        delay_feedback01_ = Clampf(k2, 0.f, 1.f);
+                }
             }
             else if(global_page_ == GlobalPage::Speed)
             {
@@ -1752,7 +2003,7 @@ void Ui::ApplyKnobs()
             switch(granular_param_page_)
             {
                 case GranularParamPage::Grain:
-                    if(!granular_grain_target_gap_scan_)
+                    if(!granular_grain_target_gap_jitter_)
                     {
                         if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                             granular_->SetSize01(k1);
@@ -1764,20 +2015,38 @@ void Ui::ApplyKnobs()
                         if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                             granular_->SetGap01(k1);
                         if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                            granular_->SetScan01(k2);
+                            granular_->SetJitter01(k2);
                     }
                     break;
                 case GranularParamPage::Position:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         granular_->SetPosition01(k1);
                     if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        granular_->SetScanPosition01(k2);
+                        granular_->SetDirection01(k2);
                     break;
-                case GranularParamPage::TuneDirection:
+                case GranularParamPage::ScanRange:
+                    if(!granular_scanrange_target_gap_)
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            granular_->SetScanPosition01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            granular_->SetScanEnd01(k2);
+                    }
+                    else
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            granular_->SetScanGap01(k1);
+                    }
+                    break;
+                case GranularParamPage::Scan:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        granular_->SetScan01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        granular_->SetScanFill01(k2);
+                    break;
+                case GranularParamPage::Tune:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                         granular_->SetGrainTuneSemitones01(k1);
-                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                        granular_->SetDirection01(k2);
                     break;
                 case GranularParamPage::ADSR:
                     if(!granular_adsr_target_sr_)
@@ -1813,6 +2082,22 @@ void Ui::ApplyKnobs()
                     {
                         if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                             granular_->SetReverbSend01(k1);
+                    }
+                    break;
+                case GranularParamPage::FX:
+                    if(!granular_fx_target_delay_)
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            granular_->SetReverbSend01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            reverb_size01_ = Clampf(k2, 0.f, 1.f);
+                    }
+                    else
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            granular_->SetDelaySend01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            delay_time01_ = Clampf(k2, 0.f, 1.f);
                     }
                     break;
                 case GranularParamPage::Capture:
@@ -1933,19 +2218,33 @@ void Ui::ApplyKnobs()
                     }
                     break;
                 case DexedParamPage::Vibrato:
-                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    if(!dexed_vibrato_target_sens_)
                     {
-                        int speed = (int)(Clampf(k1, 0.f, 1.f) * 99.f + 0.5f);
-                        speed     = speed > 99 ? 99 : speed;
-                        if((uint8_t)speed != dexed_->GetPatchByte(137))
-                            dexed_->SetPatchByte(137, (uint8_t)speed);
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        {
+                            int speed = (int)(Clampf(k1, 0.f, 1.f) * 99.f + 0.5f);
+                            speed     = speed > 99 ? 99 : speed;
+                            if((uint8_t)speed != dexed_->GetPatchByte(137))
+                                dexed_->SetPatchByte(137, (uint8_t)speed);
+                        }
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        {
+                            int depth = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
+                            depth     = depth > 99 ? 99 : depth;
+                            if((uint8_t)depth != dexed_->GetPatchByte(139))
+                                dexed_->SetPatchByte(139, (uint8_t)depth);
+                        }
                     }
-                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    else if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                     {
-                        int depth = (int)(Clampf(k2, 0.f, 1.f) * 99.f + 0.5f);
-                        depth     = depth > 99 ? 99 : depth;
-                        if((uint8_t)depth != dexed_->GetPatchByte(139))
-                            dexed_->SetPatchByte(139, (uint8_t)depth);
+                        // Global Pitch Mod Sensitivity -- only bits 0-2 of
+                        // this byte are ever read (patch[143] & 7, see
+                        // msfa's own pitchmodsenstab lookup), so only
+                        // those 8 values are worth quantizing to.
+                        int sens = (int)(Clampf(k1, 0.f, 1.f) * 7.f + 0.5f);
+                        sens     = sens > 7 ? 7 : sens;
+                        if((uint8_t)sens != (dexed_->GetPatchByte(143) & 7))
+                            dexed_->SetPatchByte(143, (uint8_t)sens);
                     }
                     break;
                 case DexedParamPage::Brightness:
@@ -1970,6 +2269,22 @@ void Ui::ApplyKnobs()
                     if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                         dexed_->SetOutputLevel01(k2);
                     break;
+                case DexedParamPage::FX:
+                    if(!dexed_fx_target_delay_)
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            dexed_->SetReverbSend01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            reverb_size01_ = Clampf(k2, 0.f, 1.f);
+                    }
+                    else
+                    {
+                        if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                            dexed_->SetDelaySend01(k1);
+                        if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                            delay_time01_ = Clampf(k2, 0.f, 1.f);
+                    }
+                    break;
                 case DexedParamPage::Advanced: break; // no knobs, encoder click drills in
                 case DexedParamPage::Preset:
                 {
@@ -1985,41 +2300,104 @@ void Ui::ApplyKnobs()
                     }
                     if(save_load_mode_ != SaveLoadMode::BrowsingLoad)
                         break;
+                    if(dexed_import_browsing_)
+                    {
+                        // Flat .syx file list (DXIMPORT/) -- same
+                        // discretized "browse a list directly" idiom as
+                        // the folder-list/in-folder cases below, just one
+                        // level instead of two since there's no factory-
+                        // category structure for an arbitrary SD folder.
+                        int total = dexed_import_file_count_;
+                        if(total > 0)
+                        {
+                            int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
+                            if(idx >= total)
+                                idx = total - 1;
+                            if(idx != dexed_import_cursor_)
+                                dexed_preset_status_[0] = '\0';
+                            dexed_import_cursor_ = idx;
+                        }
+                        break;
+                    }
                     if(!load_browsing_files_)
                     {
                         // Top-level chooser (mirrors ChoosingSave's own
-                        // Overwrite/Save New pick above) -- factory
-                        // presets always exist, so "Files" is always a
-                        // real option here.
-                        load_new_selected_ = k1 >= 0.5f;
+                        // Overwrite/Save New pick above), now 3-way:
+                        // Files (factory presets always exist, so 0..1/3
+                        // is always a real option), Import (SD SysEx),
+                        // New.
+                        float k1c               = Clampf(k1, 0.f, 1.f);
+                        load_new_selected_       = k1c >= (2.f / 3.f);
+                        dexed_import_selected_   = !load_new_selected_ && k1c >= (1.f / 3.f);
                         break;
                     }
-                    // One extra folder level versus Global:File/Granular
-                    // Preset's own single numbered list (see
-                    // dexed_preset_folder_open_'s own comment) -- K1
-                    // scrolls whichever of the two is currently active,
-                    // discretized/not pickup-tracked, same idiom as
-                    // Global:File's own file_cursor_.
-                    if(!dexed_preset_folder_open_)
+                    if(!dexed_files_group_open_)
                     {
-                        // Folder list -- kNumFactoryCategories named
-                        // categories plus one trailing "User" folder.
-                        int total = DexedSynth::kNumFactoryCategories + 1;
+                        // Group chooser (see DexedFilesGroup's own
+                        // comment) -- Roms/Dexed/Imports/User.
+                        int total = (int)DexedFilesGroup::kCount;
                         int idx   = (int)(Clampf(k1, 0.f, 1.f) * total);
                         if(idx >= total)
                             idx = total - 1;
+                        // Real bug, confirmed on hardware: marking
+                        // dexed_preset_slots_dirty_ here (this group
+                        // chooser's own display doesn't even show
+                        // folder counts, only a static Roms/Dexed/
+                        // Imports/User label list) forced a real SD
+                        // directory scan on every single group the knob
+                        // swept past, not just the one it settled on --
+                        // visibly laggy scrubbing through all 4 quickly.
+                        // The real refresh already happens on actually
+                        // opening a group (see HandleButton2()'s own
+                        // "Open" handling), which is the only point this
+                        // group's own preset/folder counts are needed.
+                        dexed_files_group_ = (DexedFilesGroup)idx;
+                        break;
+                    }
+                    // User has no folder level of its own (see
+                    // DexedFilesGroup's own comment) -- only
+                    // Roms/Dexed/Imports get this extra level, K1
+                    // scrolling dexed_preset_folder_cursor_ across
+                    // whichever this group's own folder list holds.
+                    if(dexed_files_group_ != DexedFilesGroup::User && !dexed_preset_folder_open_)
+                    {
+                        int total;
+                        switch(dexed_files_group_)
+                        {
+                            case DexedFilesGroup::Roms: total = DexedSynth::kNumRomCategories; break;
+                            case DexedFilesGroup::Dexed:
+                                total = DexedSynth::kNumFactoryCategories
+                                        - DexedSynth::kNumRomCategories;
+                                break;
+                            case DexedFilesGroup::Imports:
+                            default: total = dexed_import_folder_count_; break;
+                        }
+                        int idx = total > 0 ? (int)(Clampf(k1, 0.f, 1.f) * total) : 0;
+                        if(idx >= total)
+                            idx = total > 0 ? total - 1 : 0;
                         dexed_preset_folder_cursor_ = idx;
                         break;
                     }
                     {
-                        // Inside a folder -- browsing either one factory
-                        // category's own presets, or (the trailing
-                        // folder) every user-saved slot.
-                        int total
-                            = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
-                                  ? DexedSynth::GetFactoryCategoryCount(
-                                        dexed_preset_folder_cursor_)
-                                  : dexed_preset_user_slot_count_;
+                        // Deepest level -- either inside a Roms/Dexed
+                        // factory folder, inside one Imports bank's own
+                        // slot range, or (User) the flat, import-filtered
+                        // slot list directly.
+                        int total;
+                        if(dexed_files_group_ == DexedFilesGroup::User)
+                            total = dexed_preset_user_slot_count_;
+                        else if(dexed_files_group_ == DexedFilesGroup::Imports)
+                        {
+                            total = (dexed_preset_folder_cursor_ >= 0
+                                     && dexed_preset_folder_cursor_ < dexed_import_folder_count_)
+                                        ? dexed_import_folders_[dexed_preset_folder_cursor_].last_slot
+                                              - dexed_import_folders_[dexed_preset_folder_cursor_]
+                                                    .first_slot
+                                              + 1
+                                        : 0;
+                        }
+                        else
+                            total = DexedSynth::GetFactoryCategoryCount(ResolveDexedRealCategory());
                         if(total <= 0)
                             break;
                         int idx = (int)(Clampf(k1, 0.f, 1.f) * total);
@@ -2112,6 +2490,19 @@ void Ui::ApplyKnobs()
                     }
                     break;
                 }
+                case DexedOpParamPage::AmpModSens:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        // Only bits 0-1 of this byte are ever read
+                        // (patch[off+14] & 3, see msfa's own
+                        // ampmodsenstab lookup), so only those 4 values
+                        // are worth quantizing to.
+                        int sens = (int)(Clampf(k1, 0.f, 1.f) * 3.f + 0.5f);
+                        sens     = sens > 3 ? 3 : sens;
+                        if((uint8_t)sens != (dexed_->GetPatchByte(base + 14) & 3))
+                            dexed_->SetPatchByte(base + 14, (uint8_t)sens);
+                    }
+                    break;
                 default: break;
             }
             break;
@@ -2162,6 +2553,9 @@ void Ui::UpdateLeds()
         case LayerState::ArmedCountIn: pod_->led1.Set(1.f, 0.4f, 0.f); break; // amber
         case LayerState::Recording: pod_->led1.Set(1.f, 0.f, 0.f); break;
         case LayerState::Overdubbing: pod_->led1.Set(1.f, 0.5f, 0.f); break;
+        // Same amber as ArmedCountIn -- it's the identical count-in wait,
+        // just from Playing/Paused instead of Empty.
+        case LayerState::ArmedOverdubCountIn: pod_->led1.Set(1.f, 0.4f, 0.f); break;
         case LayerState::Playing: pod_->led1.Set(0.f, 1.f, 0.f); break;
         case LayerState::Paused: pod_->led1.Set(0.f, 0.f, 0.6f); break;
     }
@@ -2359,7 +2753,11 @@ void Ui::DrawHome()
         case LayerState::Paused: rec_label = "Pause/Overdub"; break;
         case LayerState::ArmedCountIn: rec_label = "Count-in"; break;
         case LayerState::Recording: rec_label = "Stop"; break;
-        case LayerState::Overdubbing: rec_label = "Overdubbing"; break;
+        // A tap now ends overdub early (same as Recording's own "Stop"
+        // above), now that overdub runs a full pass automatically
+        // instead of lasting exactly as long as the button stays held.
+        case LayerState::Overdubbing: rec_label = "Stop"; break;
+        case LayerState::ArmedOverdubCountIn: rec_label = "Count-in"; break;
     }
     char byp_label[12];
     snprintf(byp_label, sizeof(byp_label), "Bypass:%s", bypass_ ? "On" : "Off");
@@ -2413,7 +2811,8 @@ void Ui::DrawWaveform(const float* peaks, bool draw_playhead, float playhead_pos
 // DrawWaveform()'s other callers don't need, so the band starts lower
 // (kBandTop=24 vs 14) to leave room for it.
 void Ui::DrawGranularWaveform(const float* peaks, float grain_anchor01, float scan_anchor01,
-                                bool has_source)
+                                bool has_source, float grain_size01, float range_start01,
+                                float range_end01)
 {
     float max_peak = 0.f;
     for(int col = 0; col < GranularEngine::kWaveformCols; col++)
@@ -2452,7 +2851,45 @@ void Ui::DrawGranularWaveform(const float* peaks, float grain_anchor01, float sc
         if(col_g >= GranularEngine::kWaveformCols)
             col_g = GranularEngine::kWaveformCols - 1;
         int px_g = 1 + col_g * 2;
-        disp_->DrawLine(px_g, kBandTop - 2, px_g, kBandTop - 1, true);
+        if(grain_size01 > 0.f)
+        {
+            // Span the marker to actually show Size, centered on the
+            // anchor -- a horizontal bar this wide plus a 1px center
+            // tick, instead of the plain point marker below (which
+            // Trim's own reuse of this function still gets, via
+            // grain_size01's default of 0 -- start/end points there
+            // don't have a "size" to show).
+            int half_span_px = (int)(grain_size01 * (float)GranularEngine::kWaveformCols + 0.5f);
+            int left_px       = px_g - half_span_px;
+            int right_px      = px_g + half_span_px;
+            int max_x = 1 + (GranularEngine::kWaveformCols - 1) * 2;
+            if(left_px < 1)
+                left_px = 1;
+            if(right_px > max_x)
+                right_px = max_x;
+            disp_->DrawLine(left_px, kBandTop - 2, right_px, kBandTop - 2, true);
+            disp_->DrawPixel(px_g, kBandTop - 1, true);
+        }
+        else
+        {
+            disp_->DrawLine(px_g, kBandTop - 2, px_g, kBandTop - 1, true);
+        }
+    }
+    if(range_start01 >= 0.f && range_end01 >= 0.f)
+    {
+        // Taller than the waveform band itself -- runs from just below
+        // the header divider (y9) down through the anchor-marker zone
+        // and the whole waveform, so these read as real boundary markers
+        // rather than blending into the waveform's own bars.
+        const int kRangeTop = 11;
+        int col_a = (int)(Clampf(range_start01, 0.f, 1.f) * GranularEngine::kWaveformCols);
+        if(col_a >= GranularEngine::kWaveformCols)
+            col_a = GranularEngine::kWaveformCols - 1;
+        int col_b = (int)(Clampf(range_end01, 0.f, 1.f) * GranularEngine::kWaveformCols);
+        if(col_b >= GranularEngine::kWaveformCols)
+            col_b = GranularEngine::kWaveformCols - 1;
+        disp_->DrawLine(1 + col_a * 2, kRangeTop, 1 + col_a * 2, kBandBottom, true);
+        disp_->DrawLine(1 + col_b * 2, kRangeTop, 1 + col_b * 2, kBandBottom, true);
     }
 }
 
@@ -2466,7 +2903,7 @@ void Ui::DrawLayerScreen()
         case LayerPage::Speed: page_name = "Speed"; break;
         case LayerPage::Filter: page_name = "Filter"; break;
         case LayerPage::Effect: page_name = "Effect"; break;
-        case LayerPage::Reverb: page_name = "Reverb"; break;
+        case LayerPage::Reverb: page_name = "LYR-FX"; break;
         case LayerPage::Gain: page_name = "Gain"; break;
         default: break;
     }
@@ -2511,7 +2948,8 @@ void Ui::DrawLayerScreen()
                 // instead. See DrawWaveform() (shared with Global:Speed's
                 // composite view) for the actual drawing/auto-scaling.
                 bool draw_ph = (st == LayerState::Playing || st == LayerState::Paused
-                                || st == LayerState::Overdubbing);
+                                || st == LayerState::Overdubbing
+                                || st == LayerState::ArmedOverdubCountIn);
                 DrawWaveform(Cur().GetWaveformPeaks(), draw_ph, Cur().GetPlayPos01());
             }
 
@@ -2535,7 +2973,12 @@ void Ui::DrawLayerScreen()
                 case LayerState::Recording: rec_label = "Stop"; break;
                 case LayerState::Playing: rec_label = "Overdub/Pause"; break;
                 case LayerState::Paused: rec_label = "Overdub/Play"; break;
-                case LayerState::Overdubbing: rec_label = "Overdubbing"; break;
+                // "Stop", not "Overdubbing" -- a tap now ends it early
+                // (same as Recording's own "Stop" above), now that
+                // overdub runs a full pass automatically instead of
+                // lasting exactly as long as the button stays held.
+                case LayerState::Overdubbing: rec_label = "Stop"; break;
+                case LayerState::ArmedOverdubCountIn: rec_label = "Cancel"; break;
             }
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, rec_label, "", "", "Hold=Clear");
             break;
@@ -2611,19 +3054,17 @@ void Ui::DrawLayerScreen()
         }
         case LayerPage::Reverb:
         {
-            // Send only -- Size is a shared Global:Reverb setting now
-            // (every layer sends into ONE reverb bus, see the shared-bus
-            // comment on LooperLayer::SetReverbSend01()), so Knob2 does
-            // nothing on this page, same as Speed/Gain's idle knob2.
-            snprintf(line1, sizeof(line1), "Send: %d%%",
+            // Send only for both effects -- Size/Time/Feedback are shared
+            // Global:FX settings now (every layer sends into the same
+            // ONE reverb bus and ONE delay bus, see the shared-bus
+            // comment on LooperLayer::SetReverbSend01()/SetDelaySend01()).
+            char rev_val[8], delay_val[8];
+            snprintf(rev_val, sizeof(rev_val), "%d%%",
                       (int)(Cur().GetReverbSend01() * 100.f + 0.5f));
-            disp_->SetCursor(0, 20);
-            WriteUpper(line1);
-
-            char send_val[8];
-            snprintf(send_val, sizeof(send_val), "%d%%",
-                      (int)(Cur().GetReverbSend01() * 100.f + 0.5f));
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, "", "");
+            snprintf(delay_val, sizeof(delay_val), "%d%%",
+                      (int)(Cur().GetDelaySend01() * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Reverb", rev_val, delay_val,
+                             "Delay");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
@@ -2747,7 +3188,7 @@ void Ui::DrawGlobalScreen()
     if(global_page_ == GlobalPage::Filter)
         title = "Global:Filter";
     else if(global_page_ == GlobalPage::Reverb)
-        title = "Global:Reverb";
+        title = "Global:GLB-FX";
     disp_->SetCursor(0, 0);
     WriteUpper(title);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
@@ -2833,10 +3274,11 @@ void Ui::DrawGlobalScreen()
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Cutoff", cutoff_val, res_val, "Res");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Cycle mode", "", "", "");
     }
-    else // GlobalPage::Reverb -- Size/decay for the ONE reverb bus every
-         // layer's Send feeds (see LooperLayer::SetReverbSend01()'s
-         // comment for why this isn't per-layer any more), plus Bypass's
-         // own independent Send into that same bus.
+    else if(global_page_ == GlobalPage::Reverb && !global_fx_target_delay_)
+    // Reverb pair -- Size/decay for the ONE reverb bus every layer's
+    // Send feeds (see LooperLayer::SetReverbSend01()'s comment for why
+    // this isn't per-layer any more), plus Bypass's own independent
+    // Send into that same bus.
     {
         char size_val[8], byp_send_val[8];
         snprintf(size_val, sizeof(size_val), "%d%%", (int)(reverb_size01_ * 100.f + 0.5f));
@@ -2844,7 +3286,20 @@ void Ui::DrawGlobalScreen()
                   (int)(bypass_reverb_send01_ * 100.f + 0.5f));
         DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Size", size_val, byp_send_val,
                          "Byp Send");
-        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                         "Reverb*", "", "", "Delay");
+    }
+    else // GlobalPage::Reverb && global_fx_target_delay_ -- Delay pair,
+         // shared Time/Feedback for the ONE cross-feedback delay bus
+         // both Dexed and Grains send into (see main.cpp's fx_delay_l/r).
+    {
+        char time_val[8], fb_val[8];
+        snprintf(time_val, sizeof(time_val), "%d%%", (int)(delay_time01_ * 100.f + 0.5f));
+        snprintf(fb_val, sizeof(fb_val), "%d%%", (int)(delay_feedback01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Time", time_val, fb_val,
+                         "Feedback");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                         "Reverb", "", "", "Delay*");
     }
 }
 
@@ -3154,8 +3609,13 @@ void Ui::DrawSpeedScreen()
     int  speed_x100 = (int)(project_speed_ * 100.f + 0.5f);
     snprintf(speed_val, sizeof(speed_val), "%d.%02dx", speed_x100 / 100, speed_x100 % 100);
     DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Speed", speed_val, "", "");
+    const char* transport_label = speed_transport_mode_ == SpeedTransportMode::Scrub
+                                       ? "Mode:Scrub"
+                                       : speed_transport_mode_ == SpeedTransportMode::Freeze
+                                             ? "Mode:Freeze"
+                                             : "Mode:Off";
     DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
-                     scrub_mode_active_ ? "Scrub:On" : "Scrub:Off", "", "", "Reset");
+                     transport_label, "", "", "Reset");
 }
 
 void Ui::DrawGranularScreen()
@@ -3168,10 +3628,13 @@ void Ui::DrawGranularScreen()
     {
         case GranularParamPage::Grain: page_name = "Grain"; break;
         case GranularParamPage::Position: page_name = "POS+RHY"; break;
-        case GranularParamPage::TuneDirection: page_name = "Tune"; break;
+        case GranularParamPage::ScanRange: page_name = "ScanRng"; break;
+        case GranularParamPage::Scan: page_name = "Scan"; break;
+        case GranularParamPage::Tune: page_name = "Tune"; break;
         case GranularParamPage::ADSR: page_name = "ADSR"; break;
         case GranularParamPage::Filter: page_name = "Filter"; break;
         case GranularParamPage::Mix: page_name = "Mix"; break;
+        case GranularParamPage::FX: page_name = "GR-FX"; break;
         case GranularParamPage::Capture: page_name = "Capture"; break;
         case GranularParamPage::Trim: page_name = "Trim"; break;
         case GranularParamPage::Preset: page_name = "Preset"; break;
@@ -3205,7 +3668,7 @@ void Ui::DrawGranularScreen()
             // TomThumbAdvanceWidth()), not just left-aligned under it, so
             // differently-wide values (e.g. "3" vs "100%") still read as
             // belonging to the word above them.
-            const char* grain_labels[4] = {"SIZE", "FILL", "GAP", "SCAN"};
+            const char* grain_labels[4] = {"SIZE", "FILL", "GAP", "JITR"};
             char        grain_values[4][8];
             snprintf(grain_values[0], sizeof(grain_values[0]), "%d%%",
                       (int)(granular_->GetSize01() * 100.f + 0.5f));
@@ -3213,7 +3676,7 @@ void Ui::DrawGranularScreen()
             snprintf(grain_values[2], sizeof(grain_values[2]), "%d%%",
                       (int)(granular_->GetGap01() * 100.f + 0.5f));
             snprintf(grain_values[3], sizeof(grain_values[3]), "%d%%",
-                      (int)(granular_->GetScan01() * 100.f + 0.5f));
+                      (int)(granular_->GetJitter01() * 100.f + 0.5f));
             const int kGrainLabelBaseline = 15;
             const int kGrainValueBaseline = 21;
             const int kGrainColWidth      = disp_->Width() / 4;
@@ -3229,9 +3692,10 @@ void Ui::DrawGranularScreen()
             }
 
             DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
-                                  granular_->GetScanAnchor01(), granular_->HasSource());
+                                  granular_->GetScanAnchor01(), granular_->HasSource(),
+                                  granular_->GetGrainSizeFraction01());
 
-            if(!granular_grain_target_gap_scan_)
+            if(!granular_grain_target_gap_jitter_)
             {
                 char sz_val[8], fl_val[8];
                 snprintf(sz_val, sizeof(sz_val), "%d%%",
@@ -3242,19 +3706,19 @@ void Ui::DrawGranularScreen()
             }
             else
             {
-                char gp_val[8], sc_val[8];
+                char gp_val[8], jt_val[8];
                 snprintf(gp_val, sizeof(gp_val), "%d%%",
                           (int)(granular_->GetGap01() * 100.f + 0.5f));
-                snprintf(sc_val, sizeof(sc_val), "%d%%",
-                          (int)(granular_->GetScan01() * 100.f + 0.5f));
-                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Gap", gp_val, sc_val,
-                                 "Scan");
+                snprintf(jt_val, sizeof(jt_val), "%d%%",
+                          (int)(granular_->GetJitter01() * 100.f + 0.5f));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Gap", gp_val, jt_val,
+                                 "Jitter");
             }
             // Marks which pair Button1/Button2 currently map the knobs
             // to, same "*" convention as Pad's own ADSR page.
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
-                             granular_grain_target_gap_scan_ ? "SzFl" : "SzFl*", "", "",
-                             granular_grain_target_gap_scan_ ? "GpSc*" : "GpSc");
+                             granular_grain_target_gap_jitter_ ? "SzFl" : "SzFl*", "", "",
+                             granular_grain_target_gap_jitter_ ? "GpJt*" : "GpJt");
             break;
         }
         case GranularParamPage::Position:
@@ -3276,48 +3740,114 @@ void Ui::DrawGranularScreen()
             TomThumbDrawText(disp_, 0, 15, line1, true);
 
             DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
-                                  granular_->GetScanAnchor01(), granular_->HasSource());
+                                  granular_->GetScanAnchor01(), granular_->HasSource(),
+                                  granular_->GetGrainSizeFraction01());
 
-            char pos_val[8], scan_val[8];
+            char pos_val[8];
             snprintf(pos_val, sizeof(pos_val), "%d%%",
                       (int)(granular_->GetPosition01() * 100.f + 0.5f));
-            if(granular_->IsScanMuted())
-                snprintf(scan_val, sizeof(scan_val), "Mute");
-            else
-                snprintf(scan_val, sizeof(scan_val), "%d%%",
-                          (int)(granular_->GetScanPosition01() * 100.f + 0.5f));
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Position", pos_val, scan_val,
-                             "ScanPos");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Position", pos_val,
+                             GranularDirectionName(granular_->GetDirection()), "Dir");
             // Button hints, same "left label = Button1, right label =
             // Button2" idiom as DexedOperator's own "Op"/"AD/SR" row.
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Rhythm", "", "",
                              "Speed");
             break;
         }
-        case GranularParamPage::TuneDirection:
+        case GranularParamPage::ScanRange:
+        {
+            // Same waveform + anchor markers as every other Grains page,
+            // plus full-height Start/End boundary lines so the sweep's
+            // actual range is visible directly on the display, not just
+            // as two percentages.
+            DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
+                                  granular_->GetScanAnchor01(), granular_->HasSource(),
+                                  granular_->GetGrainSizeFraction01(),
+                                  granular_->GetScanPosition01(), granular_->GetScanEnd01());
+
+            // Button1/Button2 toggle which pair K1/K2 reach -- Start+End
+            // (the range itself) or just Gap (Scan's own, K1 only; see
+            // GranularEngine::SetScanGap01()'s own comment) -- same
+            // toggle idiom as the Grain page's own Size+Fill/Gap+Jitter
+            // pair.
+            if(!granular_scanrange_target_gap_)
+            {
+                char start_val[8], end_val[8];
+                snprintf(start_val, sizeof(start_val), "%d%%",
+                          (int)(granular_->GetScanPosition01() * 100.f + 0.5f));
+                snprintf(end_val, sizeof(end_val), "%d%%",
+                          (int)(granular_->GetScanEnd01() * 100.f + 0.5f));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Start", start_val, end_val,
+                                 "End");
+            }
+            else
+            {
+                char gap_val[8];
+                snprintf(gap_val, sizeof(gap_val), "%d%%",
+                          (int)(granular_->GetScanGap01() * 100.f + 0.5f));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Gap", gap_val, "", "");
+            }
+            // Marks which pair Button1 currently maps the knobs to, same
+            // "*" convention as the Grain page's own toggle indicator.
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                             granular_scanrange_target_gap_ ? "StEnd" : "StEnd*", "", "",
+                             granular_scanrange_target_gap_ ? "Gap*" : "Gap");
+            break;
+        }
+        case GranularParamPage::Scan:
+        {
+            // Bounce (reverse at each edge) vs Wrap (jump back to the
+            // other edge, same direction) -- Button1 toggles. Direction
+            // (Forward/Reverse/Random, independent of the sweep's own
+            // Bounce/Wrap heading -- see GranularEngine::
+            // ResolveScanDirectionSign()'s own comment) -- Button2
+            // cycles. Same "top text line shows the button-controlled
+            // mode(s)" idiom as Position's own "Rhy:.. Spd:.." line.
+            char scan_line1[28];
+            snprintf(scan_line1, sizeof(scan_line1), "Mode:%s Dir:%s",
+                      granular_->GetScanBounce() ? "Bounce" : "Wrap",
+                      GranularDirectionName(granular_->GetScanDirection()));
+            TomThumbDrawText(disp_, 0, 15, scan_line1, true);
+
+            // Same waveform + anchor markers as Grain/Position -- shows
+            // the Scan layer's own sweeping anchor.
+            DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
+                                  granular_->GetScanAnchor01(), granular_->HasSource(),
+                                  granular_->GetGrainSizeFraction01());
+
+            char sc_val[8], fl_val[8];
+            if(granular_->IsScanMuted())
+                snprintf(sc_val, sizeof(sc_val), "Mute");
+            else
+                snprintf(sc_val, sizeof(sc_val), "%d%%",
+                          (int)(granular_->GetScan01() * 100.f + 0.5f));
+            snprintf(fl_val, sizeof(fl_val), "%d", granular_->GetScanFill());
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Scan", sc_val, fl_val, "Fill");
+            // Button1 toggles Bounce/Wrap, Button2 cycles Direction (see
+            // the top text line above for both current states).
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Bounce/Wrap", "", "",
+                             "Direction");
+            break;
+        }
+        case GranularParamPage::Tune:
         {
             int semis = granular_->GetGrainTuneSemitones();
-            const char* dir_name = GranularDirectionName(granular_->GetDirection());
-            char line1[24];
-            snprintf(line1, sizeof(line1), "Tune:%+d  Dir:%s", semis, dir_name);
-            TomThumbDrawText(disp_, 0, 15, line1, true);
-            TomThumbDrawText(disp_, 0, 22,
+            TomThumbDrawText(disp_, 0, 15,
                                granular_->GetGrainFollowsNote() ? "Map to note: On"
                                                                   : "Map to note: Off",
                                true);
 
             // Same waveform + anchor markers as Grain/Position -- this
-            // page's own two knobs (Tune, Direction) don't move an
-            // anchor, but showing it anyway keeps every Grains page from
-            // looking empty and still reflects Direction's effect
-            // (reversed grains) once that's audible.
+            // page's own one knob (Tune) doesn't move an anchor, but
+            // showing it anyway keeps every Grains page from looking
+            // empty. Direction moved to Position's own K2.
             DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
-                                  granular_->GetScanAnchor01(), granular_->HasSource());
+                                  granular_->GetScanAnchor01(), granular_->HasSource(),
+                                  granular_->GetGrainSizeFraction01());
 
             char tune_val[8];
             snprintf(tune_val, sizeof(tune_val), "%+d", semis);
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Tune", tune_val, dir_name,
-                             "Dir");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Tune", tune_val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                              granular_->GetGrainFollowsNote() ? "Map:On" : "Map:Off", "", "", "");
             break;
@@ -3430,6 +3960,40 @@ void Ui::DrawGranularScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                              granular_mix_target_reverb_ ? "Grain/Scan" : "Grain/Scan*", "", "",
                              granular_mix_target_reverb_ ? "Reverb*" : "Reverb");
+            break;
+        }
+        case GranularParamPage::FX:
+        {
+            // Full reverb/delay control from within Grains itself -- Mix's
+            // own Grain/Scan/Reverb Send above are untouched, this is an
+            // additional page (see GranularParamPage::FX's own comment).
+            if(!granular_fx_target_delay_)
+            {
+                char send_val[8], size_val[8];
+                snprintf(send_val, sizeof(send_val), "%d%%",
+                          (int)(granular_->GetReverbSend01() * 100.f + 0.5f));
+                snprintf(size_val, sizeof(size_val), "%d%%",
+                          (int)(reverb_size01_ * 100.f + 0.5f));
+                disp_->SetCursor(0, 20);
+                WriteUpper("Reverb");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, size_val,
+                                 "Size");
+            }
+            else
+            {
+                char send_val[8], time_val[8];
+                snprintf(send_val, sizeof(send_val), "%d%%",
+                          (int)(granular_->GetDelaySend01() * 100.f + 0.5f));
+                snprintf(time_val, sizeof(time_val), "%d%%",
+                          (int)(delay_time01_ * 100.f + 0.5f));
+                disp_->SetCursor(0, 20);
+                WriteUpper("Delay");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, time_val,
+                                 "Time");
+            }
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                             granular_fx_target_delay_ ? "Reverb" : "Reverb*", "", "",
+                             granular_fx_target_delay_ ? "Delay*" : "Delay");
             break;
         }
         case GranularParamPage::Capture:
@@ -3545,7 +4109,8 @@ void Ui::DrawGranularScreen()
                 if(granular_capture_status_[0] != '\0')
                     TomThumbDrawText(disp_, 0, 22, granular_capture_status_, true);
                 DrawGranularWaveform(granular_->GetWaveformPeaks(), granular_->GetGrainAnchor01(),
-                                      granular_->GetScanAnchor01(), granular_->HasSource());
+                                      granular_->GetScanAnchor01(), granular_->HasSource(),
+                                      granular_->GetGrainSizeFraction01());
             }
 
             const char* hold_label = "Hold=Record";
@@ -3870,11 +4435,12 @@ void Ui::DrawDexedScreen()
     {
         case DexedParamPage::Algo: page_name = "Algo"; break;
         case DexedParamPage::Feedback: page_name = "Feedback"; break;
-        case DexedParamPage::Vibrato: page_name = "Vibrato"; break;
+        case DexedParamPage::Vibrato: page_name = "MOD"; break;
         case DexedParamPage::Brightness: page_name = "Bright"; break;
         case DexedParamPage::EnvSpeed: page_name = "EnvSpd"; break;
         case DexedParamPage::Filter: page_name = "Filter"; break;
         case DexedParamPage::Mix: page_name = "Mix"; break;
+        case DexedParamPage::FX: page_name = "DX-FX"; break;
         case DexedParamPage::Advanced: page_name = "Advanced"; break;
         case DexedParamPage::Preset: page_name = "Preset"; break;
         default: break;
@@ -4157,14 +4723,33 @@ void Ui::DrawDexedScreen()
         }
         case DexedParamPage::Vibrato:
         {
-            char speed_val[8], depth_val[8];
-            snprintf(speed_val, sizeof(speed_val), "%d", dexed_->GetPatchByte(137));
-            snprintf(depth_val, sizeof(depth_val), "%d", dexed_->GetPatchByte(139));
             disp_->SetCursor(0, 20);
-            WriteUpper("Vibrato (automatic)");
-            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Speed", speed_val, depth_val,
-                             "Depth");
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            WriteUpper(dexed_->GetModWheelTargetName());
+            // Button1 cycles the real DX7 mod-wheel routing (Pitch/Amp/EG
+            // Bias, see DexedSynth::ModWheelTarget's own comment).
+            // Button2 toggles the knobs below between the patch's own
+            // baked-in automatic vibrato (Speed/Depth) and the global
+            // Pitch Mod Sensitivity byte that gates whether Pitch (and
+            // the Depth knob itself) can do anything audible at all --
+            // added after a real report that every mod-wheel target was
+            // silent, traced to this byte never being exposed.
+            if(!dexed_vibrato_target_sens_)
+            {
+                char speed_val[8], depth_val[8];
+                snprintf(speed_val, sizeof(speed_val), "%d", dexed_->GetPatchByte(137));
+                snprintf(depth_val, sizeof(depth_val), "%d", dexed_->GetPatchByte(139));
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Speed", speed_val,
+                                 depth_val, "Depth");
+            }
+            else
+            {
+                char sens_val[8];
+                snprintf(sens_val, sizeof(sens_val), "%d", dexed_->GetPatchByte(143) & 7);
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Sens", sens_val, "", "");
+            }
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                             dexed_vibrato_target_sens_ ? "Wheel Tgt" : "Wheel Tgt*", "", "",
+                             dexed_vibrato_target_sens_ ? "Speed/Sens*" : "Speed/Sens");
             break;
         }
         case DexedParamPage::Brightness:
@@ -4223,6 +4808,40 @@ void Ui::DrawDexedScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
+        case DexedParamPage::FX:
+        {
+            // Full reverb/delay control from within Dexed itself -- Mix's
+            // own Reverb Send/Output Level above are untouched, this is
+            // an additional page (see DexedParamPage::FX's own comment).
+            if(!dexed_fx_target_delay_)
+            {
+                char send_val[8], size_val[8];
+                snprintf(send_val, sizeof(send_val), "%d%%",
+                          (int)(dexed_->GetReverbSend01() * 100.f + 0.5f));
+                snprintf(size_val, sizeof(size_val), "%d%%",
+                          (int)(reverb_size01_ * 100.f + 0.5f));
+                disp_->SetCursor(0, 20);
+                WriteUpper("Reverb");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, size_val,
+                                 "Size");
+            }
+            else
+            {
+                char send_val[8], time_val[8];
+                snprintf(send_val, sizeof(send_val), "%d%%",
+                          (int)(dexed_->GetDelaySend01() * 100.f + 0.5f));
+                snprintf(time_val, sizeof(time_val), "%d%%",
+                          (int)(delay_time01_ * 100.f + 0.5f));
+                disp_->SetCursor(0, 20);
+                WriteUpper("Delay");
+                DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, time_val,
+                                 "Time");
+            }
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                             dexed_fx_target_delay_ ? "Reverb" : "Reverb*", "", "",
+                             dexed_fx_target_delay_ ? "Delay*" : "Delay");
+            break;
+        }
         case DexedParamPage::Advanced:
         {
             // Entry point into Screen::DexedOperator -- same "Click to
@@ -4252,22 +4871,36 @@ void Ui::DrawDexedScreen()
 
             bool choosing_save    = save_load_mode_ == SaveLoadMode::ChoosingSave;
             bool browsing_load    = save_load_mode_ == SaveLoadMode::BrowsingLoad;
-            bool load_chooser     = browsing_load && !load_browsing_files_;
-            bool browsing_folders
-                = browsing_load && load_browsing_files_ && !dexed_preset_folder_open_;
-            // A folder name isn't a preset -- nothing to confirm-load
-            // until "New" is picked at the top chooser, or a folder is
-            // actually open onto a real preset (see
-            // dexed_preset_folder_open_'s own comment).
+            bool browsing_import  = browsing_load && dexed_import_browsing_;
+            bool load_chooser     = browsing_load && !load_browsing_files_ && !dexed_import_browsing_;
+            bool browsing_group
+                = browsing_load && load_browsing_files_ && !dexed_files_group_open_;
+            bool browsing_folders = browsing_load && load_browsing_files_ && dexed_files_group_open_
+                                      && dexed_files_group_ != DexedFilesGroup::User
+                                      && !dexed_preset_folder_open_;
+            if(browsing_import && dexed_import_files_dirty_)
+                RefreshDexedImportFiles();
+            // A group/folder name isn't a preset -- nothing to
+            // confirm-load until "New" is picked at the top chooser, a
+            // folder is actually open onto a real preset
+            // (Roms/Dexed/Imports), the User group is open (it has no
+            // folder level of its own, see DexedFilesGroup's own
+            // comment), or a real .syx file is highlighted inside the
+            // Import list.
+            bool dexed_files_ready = load_browsing_files_ && dexed_files_group_open_
+                                       && (dexed_preset_folder_open_
+                                           || dexed_files_group_ == DexedFilesGroup::User);
             bool can_hold_load = browsing_load
-                                  && (load_new_selected_
-                                      || (load_browsing_files_ && dexed_preset_folder_open_));
+                                  && (load_new_selected_ || dexed_files_ready
+                                      || (dexed_import_browsing_ && dexed_import_file_count_ > 0));
 
             if(pod_->button2.Pressed() && (choosing_save || can_hold_load))
             {
                 float       held     = pod_->button2.TimeHeldMs();
                 int         w = (int)(Clampf(held / 800.f, 0.f, 1.f) * (disp_->Width() - 2));
-                const char* hold_msg = choosing_save ? "Hold: Save..." : "Hold: Load...";
+                const char* hold_msg = choosing_save
+                                           ? "Hold: Save..."
+                                           : browsing_import ? "Hold: Import..." : "Hold: Load...";
                 disp_->SetCursor(0, 20);
                 WriteUpper(hold_msg);
                 disp_->DrawRect(0, 30, disp_->Width() - 1, 34, true, false);
@@ -4293,34 +4926,86 @@ void Ui::DrawDexedScreen()
             }
             else if(load_chooser)
             {
-                char line1[24], line2[16];
-                snprintf(line1, sizeof(line1), "%c Files", !load_new_selected_ ? '>' : ' ');
-                snprintf(line2, sizeof(line2), "%c Load New", load_new_selected_ ? '>' : ' ');
-                disp_->SetCursor(0, 16);
+                char line1[24], line2[24], line3[16];
+                bool files_sel = !load_new_selected_ && !dexed_import_selected_;
+                snprintf(line1, sizeof(line1), "%c Files", files_sel ? '>' : ' ');
+                snprintf(line2, sizeof(line2), "%c Import", dexed_import_selected_ ? '>' : ' ');
+                snprintf(line3, sizeof(line3), "%c Load New", load_new_selected_ ? '>' : ' ');
+                disp_->SetCursor(0, 14);
                 WriteUpper(line1);
-                disp_->SetCursor(0, 28);
+                disp_->SetCursor(0, 24);
                 WriteUpper(line2);
+                disp_->SetCursor(0, 34);
+                WriteUpper(line3);
+            }
+            else if(browsing_import)
+            {
+                char line2[24];
+                if(dexed_import_file_count_ <= 0)
+                    snprintf(line2, sizeof(line2), "No .syx in DXIMPORT/");
+                else
+                    snprintf(line2, sizeof(line2), "Import: %.14s",
+                              dexed_import_names_[dexed_import_cursor_]);
+                disp_->SetCursor(0, 20);
+                WriteUpper(line2);
+            }
+            else if(browsing_group)
+            {
+                // Tom Thumb (see font_tomthumb.h), not the normal
+                // WriteUpper()/Font_6x8 every other line on this page
+                // uses -- 4 rows don't fit this body area at 8px/row,
+                // Tom Thumb's own 6px row height does.
+                char line1[16], line2[16], line3[16], line4[16];
+                snprintf(line1, sizeof(line1), "%c Roms",
+                          dexed_files_group_ == DexedFilesGroup::Roms ? '>' : ' ');
+                snprintf(line2, sizeof(line2), "%c Dexed",
+                          dexed_files_group_ == DexedFilesGroup::Dexed ? '>' : ' ');
+                snprintf(line3, sizeof(line3), "%c Imports",
+                          dexed_files_group_ == DexedFilesGroup::Imports ? '>' : ' ');
+                snprintf(line4, sizeof(line4), "%c User",
+                          dexed_files_group_ == DexedFilesGroup::User ? '>' : ' ');
+                TomThumbDrawText(disp_, 0, 16, line1, true);
+                TomThumbDrawText(disp_, 0, 24, line2, true);
+                TomThumbDrawText(disp_, 0, 32, line3, true);
+                TomThumbDrawText(disp_, 0, 40, line4, true);
             }
             else if(browsing_folders)
             {
-                int count = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
-                                ? DexedSynth::GetFactoryCategoryCount(dexed_preset_folder_cursor_)
-                                : dexed_preset_user_slot_count_;
                 // No "Folder: " label -- Font_6x8 is fixed 6px/char, and
                 // "Folder: Woodwind 3 (64)" (23 chars) overflows the
                 // 128px display (21 chars max), pushing the count off
                 // the right edge. The longest real name+count ("Woodwind
                 // 3 (64)", 15 chars) fits comfortably without the label.
-                char line2[24];
-                snprintf(line2, sizeof(line2), "%s (%d)",
-                          dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
-                              ? DexedSynth::GetFactoryCategoryName(dexed_preset_folder_cursor_)
-                              : "User",
-                          count);
+                char        line2[24];
+                const char* name;
+                int         count;
+                if(dexed_files_group_ == DexedFilesGroup::Imports)
+                {
+                    if(dexed_preset_folder_cursor_ >= 0
+                       && dexed_preset_folder_cursor_ < dexed_import_folder_count_)
+                    {
+                        const PerformanceStore::DexedImportFolder& f
+                            = dexed_import_folders_[dexed_preset_folder_cursor_];
+                        name  = f.name;
+                        count = f.last_slot - f.first_slot + 1;
+                    }
+                    else
+                    {
+                        name  = "(none)";
+                        count = 0;
+                    }
+                }
+                else
+                {
+                    int cat = ResolveDexedRealCategory();
+                    name    = DexedSynth::GetFactoryCategoryName(cat);
+                    count   = DexedSynth::GetFactoryCategoryCount(cat);
+                }
+                snprintf(line2, sizeof(line2), "%s (%d)", name, count);
                 disp_->SetCursor(0, 20);
                 WriteUpper(line2);
             }
-            else if(browsing_load) // load_browsing_files_ && dexed_preset_folder_open_
+            else if(browsing_load) // dexed_files_ready -- see its own comment above
             {
                 int  browsed_slot = ResolveDexedPresetSlot();
                 char line2[24];
@@ -4330,7 +5015,34 @@ void Ui::DrawDexedScreen()
                     snprintf(line2, sizeof(line2), "Load: %s",
                               DexedSynth::GetFactoryPresetName(browsed_slot - 1));
                 else
-                    snprintf(line2, sizeof(line2), "Load: %d", browsed_slot);
+                {
+                    // A user slot's real name lives inside its own saved
+                    // file (a manual save keeps whatever name was in the
+                    // live patch at save time; a SysEx import keeps the
+                    // bank's own original name verbatim) -- read it once
+                    // per distinct slot landed on, not once per Draw()
+                    // tick, see dexed_browse_name_slot_'s own comment.
+                    if(browsed_slot != dexed_browse_name_slot_)
+                    {
+                        DexedSynth::DexedPresetData preset;
+                        const char*                  name = "?";
+                        if(PerformanceStore::LoadDexedPreset(browsed_slot, &preset))
+                            name = DexedSynth::GetPresetDataName(preset);
+                        // Some older saves genuinely predate real embedded
+                        // names (before the factory bank/name system
+                        // existed) and carry blank name bytes -- fall
+                        // back to the slot number rather than a bare "?"
+                        // so those don't look like a fresh regression.
+                        if(strcmp(name, "?") == 0)
+                            snprintf(dexed_browse_name_buf_, sizeof(dexed_browse_name_buf_), "%d",
+                                      browsed_slot);
+                        else
+                            snprintf(dexed_browse_name_buf_, sizeof(dexed_browse_name_buf_), "%s",
+                                      name);
+                        dexed_browse_name_slot_ = browsed_slot;
+                    }
+                    snprintf(line2, sizeof(line2), "Load: %s", dexed_browse_name_buf_);
+                }
                 disp_->SetCursor(0, 20);
                 WriteUpper(line2);
             }
@@ -4343,7 +5055,19 @@ void Ui::DrawDexedScreen()
                     snprintf(line1, sizeof(line1), "Now: %s",
                               DexedSynth::GetFactoryPresetName(dexed_loaded_preset_slot_ - 1));
                 else
-                    snprintf(line1, sizeof(line1), "Now: %d", dexed_loaded_preset_slot_);
+                {
+                    // Live in RAM already (dexed_ is currently playing
+                    // it) -- no SD read needed, unlike the "Load:" case
+                    // above for a highlighted-but-not-yet-applied slot.
+                    const char* name = DexedSynth::GetPresetDataName(dexed_->CapturePreset());
+                    if(strcmp(name, "?") == 0)
+                        // See the "Load:" case's own comment -- some
+                        // older saves genuinely predate real embedded
+                        // names and carry blank name bytes.
+                        snprintf(line1, sizeof(line1), "Now: %d", dexed_loaded_preset_slot_);
+                    else
+                        snprintf(line1, sizeof(line1), "Now: %s", name);
+                }
                 disp_->SetCursor(0, 20);
                 WriteUpper(line1);
                 if(dexed_preset_status_[0] != '\0')
@@ -4359,17 +5083,25 @@ void Ui::DrawDexedScreen()
                     b1_label = "Save";
                 else if(load_chooser && !load_new_selected_)
                     b1_label = "Select";
-                else if(browsing_folders)
-                    b1_label = "Open";
                 else
+                    // Back everywhere else within Files' own nested
+                    // browsing (group chooser, folder list, and an open
+                    // folder) -- Button2 is "Open" at the group/folder
+                    // levels instead (drills deeper), see
+                    // OnButton1Short()/HandleButton2()'s own comments on
+                    // this split.
                     b1_label = "Back";
                 const char* b2_label;
                 if(save_load_mode_ == SaveLoadMode::Idle)
                     b2_label = "Load";
                 else if(choosing_save)
                     b2_label = "Hold=Save";
-                else if(load_browsing_files_ && dexed_preset_folder_open_)
+                else if(browsing_group || browsing_folders)
+                    b2_label = "Open";
+                else if(dexed_files_ready)
                     b2_label = "Prev./Hold=Load";
+                else if(browsing_import && can_hold_load)
+                    b2_label = "Hold=Import";
                 else if(can_hold_load)
                     b2_label = "Hold=Load";
                 else
@@ -4404,6 +5136,7 @@ void Ui::DrawDexedOperatorScreen()
         case DexedOpParamPage::Detune: page_name = "Detune"; break;
         case DexedOpParamPage::EgRate: page_name = "EG Rate"; break;
         case DexedOpParamPage::EgLevel: page_name = "EG Level"; break;
+        case DexedOpParamPage::AmpModSens: page_name = "AmpSens"; break;
         default: break;
     }
     char title[24];
@@ -4481,6 +5214,16 @@ void Ui::DrawDexedOperatorScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "AD/SR");
             break;
         }
+        case DexedOpParamPage::AmpModSens:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(base + 14) & 3);
+            disp_->SetCursor(0, 20);
+            WriteUpper("0 = wheel has no effect");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "AmpSens", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
         default: break;
     }
 }
@@ -4502,7 +5245,7 @@ void Ui::DrawMixerScreen()
     }
 
     // A real channel -- whichever group of 4 it belongs to (0-3 = the
-    // loop layers, 4-7 = Plaits/Grains/Bypass/Master), with real Vol/
+    // loop layers, 4-7 = Grains/Dexed/Bypass/Master), with real Vol/
     // Rev/Pan bars for each of those 4 at once.
     bool is_master = mixer_position_ == kNumMixerChannels - 1;
     char title[24];
@@ -4798,9 +5541,11 @@ void Ui::TriggerLoad()
     // Project vari-speed is a live-performance control, not part of a
     // saved performance (same rule as master volume) -- always back to
     // 1.0x after a Load, same as at boot, regardless of success/failure.
-    project_speed01_   = 0.5f;
-    project_speed_     = 1.f;
-    scrub_mode_active_ = false;
+    project_speed01_      = 0.5f;
+    project_speed_        = 1.f;
+    speed_transport_mode_ = SpeedTransportMode::Normal;
+    for(int i = 0; i < num_layers_; i++)
+        layers_[i].SetFreezeActive(false);
 
     if(ok)
     {
@@ -5042,8 +5787,22 @@ void Ui::ApplyGranularTrim()
     if(end <= start)
         end = start + 1 <= full ? start + 1 : full;
 
-    granular_->SetSource(granular_capture_buf_l_ + start, granular_capture_buf_r_ + start,
+    granular_->SetTrimRange(granular_capture_buf_l_ + start, granular_capture_buf_r_ + start,
                           end - start);
+
+    // Audio range above is already live and correct every tick (cheap,
+    // O(1)); the waveform redraw only needs to keep up with what's
+    // actually visible, so recompute it far less often than the knob
+    // itself is polled -- every 20th call here (~20ms at the main loop's
+    // own ~1kHz rate), not every single one. Still feels fully live/
+    // continuous to the eye while turning, at a fraction of the cost.
+    constexpr uint32_t kPeaksThrottle = 20;
+    granular_trim_peaks_throttle_++;
+    if(granular_trim_peaks_throttle_ >= kPeaksThrottle)
+    {
+        granular_trim_peaks_throttle_ = 0;
+        granular_->RecomputeWaveformPeaks();
+    }
 }
 
 void Ui::RefreshGranularPresetSlots()
@@ -5153,23 +5912,83 @@ void Ui::TriggerLoadGranularPreset()
 
 void Ui::RefreshDexedPresetSlots()
 {
-    dexed_preset_user_slot_count_
-        = PerformanceStore::ListDexedPresets(dexed_preset_user_slots_, kMaxDexedPresetSlots);
-    int folder_count = dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories
-                            ? DexedSynth::GetFactoryCategoryCount(dexed_preset_folder_cursor_)
-                            : dexed_preset_user_slot_count_;
+    dexed_import_folder_count_ = PerformanceStore::ListDexedImportFolders(
+        dexed_import_folders_, PerformanceStore::kMaxDexedImportFolders);
+
+    // Full unfiltered scan, then drop anything that belongs to a
+    // recorded import folder -- what's left is the User group's own
+    // list (see dexed_preset_user_slots_'s own doc comment). Needs the
+    // import-folder refresh above to have already happened this call.
+    static int raw_slots[kMaxDexedPresetSlots];
+    int        raw_count = PerformanceStore::ListDexedPresets(raw_slots, kMaxDexedPresetSlots);
+    int        filtered  = 0;
+    for(int i = 0; i < raw_count && filtered < kMaxDexedPresetSlots; i++)
+    {
+        int  slot      = raw_slots[i];
+        bool in_import = false;
+        for(int f = 0; f < dexed_import_folder_count_; f++)
+        {
+            if(slot >= dexed_import_folders_[f].first_slot
+               && slot <= dexed_import_folders_[f].last_slot)
+            {
+                in_import = true;
+                break;
+            }
+        }
+        if(!in_import)
+            dexed_preset_user_slots_[filtered++] = slot;
+    }
+    dexed_preset_user_slot_count_ = filtered;
+
+    int folder_count;
+    switch(dexed_files_group_)
+    {
+        case DexedFilesGroup::Roms:
+        case DexedFilesGroup::Dexed:
+            folder_count = DexedSynth::GetFactoryCategoryCount(ResolveDexedRealCategory());
+            break;
+        case DexedFilesGroup::Imports: folder_count = dexed_import_folder_count_; break;
+        case DexedFilesGroup::User:
+        default: folder_count = dexed_preset_user_slot_count_; break;
+    }
     if(dexed_preset_cursor_ >= folder_count)
         dexed_preset_cursor_ = folder_count > 0 ? folder_count - 1 : 0;
     dexed_preset_slots_dirty_ = false;
 }
 
+int Ui::ResolveDexedRealCategory() const
+{
+    if(dexed_files_group_ == DexedFilesGroup::Roms)
+        return dexed_preset_folder_cursor_;
+    if(dexed_files_group_ == DexedFilesGroup::Dexed)
+        return dexed_preset_folder_cursor_ + DexedSynth::kNumRomCategories;
+    return -1;
+}
+
 int Ui::ResolveDexedPresetSlot() const
 {
-    if(dexed_preset_folder_cursor_ < DexedSynth::kNumFactoryCategories)
-        return DexedSynth::GetFactoryCategorySlot(dexed_preset_folder_cursor_, dexed_preset_cursor_);
-    if(dexed_preset_cursor_ < 0 || dexed_preset_cursor_ >= dexed_preset_user_slot_count_)
-        return -1;
-    return dexed_preset_user_slots_[dexed_preset_cursor_];
+    switch(dexed_files_group_)
+    {
+        case DexedFilesGroup::Roms:
+        case DexedFilesGroup::Dexed:
+            return DexedSynth::GetFactoryCategorySlot(ResolveDexedRealCategory(),
+                                                        dexed_preset_cursor_);
+        case DexedFilesGroup::Imports:
+        {
+            if(dexed_preset_folder_cursor_ < 0
+               || dexed_preset_folder_cursor_ >= dexed_import_folder_count_)
+                return -1;
+            const PerformanceStore::DexedImportFolder& f
+                = dexed_import_folders_[dexed_preset_folder_cursor_];
+            int slot = f.first_slot + dexed_preset_cursor_;
+            return slot <= f.last_slot ? slot : -1;
+        }
+        case DexedFilesGroup::User:
+        default:
+            if(dexed_preset_cursor_ < 0 || dexed_preset_cursor_ >= dexed_preset_user_slot_count_)
+                return -1;
+            return dexed_preset_user_slots_[dexed_preset_cursor_];
+    }
 }
 
 void Ui::TriggerSaveDexedPreset(bool force_new)
@@ -5212,6 +6031,11 @@ void Ui::TriggerLoadDexedPreset()
 {
     if(!dexed_)
         return;
+    if(dexed_import_selected_)
+    {
+        TriggerDexedSyxImport();
+        return;
+    }
     if(!load_browsing_files_)
     {
         TriggerNewDexedPreset();
@@ -5240,6 +6064,113 @@ void Ui::TriggerLoadDexedPreset()
     }
 }
 
+void Ui::RefreshDexedImportFiles()
+{
+    dexed_import_file_count_
+        = PerformanceStore::ListImportSyxFiles(dexed_import_names_, kMaxImportFiles);
+    if(dexed_import_cursor_ >= dexed_import_file_count_)
+        dexed_import_cursor_ = dexed_import_file_count_ > 0 ? dexed_import_file_count_ - 1 : 0;
+    dexed_import_files_dirty_ = false;
+}
+
+void Ui::TriggerDexedSyxImport()
+{
+    if(!dexed_ || dexed_import_file_count_ <= 0 || dexed_import_cursor_ < 0
+       || dexed_import_cursor_ >= dexed_import_file_count_)
+        return;
+
+    // static -- 32 DexedPresetData (~6KB) is more than this function
+    // wants to put on the stack for a UI action, same "large buffer ->
+    // static" caution used throughout PerformanceStore's own SD I/O.
+    static DexedSynth::DexedPresetData presets[PerformanceStore::kMaxSyxBulkVoices];
+    int                                count = 0;
+    if(!PerformanceStore::ImportDexedSyx(dexed_import_names_[dexed_import_cursor_], presets, &count))
+    {
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Fail:%s",
+                  PerformanceStore::GetLastError());
+        return;
+    }
+
+    // Each decoded voice becomes its own new user slot -- a Single Voice
+    // Dump writes one, a 32-Voice Bulk Dump writes up to 32. Stops early
+    // (keeping whatever was already written) if the card fills up
+    // mid-import rather than losing the whole batch.
+    //
+    // Two real bugs fixed here, confirmed on hardware (a 32-voice import
+    // looked completely frozen for several seconds): (1)
+    // NextFreeDexedPresetSlot() used to be called fresh for every single
+    // voice, each call re-scanning the WHOLE user slot range from its
+    // own start -- O(n) work called n times is O(n^2) for the batch.
+    // next_candidate instead resumes each search right where the last
+    // one left off, one real forward sweep across the whole import.
+    // (2) nothing drew anything to the display for the whole loop, so a
+    // multi-second batch gave zero feedback that it was doing anything
+    // at all -- this now shows the same "WORKING..." progress overlay
+    // (Ui::OnSaveLoadProgress()) every other multi-step SD operation in
+    // this project already uses.
+    g_progress_disp = disp_;
+    int first_slot = -1, last_slot = -1, next_candidate = -1;
+    for(int i = 0; i < count; i++)
+    {
+        int slot = PerformanceStore::NextFreeDexedPresetSlot(next_candidate);
+        if(slot < 0 || !PerformanceStore::SaveDexedPreset(slot, presets[i]))
+            break;
+        next_candidate = slot + 1;
+        if(first_slot < 0)
+            first_slot = slot;
+        last_slot = slot;
+        OnSaveLoadProgress((float)(i + 1) / (float)count);
+    }
+    g_progress_disp = nullptr;
+
+    if(last_slot < 0)
+    {
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Card full/missing");
+        return;
+    }
+
+    // Land on the last voice imported, live -- same "something real is
+    // now loaded" feel as TriggerLoadDexedPreset()'s own preview.
+    dexed_->ApplyPreset(presets[count - 1]);
+    dexed_loaded_preset_slot_ = last_slot;
+    dexed_preset_slots_dirty_ = true; // new user slot(s) now exist
+
+    // Every import gets its own named folder (Files -> Imports group),
+    // even a single-voice one -- named after the .syx file itself (the
+    // SysEx data carries no overall "bank name" field of its own, only
+    // each voice's individual 10-character name -- see
+    // PerformanceStore::DexedImportFolder's own doc comment), extension
+    // stripped. A failure here doesn't touch dexed_preset_status_ (the
+    // "Imported->" message above already reported real success) --
+    // it'd only mean this one import doesn't get its own folder and its
+    // slots fall back to showing in the plain User list instead, not
+    // that anything was lost.
+    {
+        const char* base = dexed_import_names_[dexed_import_cursor_];
+        char        folder_name[24];
+        snprintf(folder_name, sizeof(folder_name), "%s", base);
+        size_t len = strlen(folder_name);
+        if(len > 4)
+        {
+            // Case-insensitive ".syx" check, same manual-lowercase idiom
+            // ListImportSyxFiles() already uses for the same extension.
+            char ext[5];
+            for(int i = 0; i < 4; i++)
+                ext[i] = (char)tolower((unsigned char)folder_name[len - 4 + i]);
+            ext[4] = '\0';
+            if(strcmp(ext, ".syx") == 0)
+                folder_name[len - 4] = '\0';
+        }
+        PerformanceStore::SaveDexedImportFolder(folder_name, first_slot, last_slot);
+    }
+
+    if(first_slot == last_slot)
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Imported->%d", last_slot);
+    else
+        snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Imported->%d-%d", first_slot,
+                  last_slot);
+}
+
 void Ui::TriggerSaveDefaults()
 {
     bool ok = PerformanceStore::SavePrefs(*tempo_, master_volume01_, bypass_,
@@ -5262,8 +6193,9 @@ void Ui::TriggerExport()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            reverb_size01_, /*for_microdexed=*/false,
-                                            project_speed_, &Ui::OnSaveLoadProgress);
+                                            reverb_size01_, delay_time01_, delay_feedback01_,
+                                            /*for_microdexed=*/false, project_speed_,
+                                            &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;
@@ -5284,8 +6216,9 @@ void Ui::TriggerExportMicroDexed()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            reverb_size01_, /*for_microdexed=*/true,
-                                            project_speed_, &Ui::OnSaveLoadProgress);
+                                            reverb_size01_, delay_time01_, delay_feedback01_,
+                                            /*for_microdexed=*/true, project_speed_,
+                                            &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
     g_progress_disp         = nullptr;
     g_audio_suspended       = false;

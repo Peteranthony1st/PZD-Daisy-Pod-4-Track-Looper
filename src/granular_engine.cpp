@@ -125,22 +125,36 @@ void GranularEngine::SetSource(const float* buf_l, const float* buf_r, size_t le
     scan_cluster_  = GrainCluster{};
     held_note_     = -1;
 
-    if(len == 0)
+    RecomputeWaveformPeaks();
+}
+
+void GranularEngine::SetTrimRange(const float* buf_l, const float* buf_r, size_t len)
+{
+    // Deliberately O(1) -- no RecomputeWaveformPeaks() call here, see
+    // this function's own doc comment for why that's the caller's job.
+    src_l_   = buf_l;
+    src_r_   = buf_r;
+    src_len_ = len;
+}
+
+void GranularEngine::RecomputeWaveformPeaks()
+{
+    if(src_len_ == 0)
     {
         for(int i = 0; i < kWaveformCols; i++)
             waveform_peaks_[i] = 0.f;
         return;
     }
 
-    size_t per_col = len / (size_t)kWaveformCols;
+    size_t per_col = src_len_ / (size_t)kWaveformCols;
     if(per_col < 1)
         per_col = 1;
     for(int col = 0; col < kWaveformCols; col++)
     {
         size_t start = (size_t)col * per_col;
         size_t end   = start + per_col;
-        if(end > len)
-            end = len;
+        if(end > src_len_)
+            end = src_len_;
         float peak = 0.f;
         for(size_t i = start; i < end; i++)
         {
@@ -191,14 +205,15 @@ void GranularEngine::NoteOn(uint8_t note, uint8_t velocity)
         if((rhythm_mask_cached_ & 1u) != 0)
         {
             TriggerGrainInCluster(grain_cluster_, position01_ * (float)src_len_,
-                                  grain_tune_rate_ * note_mult * dir_sign, note_gain_);
+                                  grain_tune_rate_ * note_mult * dir_sign, note_gain_,
+                                  fill_count_);
         }
         rhythm_step_ = (rhythm_step_ + 1) % kRhythmSteps;
         grain_cluster_.next_grain_countdown = CurrentGrainIntervalSamples();
 
-        // Scan: starts sweeping from scan_start01_ (the POS+RHY page's
-        // own Position knob), heading whichever way scan_initial_sign_
-        // (the Grain page's own Scan speed/direction knob) says first --
+        // Scan: starts sweeping from scan_start01_ (the Scan Range
+        // page's own Start knob), heading whichever way scan_initial_sign_
+        // (the Scan page's own Scan speed/direction knob) says first --
         // the live bounce advance lives in Process(), this just seeds
         // where a fresh note's sweep begins. A muted note (Scan's own
         // dead zone, or Scan Volume at zero) simply gets no Scan grain at
@@ -207,10 +222,17 @@ void GranularEngine::NoteOn(uint8_t note, uint8_t velocity)
         scan_direction_sign_   = scan_initial_sign_;
         if(!IsScanMuted())
         {
+            // Playback direction of this grain (Forward/Reverse/Random,
+            // Scan Range page's own Button1) is independent of
+            // scan_direction_sign_ above, which is only the sweep's own
+            // bounce/wrap heading -- see ResolveScanDirectionSign()'s
+            // own comment.
+            float scan_dir_sign = ResolveScanDirectionSign();
             TriggerGrainInCluster(scan_cluster_, scan_position_samples_,
-                                  grain_tune_rate_ * note_mult * scan_direction_sign_, note_gain_);
+                                  grain_tune_rate_ * note_mult * scan_dir_sign, note_gain_,
+                                  scan_fill_count_);
         }
-        scan_cluster_.next_grain_countdown = ComputeHopSamples();
+        scan_cluster_.next_grain_countdown = ComputeHopSamples(scan_fill_count_, scan_gap01_);
     }
 }
 
@@ -230,16 +252,27 @@ void GranularEngine::SetFill01(float v01)
     fill_count_ = (int)(Clampf(v01, 0.f, 1.f) * kGrainsPerVoice + 0.5f);
 }
 
+void GranularEngine::SetScanFill01(float v01)
+{
+    scan_fill_count_ = (int)(Clampf(v01, 0.f, 1.f) * kGrainsPerVoice + 0.5f);
+}
+
 void GranularEngine::SetGap01(float v01)
 {
     gap01_ = Clampf(v01, 0.f, 1.f);
 }
 
+void GranularEngine::SetScanGap01(float v01)
+{
+    scan_gap01_ = Clampf(v01, 0.f, 1.f);
+}
+
 // Walks Off -> 4Floor -> Tresillo -> OffBeat -> Sparse -> EclSparse ->
 // EclDense -> back to Off. Discrete (Button1-cycled) rather than a
-// continuous knob sweep, since K2 on this page is Scan Position now --
-// see the real user report that drove this (Position page redesign,
-// same conversation as SetScanPosition01()'s own comment).
+// continuous knob sweep -- both of the Position page's knobs are
+// already spoken for (K1 = Position), so Rhythm/Speed share the page as
+// button-cycled modes instead (see the real user report that drove
+// this, same conversation as SetScanPosition01()'s own comment).
 void GranularEngine::CycleRhythm()
 {
     rhythm_index_ = (rhythm_index_ + 1) % kNumRhythmStates;
@@ -335,12 +368,20 @@ float GranularEngine::ComputeRhythmStepSamples() const
 // rather than Speed just being another multiplier on top of Fill.
 float GranularEngine::CurrentGrainIntervalSamples() const
 {
-    return rhythm_index_ == 0 ? ComputeHopSamples() : ComputeRhythmStepSamples();
+    // Grain cluster only -- Scan always uses plain ComputeHopSamples()
+    // with its own fill count directly (see its own call sites), never
+    // the Rhythm/Speed-synced path.
+    return rhythm_index_ == 0 ? ComputeHopSamples(fill_count_, gap01_) : ComputeRhythmStepSamples();
 }
 
 void GranularEngine::SetPosition01(float v01)
 {
     position01_ = Clampf(v01, 0.f, 1.f);
+}
+
+void GranularEngine::SetJitter01(float v01)
+{
+    jitter01_ = Clampf(v01, 0.f, 1.f);
 }
 
 void GranularEngine::SetScan01(float v01)
@@ -377,11 +418,22 @@ void GranularEngine::SetScan01(float v01)
 
 void GranularEngine::SetScanPosition01(float v01)
 {
-    // Just where the sweep's bounce range STARTS (the live lower bound
-    // Process() bounces against) -- no mute meaning of its own, that's
-    // entirely Scan's own job (SetScan01(), above). Default 0 = the
-    // buffer's own start.
+    // Where the sweep BEGINS on a fresh note, and one end of its bounce/
+    // wrap range -- no mute meaning of its own, that's entirely Scan's
+    // own job (SetScan01(), above). Default 0 = the buffer's own start.
+    // See SetScanEnd01() for the other end of the range.
     scan_start01_ = Clampf(v01, 0.f, 1.f);
+}
+
+void GranularEngine::SetScanEnd01(float v01)
+{
+    // The other end of the sweep's range -- Process() always bounces/
+    // wraps between whichever of Start/End is numerically lower and
+    // higher, so setting End below Start just works (an inverted-
+    // looking range still produces a correct, non-broken sweep). Default
+    // 1 = the buffer's own end, matching the range's original fixed-to-
+    // buffer-end behavior exactly.
+    scan_end01_ = Clampf(v01, 0.f, 1.f);
 }
 
 void GranularEngine::SetGrainTuneSemitones01(float v01)
@@ -423,6 +475,21 @@ float GranularEngine::GetDirection01() const
 float GranularEngine::ResolveDirectionSign()
 {
     switch(direction_)
+    {
+        case Direction::Reverse: return -1.f;
+        case Direction::Random:
+        {
+            float r01 = (float)(NextRandom(rng_state_) & 0x00FFFFFFu) / (float)0x00FFFFFFu;
+            return r01 < 0.5f ? -1.f : 1.f;
+        }
+        case Direction::Forward:
+        default: return 1.f;
+    }
+}
+
+float GranularEngine::ResolveScanDirectionSign()
+{
+    switch(scan_direction_)
     {
         case Direction::Reverse: return -1.f;
         case Direction::Random:
@@ -477,14 +544,23 @@ float GranularEngine::GetScanAnchor01() const
     return src_len_ > 0 ? Clampf(scan_position_samples_ / (float)src_len_, 0.f, 1.f) : 0.f;
 }
 
-float GranularEngine::ComputeHopSamples() const
+float GranularEngine::GetGrainSizeFraction01() const
+{
+    if(src_len_ == 0)
+        return 0.f;
+    float grain_len_ms = Clampf(size01_, 0.f, 1.f) * (kMaxGrainMs - kMinGrainMs) + kMinGrainMs;
+    float grain_len_samples = grain_len_ms * 0.001f * sample_rate_;
+    return Clampf(grain_len_samples / (float)src_len_, 0.f, 1.f);
+}
+
+float GranularEngine::ComputeHopSamples(int fill_count, float gap01) const
 {
     float grain_len_samples = Clampf(size01_, 0.f, 1.f) * (kMaxGrainMs - kMinGrainMs)
                                + kMinGrainMs;
     grain_len_samples       = grain_len_samples * 0.001f * sample_rate_;
-    float base_hop    = fill_count_ > 0 ? grain_len_samples / (float)fill_count_
+    float base_hop    = fill_count > 0 ? grain_len_samples / (float)fill_count
                                           : grain_len_samples;
-    float sparse_mult = 1.f + gap01_ * kMaxSparseFactor;
+    float sparse_mult = 1.f + gap01 * kMaxSparseFactor;
     return base_hop * sparse_mult;
 }
 
@@ -517,14 +593,14 @@ void GranularEngine::ChokeCluster(GrainCluster& c)
 }
 
 void GranularEngine::TriggerGrainInCluster(GrainCluster& c, float read_pos, float read_inc,
-                                            float gain)
+                                            float gain, int fill_count)
 {
-    // Steal whichever slot (among the first fill_count_ of them) is
+    // Steal whichever slot (among the first fill_count of them) is
     // furthest along, or an inactive one if any -- same idiom as the old
     // engine's TriggerGrainInVoice().
     int   victim      = 0;
     float worst_phase = -1.f;
-    int   n           = fill_count_ > 0 ? fill_count_ : 1;
+    int   n           = fill_count > 0 ? fill_count : 1;
     if(n > kGrainsPerVoice)
         n = kGrainsPerVoice;
     for(int i = 0; i < n; i++)
@@ -542,8 +618,20 @@ void GranularEngine::TriggerGrainInCluster(GrainCluster& c, float read_pos, floa
         }
     }
 
-    const float kStealSafePhase = 0.85f;
-    if(c.grains[victim].active && c.grains[victim].phase < kStealSafePhase)
+    // Always release-fade a stolen active grain, regardless of how far
+    // through its life it is -- this used to skip the fade past phase
+    // 0.85 on the assumption the Hann window had already attenuated it
+    // to inaudibility by then (true for typical dynamic/percussive
+    // material). Confirmed false for a sustained, consistently loud
+    // source (e.g. a well-produced pad loop with no natural quiet
+    // moments): hann(0.85) is still ~21% of peak, which is real,
+    // audible amplitude on hot content -- discarding it with zero fade
+    // produced a sharp discontinuity on every single grain retrigger,
+    // perfectly periodic at the Grain layer's own fixed hop interval
+    // (confirmed via a real exported capture: identical-looking clicks
+    // exactly 7703 samples/~6.23Hz apart, at a fixed anchor position --
+    // not random jitter, not CPU/import-related).
+    if(c.grains[victim].active)
     {
         c.release_grains[victim] = c.grains[victim];
         c.release_fades[victim]  = 1.f;
@@ -610,12 +698,12 @@ void GranularEngine::RenderGrain(Grain& g, float extra_gain, float& out_l, float
         g.active = false;
 }
 
-void GranularEngine::RenderCluster(GrainCluster& c, float overlap_gain, float& out_l,
-                                     float& out_r)
+void GranularEngine::RenderCluster(GrainCluster& c, float overlap_gain, int fill_count,
+                                     float& out_l, float& out_r)
 {
     out_l = 0.f;
     out_r = 0.f;
-    int n = fill_count_ > 0 ? fill_count_ : 1;
+    int n = fill_count > 0 ? fill_count : 1;
     if(n > kGrainsPerVoice)
         n = kGrainsPerVoice;
     for(int i = 0; i < n; i++)
@@ -652,7 +740,7 @@ void GranularEngine::RenderCluster(GrainCluster& c, float overlap_gain, float& o
 
 DSY_ITCM_TEXT
 void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* reverb_send_l,
-                              float* reverb_send_r)
+                              float* reverb_send_r, float* delay_send_l, float* delay_send_r)
 {
     bool has_source = src_len_ > 0;
 
@@ -667,25 +755,39 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
     filter_r_.SetRes(filter_res01_ * 0.9f);
 
     // See RenderCluster()'s own comment -- computed once per block since
-    // fill_count_ only changes when the Fill knob moves, not per sample.
-    // Full 1/n (not sqrt) -- sqrt-based compensation still let loudness
-    // creep up audibly as Fill increased, since it only partially offsets
-    // the linear gain from more simultaneously active grains.
-    int   fill_for_gain = fill_count_ > 0 ? fill_count_ : 1;
-    float overlap_gain  = 1.f / (float)fill_for_gain;
+    // fill_count_/scan_fill_count_ only change when their own Fill knob
+    // moves, not per sample. Full 1/n (not sqrt) -- sqrt-based
+    // compensation still let loudness creep up audibly as Fill
+    // increased, since it only partially offsets the linear gain from
+    // more simultaneously active grains. Grain and Scan compensate
+    // independently now (each against its own count), matching their
+    // now-independent Fill controls.
+    int   fill_for_gain      = fill_count_ > 0 ? fill_count_ : 1;
+    float overlap_gain       = 1.f / (float)fill_for_gain;
+    int   scan_fill_for_gain = scan_fill_count_ > 0 ? scan_fill_count_ : 1;
+    float scan_overlap_gain  = 1.f / (float)scan_fill_for_gain;
 
     // Scan's sweep range -- recomputed once per block (not per sample,
-    // same reasoning as overlap_gain above) so turning the Position knob
-    // while a sweep is already under way moves the lower bound live; the
-    // bounce check below naturally clamps+flips at whichever edge the
-    // live position is currently past, no special-case needed.
-    float scan_lo = has_source ? Clampf(scan_start01_, 0.f, 1.f) * (float)src_len_ : 0.f;
-    float scan_hi = has_source ? (float)src_len_ : 0.f;
+    // same reasoning as overlap_gain above) so turning Start/End while a
+    // sweep is already under way moves the range live; the bounce/wrap
+    // check below naturally clamps at whichever edge the live position
+    // is currently past, no special-case needed. min/max (not just
+    // Start=lo, End=hi) so setting Start above End still produces a
+    // correct, non-inverted range instead of a broken one.
+    float scan_range_a = Clampf(scan_start01_, 0.f, 1.f) * (float)src_len_;
+    float scan_range_b = Clampf(scan_end01_, 0.f, 1.f) * (float)src_len_;
+    float scan_lo = has_source ? fminf(scan_range_a, scan_range_b) : 0.f;
+    float scan_hi = has_source ? fmaxf(scan_range_a, scan_range_b) : 0.f;
 
     for(size_t i = 0; i < size; i++)
     {
         bool gate = held_note_ >= 0;
         float grain_l = 0.f, grain_r = 0.f, scan_l = 0.f, scan_r = 0.f;
+        // Set below (inside if(has_source)) -- used by the Grain/Scan
+        // headroom compensation just after mixed_l/mixed_r, see its own
+        // comment there.
+        bool  grain_layer_sounding = false;
+        bool  scan_layer_sounding  = false;
         // env stays 0 (silent) when there's nothing captured -- no point
         // running the ADSR's own Process() at all in that case, since
         // grain_l/scan_l are already 0 without a source regardless of
@@ -701,7 +803,7 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
             // plain `gate` meant a long Release time never actually
             // produced a longer tail than whatever grain(s) happened to
             // already be in flight at the moment of NoteOff (at most one
-            // grain's own Size, up to 500ms), since nothing kept feeding
+            // grain's own Size, up to 1000ms), since nothing kept feeding
             // new material for the envelope to shape. IsRunning() stays
             // true until the envelope actually reaches idle (release
             // genuinely finished), so this naturally stops triggering
@@ -709,6 +811,7 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
             // confirmed via a real user report ("long release, let go of
             // the note -- should sound on, but it doesn't").
             bool still_sounding = gate || adsr_.IsRunning();
+            grain_layer_sounding = still_sounding;
 
             // Grain layer: fixed anchor, just needs re-triggering on its
             // own schedule. The refill interval is Fill/Gap/Size-derived
@@ -732,50 +835,109 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
                 {
                     float dir_sign  = ResolveDirectionSign();
                     float note_mult = grain_follows_note_ ? note_rate_ : 1.f;
-                    TriggerGrainInCluster(grain_cluster_, position01_ * (float)src_len_,
-                                          grain_tune_rate_ * note_mult * dir_sign, note_gain_);
+                    // Jitter -- see SetJitter01()'s own doc comment. Range
+                    // is a fraction of the CURRENT grain length (not a
+                    // fixed sample count) so it scales sensibly whether
+                    // Size is set short or long; TriggerGrainInCluster()'s
+                    // own fmodf() wraps this back into range the same way
+                    // it already does for the plain anchor.
+                    float trigger_pos = position01_ * (float)src_len_;
+                    if(jitter01_ > 0.f)
+                    {
+                        float grain_len_ms = Clampf(size01_, 0.f, 1.f)
+                                                  * (kMaxGrainMs - kMinGrainMs)
+                                              + kMinGrainMs;
+                        float jitter_range_samples
+                            = jitter01_ * grain_len_ms * 0.001f * sample_rate_;
+                        float r01 = (float)(NextRandom(rng_state_) & 0x00FFFFFFu)
+                                    / (float)0x00FFFFFFu;
+                        trigger_pos += (r01 * 2.f - 1.f) * jitter_range_samples;
+                    }
+                    TriggerGrainInCluster(grain_cluster_, trigger_pos,
+                                          grain_tune_rate_ * note_mult * dir_sign, note_gain_,
+                                          fill_count_);
                 }
                 grain_cluster_.next_grain_countdown += CurrentGrainIntervalSamples();
             }
-            RenderCluster(grain_cluster_, overlap_gain, grain_l, grain_r);
+            RenderCluster(grain_cluster_, overlap_gain, fill_count_, grain_l, grain_r);
 
-            // Scan layer -- actually sweeps: bounces between scan_lo
-            // (Scan Position's own live value, POS+RHY page) and the end
-            // of the buffer, at the rate/direction Scan's own speed knob
-            // (Grain page) set. Skipped entirely (no advance, no
+            // Scan layer -- actually sweeps: bounces/wraps between
+            // Start and End (the Scan Range page's own two knobs), at
+            // the rate/direction Scan's own speed knob (Scan page) set.
+            // Skipped entirely (no advance, no
             // triggering, no rendering) when EITHER Scan is in its own
             // dead zone OR Mix's Scan Volume is at/near zero -- see
             // IsScanMuted().
             if(!IsScanMuted())
             {
+                scan_layer_sounding = true;
                 scan_position_samples_ += scan_direction_sign_ * scan_speed_
                                            * (1.f / sample_rate_) * (float)src_len_;
                 if(scan_position_samples_ > scan_hi)
                 {
-                    scan_position_samples_ = scan_hi;
-                    scan_direction_sign_   = -1.f;
+                    // Bounce: reverse direction at the edge (today's
+                    // original behavior). Wrap (scan_bounce_ off): jump
+                    // straight back to the other edge and keep heading
+                    // the same way, so it always resumes from the same
+                    // starting point instead of ping-ponging -- a real
+                    // user request, off by default preserves existing
+                    // behavior exactly.
+                    scan_position_samples_ = scan_bounce_ ? scan_hi : scan_lo;
+                    if(scan_bounce_)
+                        scan_direction_sign_ = -1.f;
                 }
                 else if(scan_position_samples_ < scan_lo)
                 {
-                    scan_position_samples_ = scan_lo;
-                    scan_direction_sign_   = 1.f;
+                    scan_position_samples_ = scan_bounce_ ? scan_lo : scan_hi;
+                    if(scan_bounce_)
+                        scan_direction_sign_ = 1.f;
                 }
 
                 scan_cluster_.next_grain_countdown -= 1.f;
                 if(scan_cluster_.next_grain_countdown <= 0.f && still_sounding)
                 {
                     float note_mult = grain_follows_note_ ? note_rate_ : 1.f;
+                    // See ResolveScanDirectionSign()'s own comment --
+                    // independent of scan_direction_sign_ (the sweep's
+                    // own bounce/wrap heading, above).
+                    float scan_dir_sign = ResolveScanDirectionSign();
                     TriggerGrainInCluster(scan_cluster_, scan_position_samples_,
-                                          grain_tune_rate_ * note_mult * scan_direction_sign_,
-                                          note_gain_);
-                    scan_cluster_.next_grain_countdown += ComputeHopSamples();
+                                          grain_tune_rate_ * note_mult * scan_dir_sign,
+                                          note_gain_, scan_fill_count_);
+                    scan_cluster_.next_grain_countdown
+                        += ComputeHopSamples(scan_fill_count_, scan_gap01_);
                 }
-                RenderCluster(scan_cluster_, overlap_gain, scan_l, scan_r);
+                RenderCluster(scan_cluster_, scan_overlap_gain, scan_fill_count_, scan_l, scan_r);
             }
         }
 
         float mixed_l = (grain_l * grain_volume01_ + scan_l * scan_volume01_) * env;
         float mixed_r = (grain_r * grain_volume01_ + scan_r * scan_volume01_) * env;
+
+        // Grain/Scan headroom compensation -- same idea as DexedSynth's
+        // own per-note version (see its voice_headroom_scale_). Grain and
+        // Scan are two independently overlap-compensated layers that
+        // still get summed together right above; either one alone (by
+        // far the common case) is untouched, but a source that stays
+        // close to peak the whole way through -- a well-produced,
+        // seamlessly-looping pad sample, with none of the natural quiet
+        // stretches a one-shot/percussive sample has -- can push their
+        // sum well past unity far more often than the hard clamp below
+        // was ever meant to catch, hitting it repeatedly instead of just
+        // on rare outliers. Confirmed against a real user-reported
+        // import that clicked regardless of Size/Fill/pitch, on a file
+        // that played perfectly clean off the Pod entirely (so not an
+        // import/decode bug -- see the loop-layer/Dexed headroom fixes
+        // for the same pattern). 1/sqrt(2), the standard two-source
+        // equal-power curve, not a full 1/2, so two quieter/dynamic
+        // sources summing still sound a bit fuller, not just halved --
+        // and cheap (one AND plus a constant multiply, no extra
+        // transcendental call) since this runs every sample.
+        if(grain_layer_sounding && scan_layer_sounding)
+        {
+            mixed_l *= 0.70710678f;
+            mixed_r *= 0.70710678f;
+        }
 
         // Safety backstop -- the overlap-gain compensation above handles
         // the common case, but the release-fade grain, Grain+Scan summing
@@ -819,6 +981,8 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
         out_r[i] = fr;
         reverb_send_l[i] += fl * reverb_send01_;
         reverb_send_r[i] += fr * reverb_send01_;
+        delay_send_l[i] += fl * delay_send01_;
+        delay_send_r[i] += fr * delay_send01_;
     }
 }
 
@@ -826,13 +990,17 @@ void GranularEngine::ApplyPreset(const GranularPresetData& p)
 {
     SetSize01(p.size01);
     SetFill01(p.fill01);
+    SetScanFill01(p.scan_fill01);
     SetGap01(p.gap01);
+    SetScanGap01(p.scan_gap01);
     SetPosition01(p.position01);
     SetScan01(p.scan01);
     SetScanPosition01(p.scan_start01);
+    SetScanEnd01(p.scan_end01);
     SetGrainTuneSemitones01(p.grain_tune01);
     SetGrainFollowsNote(p.grain_follows_note);
     SetDirection01(p.direction01);
+    scan_direction_ = (Direction)(p.scan_direction % 3);
     SetAttack01(p.attack01);
     SetDecay01(p.decay01);
     SetSustain01(p.sustain01);
@@ -845,6 +1013,8 @@ void GranularEngine::ApplyPreset(const GranularPresetData& p)
     rhythm_index_ = p.rhythm_index % kNumRhythmStates;
     RecomputeRhythmPattern();
     grain_speed_ = (GrainSpeed)(p.grain_speed % 4);
+    SetJitter01(p.jitter01);
+    scan_bounce_ = p.scan_bounce;
 }
 
 GranularEngine::GranularPresetData GranularEngine::CapturePreset() const
@@ -852,13 +1022,17 @@ GranularEngine::GranularPresetData GranularEngine::CapturePreset() const
     GranularPresetData p;
     p.size01              = size01_;
     p.fill01              = GetFill01();
+    p.scan_fill01         = GetScanFill01();
     p.gap01               = gap01_;
+    p.scan_gap01          = scan_gap01_;
     p.position01          = position01_;
     p.scan01              = scan01_;
     p.scan_start01        = scan_start01_;
+    p.scan_end01          = scan_end01_;
     p.grain_tune01        = GetGrainTuneSemitones01();
     p.grain_follows_note  = grain_follows_note_;
     p.direction01         = GetDirection01();
+    p.scan_direction      = (int32_t)scan_direction_;
     p.attack01            = attack01_;
     p.decay01             = decay01_;
     p.sustain01           = sustain01_;
@@ -870,5 +1044,7 @@ GranularEngine::GranularPresetData GranularEngine::CapturePreset() const
     p.scan_volume01       = scan_volume01_;
     p.rhythm_index        = rhythm_index_;
     p.grain_speed         = (int32_t)grain_speed_;
+    p.jitter01            = jitter01_;
+    p.scan_bounce         = scan_bounce_;
     return p;
 }

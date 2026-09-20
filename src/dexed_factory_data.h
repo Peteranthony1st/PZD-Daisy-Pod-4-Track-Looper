@@ -38,3 +38,9 @@ struct DexedFactoryCategory
 // duplicate covering the same sound types.
 constexpr int kDexedNumFactoryCategories = 54;
 extern const DexedFactoryCategory kDexedFactoryCategories[kDexedNumFactoryCategories];
+// The first 4 entries of kDexedFactoryCategories above are "Rom 1"
+// through "Rom 4" specifically (see this file's own doc comment) --
+// used by Ui's own Roms/Dexed group split (DexedFilesGroup, ui.h) to
+// know where the real ROM categories end and the other ~50
+// curated-by-sound-type ones begin.
+constexpr int kDexedNumRomCategories = 4;
