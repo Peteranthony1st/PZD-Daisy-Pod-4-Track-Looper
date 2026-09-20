@@ -3,6 +3,8 @@
 #include <cstdint>
 #include "tempo_clock.h"
 #include "looper_layer.h"
+#include "granular_engine.h"
+#include "dexed_synth.h"
 
 // SD card save/load for a whole "performance" (all layers' audio plus
 // tempo/global/per-layer settings) as one flat binary file per slot.
@@ -54,6 +56,29 @@ int NextFreeSlot();
 
 using ProgressFn = void (*)(float progress01);
 
+// Deletes an existing saved performance -- irreversible, same as deleting
+// any other file; the caller (SD MGMT's own hold-to-confirm gesture) owns
+// making that consequence clear before calling this. Also closes the gap
+// this leaves behind: every higher-numbered performance still on the card
+// (plus any other pre-existing gaps above it) shifts down to keep the
+// numbering contiguous from 1, so a later Save New always continues right
+// after the highest real performance instead of NextFreeSlot() picking
+// the low number this just freed. If loaded_slot_inout is non-null and
+// currently names a slot this shifts (or the one just deleted), it's
+// updated in place to follow that content to its new slot (or to -1 if it
+// was the slot just deleted).
+bool DeleteSlot(int slot, int* loaded_slot_inout = nullptr);
+// Byte-for-byte copy of an existing performance into the next free slot
+// (see NextFreeSlot()) -- chunked, so this can take real time for a
+// performance with a lot of recorded audio; pass on_progress the same way
+// Save()/Load() do. *out_new_slot is set to the slot actually used.
+bool DuplicateSlot(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Deals ONLY with the looper (all layers' audio plus tempo/global/per-
+// layer settings) -- Grains has its own fully independent save/load
+// system (SaveGranularPreset() below), never embedded into a performance
+// file. Keeps every instrument's saves in its own separate "bubble",
+// performances included.
 bool Save(int                slot,
           TempoClock&        tempo,
           LooperLayer*       layers,
@@ -80,6 +105,196 @@ bool Load(int          slot,
           float*       out_bypass_reverb_send01,
           ProgressFn   on_progress = nullptr);
 
+// Grains (GranularEngine) presets: parameters AND the captured audio
+// itself -- a Grains preset IS a specific captured sound plus how it's
+// being played back, so loading one needs to restore both. No factory
+// range (there's no hand-tuned-patch equivalent for a captured sample),
+// so every slot 1..kMaxGranularPresets is a normal user save. Numbered/
+// found the same way as ListSlots()'s own range.
+constexpr int kMaxGranularPresets = 99;
+
+// audio_l/audio_r: whatever GranularEngine::GetSourceL()/R() currently
+// point at; audio_len: GetSourceLen(). Blocking (chunked SD write, same
+// kChunkSamples streaming as Save()'s own layer audio) -- call from the
+// main loop with a progress callback, same rule as Save()/Load()/
+// ExportWav() above, not the audio ISR.
+bool SaveGranularPreset(int                                       slot,
+                        const GranularEngine::GranularPresetData& preset,
+                        const float*                              audio_l,
+                        const float*                              audio_r,
+                        size_t                                    audio_len,
+                        ProgressFn                                on_progress = nullptr);
+// out_audio_l/r must have room for at least audio_capacity samples each
+// -- the file's own audio_len is clamped to that before reading, same
+// "never write past what the caller actually owns" reasoning as every
+// other buffer-filling call in this project. *out_audio_len is set to
+// however many samples were actually read.
+bool LoadGranularPreset(int                                  slot,
+                        GranularEngine::GranularPresetData* out_preset,
+                        float*                               out_audio_l,
+                        float*                               out_audio_r,
+                        size_t                                audio_capacity,
+                        size_t*                               out_audio_len,
+                        ProgressFn                            on_progress = nullptr);
+int  ListGranularPresets(int* out_numbers, int max_out);
+int  NextFreeGranularPresetSlot();
+// No factory range to guard against here (see kMaxGranularPresets's own
+// comment) -- see DeleteSlot()/DuplicateSlot() above for the general
+// shape, including the same gap-closing renumbering and
+// loaded_slot_inout follow-along. Duplicating copies the whole file
+// (params + captured audio) in one chunked byte-for-byte pass, not
+// through GranularEngine at all.
+bool DeleteGranularPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicateGranularPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Dexed presets: parameters only, no audio -- same shape as the
+// removed FmSynth/PadSynth presets, including the same factory range:
+// 1..DexedSynth::GetNumFactoryPresets() are the permanently read-only,
+// firmware-embedded factory presets (real DX7 patches, see
+// dexed_factory_data.h/.cpp) -- LoadDexedPreset() serves those directly
+// without touching the card, and SaveDexedPreset()/
+// NextFreeDexedPresetSlot() never target them. User saves start right
+// after that range. Unlike the removed Fm/Pad presets' fixed factory
+// count, this range is sized from the real embedded data (704 patches
+// as of writing) rather than a compile-time constant.
+constexpr int kMaxDexedPresets = 3500; // headroom above the current 3129 factory presets
+
+bool SaveDexedPreset(int slot, const DexedSynth::DexedPresetData& preset);
+bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset);
+// Lists existing USER slots only (ascending) -- factory presets are
+// always available and aren't part of this scan. Same shape as
+// ListSlots().
+int  ListDexedPresets(int* out_numbers, int max_out);
+// Lowest free USER slot, or -1 if the whole range is full/no card.
+// search_from (optional): resume scanning from this slot instead of
+// the very start of the USER range -- lets a caller doing several
+// consecutive allocations (see Ui::TriggerDexedSyxImport()'s own
+// SysEx-bank-import loop) advance a single forward sweep across the
+// whole batch (each call starting where the last one left off, i.e.
+// search_from = previous result + 1) instead of re-scanning from
+// scratch every time, which turns an O(n) find into an O(n^2) one as
+// the USER range grows. Values at or below the factory range are
+// clamped up to its own real start, same as omitting this entirely.
+int  NextFreeDexedPresetSlot(int search_from = -1);
+// Refuses factory slots (1..DexedSynth::GetNumFactoryPresets() aren't
+// files at all) same as SaveDexedPreset() -- see DeleteSlot()/
+// DuplicateSlot() above for the general shape, including the same
+// gap-closing renumbering and loaded_slot_inout follow-along. The
+// factory range itself is never deleted/compacted through this path --
+// see CompactSlotsAfterDelete()'s own doc comment in the .cpp for why
+// that renumbering scheme is fundamentally incompatible with a fixed,
+// ordered factory bank.
+bool DeleteDexedPreset(int slot, int* loaded_slot_inout = nullptr);
+bool DuplicateDexedPreset(int slot, int* out_new_slot, ProgressFn on_progress = nullptr);
+
+// Importing a user-supplied DX7 SysEx file (.syx, from a computer,
+// dropped into DXIMPORT/ on the SD card) as new Dexed USER presets --
+// a separate folder from Grains' own IMPORT/ (WAV) so the two file
+// types never collide in one listing. Two real-world SysEx shapes are
+// recognized, both fully validated (Yamaha ID byte, message length,
+// 7-bit checksum) before anything is trusted:
+//   Single Voice Dump (format 0): exactly one patch, 163 bytes on the
+//     wire (F0 43 0S 00 01 1B <155 bytes, already in this project's own
+//     unpacked layout -- see dexed_sysex.h's own doc comment for why
+//     the single-voice wire format and DexedSynth's internal 156-byte
+//     patch_[] layout are byte-for-byte the same thing> <checksum> F7).
+//   32-Voice Bulk Dump (format 9): a full bank, 4104 bytes on the wire
+//     (F0 43 0S 09 20 00 <32*128 packed-format bytes, the same layout
+//     DexedSysex::UnpackVoice() already expands for the embedded
+//     factory banks> <checksum> F7).
+// Anything else (wrong ID byte, wrong length, bad checksum, an
+// unrecognized format number) is cleanly refused (GetLastError()
+// reports why), never guessed at.
+constexpr int kMaxImportSyxNameLen = 60;
+// Same shape/rules as ListImportWavFiles() below (ascending directory
+// order, skips macOS AppleDouble sidecars, skips names longer than
+// kMaxImportSyxNameLen rather than truncating), scoped to DXIMPORT/ and
+// .syx/.SYX instead of IMPORT/ and .wav/.WAV.
+int  ListImportSyxFiles(char out_names[][kMaxImportSyxNameLen + 1], int max_out);
+constexpr int kMaxSyxBulkVoices = 32;
+// Reads and validates filename (inside DXIMPORT/), decodes every voice
+// it contains into out_presets[0..*out_count-1] (patch bytes only --
+// reverb_send01/output_level01/filter/pan all take DexedPresetData's
+// own defaults, same as GetFactoryPreset()) and sets *out_count to 1
+// (single dump) or 32 (bulk dump). Caller is responsible for actually
+// writing each one to a real user slot (see
+// Ui::TriggerDexedSyxImport()) -- this function only reads and decodes
+// the file, it never touches the DEXP/ preset store itself.
+bool ImportDexedSyx(const char*                  filename,
+                    DexedSynth::DexedPresetData out_presets[kMaxSyxBulkVoices],
+                    int*                         out_count);
+
+// One folder created per imported SysEx bank (see ImportDexedSyx()
+// above) -- its own name (derived from the imported file's own name,
+// since the SysEx data itself carries no overall "bank name" field,
+// only each voice's own 10-character name) plus the contiguous range
+// of USER slots that import filled. A flat, fixed-size-record file
+// (DEXP/IMPORTS.DAT, no header -- record count is just file size /
+// sizeof(DexedImportFolder)) rather than a versioned/magic'd format
+// like every other *PresetData store here, since there's nothing about
+// this shape that could ever need to change compatibly -- if it ever
+// does, this whole file can simply be deleted and rebuilt by
+// re-importing (the underlying preset slots themselves are untouched).
+struct DexedImportFolder
+{
+    char    name[24];
+    int32_t first_slot;
+    int32_t last_slot;
+};
+constexpr int kMaxDexedImportFolders = 64;
+// Appends one new import-folder record -- called once per completed
+// ImportDexedSyx()+save batch (see Ui::TriggerDexedSyxImport()), never
+// per-voice. Returns false (GetLastError() explains) if the manifest
+// couldn't be written -- the underlying preset slots are already saved
+// either way at that point, so a false here means "the folder grouping
+// didn't record," not "the import itself failed."
+bool SaveDexedImportFolder(const char* name, int first_slot, int last_slot);
+// Reads every recorded import folder, ascending (oldest import first,
+// so folder order in the browser matches import order). 0 (not an
+// error) if no imports have ever been recorded, i.e. the file doesn't
+// exist yet.
+int ListDexedImportFolders(DexedImportFolder* out, int max_out);
+
+// Importing a user-supplied WAV file (from a computer, dropped into
+// IMPORT/ on the SD card) as Grains capture audio -- a third capture
+// source alongside Direct Record and From Layer. Accepts 16/24/32-bit
+// PCM or 32-bit IEEE float, mono or stereo, and any of the common real-
+// world WAV sample rates (8000/11025/16000/22050/24000/32000/44100/
+// 48000/88200/96000/176400/192000 Hz) -- anything other than 48000 Hz is
+// resampled to the native 48000 Hz engine rate with an exact-ratio
+// Catmull-Rom resampler (upsampling for rates below 48kHz, the same
+// technique ExportWav() already uses in the other direction; a genuine
+// downsample for rates above 48kHz gets a real anti-aliasing prefilter
+// first). Anything else (an unlisted sample rate, a non-PCM/float
+// format) is cleanly refused (GetLastError() reports why) rather than
+// misread.
+constexpr int kMaxImportWavNameLen = 60;
+// Fills out_names ascending (directory order) with .wav/.WAV filenames
+// found in IMPORT/ on the SD root, returns how many were found (up to
+// max_out). A name longer than kMaxImportWavNameLen is SKIPPED entirely
+// rather than truncated -- an earlier version truncated it instead, which
+// silently produced a listed name that didn't match any real file on
+// disk (ImportWav() would then fail to open it, FR_NO_FILE) since
+// truncating can chop off the ".wav" extension or land mid-name.
+// Realistic sample filenames are well under this length in practice.
+// Also skips macOS "._name.wav" AppleDouble sidecar files -- these get
+// silently created alongside every real file when Finder (or many other
+// macOS copy tools) writes to a non-HFS+ volume like a FAT32 SD card;
+// they end in .wav and so pass the extension filter, but their content
+// isn't a real WAV file (fails ImportWav()'s own RIFF magic check).
+int  ListImportWavFiles(char out_names[][kMaxImportWavNameLen + 1], int max_out);
+// out_l/out_r must have room for at least audio_capacity samples each --
+// the file's own length (after any resampling) is truncated to that,
+// same "never write past what the caller owns" rule as
+// LoadGranularPreset(). *out_len is set to however many samples were
+// actually produced.
+bool ImportWav(const char* filename,
+               float*      out_l,
+               float*      out_r,
+               size_t      audio_capacity,
+               size_t*     out_len,
+               ProgressFn  on_progress = nullptr);
+
 // Renders the current in-memory performance (one full shared loop length,
 // every layer's real filter/character-effect/reverb chain applied,
 // same as live playback) to a new stereo 16-bit PCM WAV file. Two
@@ -95,8 +310,10 @@ bool Load(int          slot,
 //     folder literally named "custom" and expects 44100 Hz PCM.
 // Each mode has its own independent EXPnnn numbering sequence.
 // Master volume and the metronome click are deliberately NOT included
-// (see performance_store.cpp); the master filter and the shared reverb
-// bus (reverb_size01 -- see Ui::GetReverbSize01()) both are. project_speed
+// (see performance_store.cpp); the master filter and the shared reverb/
+// delay buses (reverb_size01/delay_time01/delay_feedback01 -- see
+// Ui::GetReverbSize01()/GetDelayTime01()/GetDelayFeedback01()) all are.
+// project_speed
 // is the live vari-speed multiplier (see Ui::GetProjectSpeed()) -- unlike
 // master volume, this one IS captured into the export as-is, on purpose:
 // vari-speed is something a user dials in deliberately as part of a
@@ -116,6 +333,8 @@ bool ExportWav(TempoClock&  tempo,
                float        master_filter_cutoff01,
                float        master_filter_res01,
                float        reverb_size01,
+               float        delay_time01,
+               float        delay_feedback01,
                bool         for_microdexed,
                float        project_speed,
                ProgressFn   on_progress = nullptr);
