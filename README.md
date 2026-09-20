@@ -221,6 +221,26 @@ instrument while a layer is actively recording/overdubbing captures its
 live sound directly into the take, mixed with your physical input, with
 no patch cable needed.
 
+**CPU tips** — the Looper, Dexed, and Grains are all independently
+switchable (`Global:Looper`/`Global:Dexed`/`Global:Granular`), and each
+toggle is a real CPU lever, not just a mute: turning an engine off skips
+its processing entirely, not just its output. Running all three at once
+with reverb/delay active on several of them is the heaviest realistic
+combination this hardware handles — worth keeping in mind if you're
+pushing 4 layers, both instruments, and effects all together.
+
+A workflow that keeps CPU headroom on your side: record your Dexed and
+Grains parts into loop layers first, **then switch those engines off**
+once you've got the takes you want — you get their CPU share back
+immediately. Save dialing in reverb/delay for last, once you know what's
+actually being kept, rather than running effects continuously while
+you're still auditioning sounds.
+
+The Looper can also be switched off entirely while still playing Dexed
+and/or Grains live — they don't depend on it at all, and Bypass (live
+mic monitoring) keeps working too, so you can jam with Dexed/Grains plus
+a live mic with the whole looper switched off and using none of its CPU.
+
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
 there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains, Dexed,
 and Bypass, plus Volume/Reverb-Size for the final Master bus, ending in
