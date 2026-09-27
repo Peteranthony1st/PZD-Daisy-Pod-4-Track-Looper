@@ -278,11 +278,13 @@ void DexedSynth::RenderQuantum()
             held++;
     }
 
-    // See voice_headroom_scale_'s own comment -- a held note is untouched
-    // (1.0), a stacked chord tapers down smoothly via the standard
+    // See voice_headroom_target_'s own comment -- a held note is
+    // untouched (1.0), a stacked chord tapers down via the standard
     // "equal-power" 1/sqrt(N) curve on top of kHeadroomScale's own fixed
-    // margin.
-    voice_headroom_scale_ = held > 1 ? 1.f / sqrtf((float)held) : 1.f;
+    // margin. Only the TARGET is set here; voice_headroom_scale_ itself
+    // ramps toward it sample-by-sample in Process(), so a NoteOn/NoteOff
+    // changing this mid-block doesn't step the output discontinuously.
+    voice_headroom_target_ = held > 1 ? 1.f / sqrtf((float)held) : 1.f;
 
     stage_pos_ = 0;
 }
@@ -308,10 +310,30 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
 
     const float send       = reverb_send01_;
     const float delay_send = delay_send01_;
+    // Real bug, confirmed on hardware: voice_headroom_target_ can change
+    // on literally any sample (a new NoteOn/NoteOff), and multiplying by
+    // it directly used to step the output discontinuously right at that
+    // sample -- audible as a click on every chord press/release, not
+    // just an inaudible level correction. Ramped instead, same ~8ms
+    // declick window LooperLayer's own effect_fade_ uses.
+    const float headroom_ramp_step = 1.f / (0.008f * sample_rate_);
     for(size_t i = 0; i < size; i++)
     {
         if(stage_pos_ >= kMsfaBlock)
             RenderQuantum();
+
+        if(voice_headroom_scale_ < voice_headroom_target_)
+        {
+            voice_headroom_scale_ += headroom_ramp_step;
+            if(voice_headroom_scale_ > voice_headroom_target_)
+                voice_headroom_scale_ = voice_headroom_target_;
+        }
+        else if(voice_headroom_scale_ > voice_headroom_target_)
+        {
+            voice_headroom_scale_ -= headroom_ramp_step;
+            if(voice_headroom_scale_ < voice_headroom_target_)
+                voice_headroom_scale_ = voice_headroom_target_;
+        }
 
         float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale
                   * voice_headroom_scale_;

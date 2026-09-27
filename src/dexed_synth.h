@@ -323,7 +323,7 @@ class DexedSynth
     float brightness01_ = 0.5f;
     float env_speed01_  = 0.5f;
 
-    // Voice-count headroom compensation -- recomputed once per
+    // Voice-count headroom compensation -- retargeted once per
     // RenderQuantum() from how many voices are actually held right now
     // (held_note != -1). A single held note is untouched (1.0); a
     // patch that's fine alone can still push kHeadroomScale's own
@@ -333,7 +333,20 @@ class DexedSynth
     // measured this way) -- see kHeadroomScale's own comment. 1/sqrt(N)
     // is the standard "equal-power" voice-count curve, applied on top
     // of that existing fixed scale, not instead of it.
-    float voice_headroom_scale_ = 1.f;
+    //
+    // voice_headroom_target_ is that raw, instantly-changing value;
+    // voice_headroom_scale_ is what Process() actually multiplies by,
+    // ramped toward the target a little every sample (see its own
+    // kHeadroomRampPerSample-driven step in Process()) rather than
+    // snapping straight to it. Real bug, confirmed on hardware: without
+    // this smoothing, the held-voice count (and so the target) can
+    // change on literally any sample -- a new NoteOn/NoteOff -- and
+    // applying that as an instant multiplier at a 64-sample
+    // RenderQuantum() boundary is a genuine discontinuity in the
+    // summed output, audible as a click on every chord press/release,
+    // not just an inaudible level correction.
+    float voice_headroom_target_ = 1.f;
+    float voice_headroom_scale_  = 1.f;
 
     float sample_rate_     = 48000.f;
     float reverb_send01_   = 0.f;
