@@ -78,8 +78,14 @@ The name, general concept, and file organization are based on
 - Tempo (40–240 BPM), bars per loop (1–16), metronome on/off — locked
   once any layer holds a recording, so you can't pull layers out of sync
 - Master-bus filter, applied to the full mix
-- Reverb size/decay — one shared room for every layer's reverb send, plus
-  Bypass's own independent send into that same room
+- Reverb — one shared Dattorro-topology plate reverb (a real port of
+  [el-visio/dattorro-verb](https://github.com/el-visio/dattorro-verb),
+  see Thanks below) for every layer's reverb send, plus Bypass's own
+  independent send into that same room. `Global:GLB-FX`'s Size/decay is
+  the one knob everything already used; two more pages,
+  `Global:RevTone` (PreDelay, PreFilter, DecayDiffusion, Damping) and
+  `Global:RevDiff` (Input Diffusion 1+2), dial in the rest — from a
+  tight classic plate to a long, smeared, cloud-like wash
 - Bypass: hear your live input mixed into the output before you've even
   recorded anything
 - Startup defaults — save your usual BPM/Bars/Volume/Metro/Filter/Reverb
@@ -506,3 +512,9 @@ cd src && make
 - The broader **Dexed/MicroDexed** open-source ecosystem — source of
   Dexed's 3129 factory presets, freely distributed real DX7 SysEx
   bank dumps.
+- **[el-visio's dattorro-verb](https://github.com/el-visio/dattorro-verb)**
+  (MIT License, Pauli Pölkki 2022) — a real C implementation of Jon
+  Dattorro's 1997 figure-8 plate reverb topology, ported here (`src/
+  dattorro_reverb.h/.cpp`) as the shared reverb bus — same real delay
+  lengths, tap offsets, and tuned defaults, just `float`/static-buffer
+  instead of `double`/`malloc`.

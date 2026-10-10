@@ -114,6 +114,16 @@ class Ui
     // comment for why). Raw 0..1, applied via SetFeedback() directly
     // (same range DaisySP's ReverbSc expects), no curve needed.
     float GetReverbSize01() const { return reverb_size01_; }
+    // The other 6 DattorroReverb parameters -- Size/Decay above is the
+    // one that was already live; these back Global:Reverb Tone/Diffusion
+    // (see GlobalPage::ReverbTone/ReverbDiffusion). Raw 0..1, applied via
+    // the matching DattorroReverb setter directly, no curve.
+    float GetReverbPreDelay01() const { return reverb_predelay01_; }
+    float GetReverbPreFilter01() const { return reverb_prefilter01_; }
+    float GetReverbInputDiffusion1_01() const { return reverb_input_diffusion1_01_; }
+    float GetReverbInputDiffusion2_01() const { return reverb_input_diffusion2_01_; }
+    float GetReverbDecayDiffusion01() const { return reverb_decay_diffusion01_; }
+    float GetReverbDamping01() const { return reverb_damping01_; }
     // Shared delay bus's Time/Feedback (see main.cpp's fx_delay_l/r) --
     // same "one shared instance, everyone sends into it" relationship to
     // Dexed's/Grains' own Delay Send as Reverb Size has to their Reverb
@@ -274,6 +284,14 @@ class Ui
         Speed, // Sits right after Tempo -- both are project-wide timing/transport controls
         Filter,
         Reverb,
+        // Reverb's own two follow-on pages -- Decay/Size itself stays on
+        // Reverb (GLB-FX) above, these cover the rest of the Dattorro
+        // engine's parameters (see DattorroReverb). ReverbTone's own pair
+        // is Button-toggled (PreDelay+PreFilter vs. DecayDiffusion+
+        // Damping); ReverbDiffusion has only 2 knobs left (Input
+        // Diffusion 1+2) so needs no toggle.
+        ReverbTone,
+        ReverbDiffusion,
         File,
         // File management: Knob1 picks which of the 2 save folders
         // (Performances/Grains Presets) then Button1 tap drills in; once
@@ -524,6 +542,13 @@ class Ui
         GlobalFilter,
         GlobalReverb,
         GlobalDelay, // Global:FX's Delay pair (Time/Feedback) -- see global_fx_target_delay_
+        // Global:Reverb Tone's own Button-toggled pair -- see
+        // global_reverb_tone_target_b_.
+        GlobalReverbTonePreDelay,     // PreDelay + PreFilter
+        GlobalReverbToneDecayDamping, // DecayDiffusion + Damping
+        // Global:Reverb Diffusion -- only 2 knobs (Input Diffusion 1+2),
+        // no toggle needed.
+        GlobalReverbDiffusion,
         GlobalSpeed,
         GlobalFile,
         GlobalExport,
@@ -1054,6 +1079,21 @@ class Ui
     float      master_filter_res01_     = 0.f;
 
     float reverb_size01_ = 0.6f; // shared reverb bus's Size/decay, see GetReverbSize01()
+    // The other 6 DattorroReverb parameters -- defaults match the
+    // library's own tuned values (see DattorroReverb::Init()), with
+    // Damping's default (0.05) converted through its own inverted
+    // mapping so the knob's default still lands on the library's real
+    // 0.95 internal value.
+    float reverb_predelay01_          = 0.1f;
+    float reverb_prefilter01_         = 0.85f;
+    float reverb_input_diffusion1_01_ = 0.75f;
+    float reverb_input_diffusion2_01_ = 0.625f;
+    float reverb_decay_diffusion01_   = 0.70f;
+    float reverb_damping01_           = 0.05f;
+    // Global:Reverb Tone's own Button-toggled pair (PreDelay+PreFilter
+    // vs. DecayDiffusion+Damping) -- same idiom as global_fx_target_delay_
+    // below. Global:Reverb Diffusion has no toggle (only 2 knobs left).
+    bool global_reverb_tone_target_b_ = false;
     float delay_time01_     = 0.3f; // shared delay bus's Time, see GetDelayTime01()
     float delay_feedback01_ = 0.35f; // shared delay bus's Feedback, see GetDelayFeedback01()
     // Global:FX's own toggle between the Reverb pair (Size/Bypass Send,

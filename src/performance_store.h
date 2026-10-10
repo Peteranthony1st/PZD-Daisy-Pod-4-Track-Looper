@@ -90,8 +90,22 @@ bool Save(int                slot,
           float              master_filter_res01,
           float              reverb_size01,
           float              bypass_reverb_send01,
+          // The other 6 DattorroReverb parameters (see Ui::GetReverbPreDelay01()
+          // and friends) -- reverb_size01 above IS Decay, already covered.
+          float              reverb_predelay01,
+          float              reverb_prefilter01,
+          float              reverb_input_diffusion1_01,
+          float              reverb_input_diffusion2_01,
+          float              reverb_decay_diffusion01,
+          float              reverb_damping01,
           ProgressFn         on_progress = nullptr);
 
+// Accepts both kFileVersion (12) and the previous version (11) -- see
+// Load()'s own comment in performance_store.cpp for why this is the
+// first backward-compatible version bump in this project's history. A
+// v11 file leaves *out_reverb_predelay01 and friends at the Dattorro
+// library's own tuned defaults (the same ones DattorroReverb::Init()
+// itself uses) rather than failing to load.
 bool Load(int          slot,
           TempoClock&  tempo,
           LooperLayer* layers,
@@ -103,6 +117,12 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
           float*       out_bypass_reverb_send01,
+          float*       out_reverb_predelay01,
+          float*       out_reverb_prefilter01,
+          float*       out_reverb_input_diffusion1_01,
+          float*       out_reverb_input_diffusion2_01,
+          float*       out_reverb_decay_diffusion01,
+          float*       out_reverb_damping01,
           ProgressFn   on_progress = nullptr);
 
 // Grains (GranularEngine) presets: parameters AND the captured audio
@@ -333,6 +353,12 @@ bool ExportWav(TempoClock&  tempo,
                float        master_filter_cutoff01,
                float        master_filter_res01,
                float        reverb_size01,
+               float        reverb_predelay01,
+               float        reverb_prefilter01,
+               float        reverb_input_diffusion1_01,
+               float        reverb_input_diffusion2_01,
+               float        reverb_decay_diffusion01,
+               float        reverb_damping01,
                float        delay_time01,
                float        delay_feedback01,
                bool         for_microdexed,
@@ -357,8 +383,15 @@ bool SavePrefs(TempoClock&  tempo,
                float        master_filter_cutoff01,
                float        master_filter_res01,
                float        reverb_size01,
-               float        bypass_reverb_send01);
+               float        bypass_reverb_send01,
+               float        reverb_predelay01,
+               float        reverb_prefilter01,
+               float        reverb_input_diffusion1_01,
+               float        reverb_input_diffusion2_01,
+               float        reverb_decay_diffusion01,
+               float        reverb_damping01);
 
+// Same v11/v12 backward compatibility as Load() -- see its own comment.
 bool LoadPrefs(float*      out_bpm,
                int*        out_bars,
                float*      out_master_volume01,
@@ -369,6 +402,12 @@ bool LoadPrefs(float*      out_bpm,
                float*      out_reverb_size01,
                float*      out_bypass_reverb_send01,
                bool*       out_metronome_enabled,
-               float*      out_metronome_vol01);
+               float*      out_metronome_vol01,
+               float*      out_reverb_predelay01,
+               float*      out_reverb_prefilter01,
+               float*      out_reverb_input_diffusion1_01,
+               float*      out_reverb_input_diffusion2_01,
+               float*      out_reverb_decay_diffusion01,
+               float*      out_reverb_damping01);
 
 } // namespace PerformanceStore

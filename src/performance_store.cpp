@@ -1,8 +1,10 @@
 #include "performance_store.h"
 #include "dexed_sysex.h"
+#include "dattorro_reverb.h"
 #include <cstdio>
 #include <cstring>
 #include <cctype>
+#include <cstddef>
 #include <math.h>
 #include "per/sdmmc.h"
 #include "sys/fatfs.h"
@@ -365,6 +367,20 @@ struct FileHeader
     // every layer's own Send.
     float    bypass_reverb_send01;
 
+    // The other 6 DattorroReverb parameters -- added in version 12.
+    // reverb_size01 above IS Decay (no new field needed for it, same
+    // knob/meaning carried forward from every version back to 7).
+    // These 6 are the FIRST fields ever added without bumping the
+    // version to a hard-reject-everything-older value -- see
+    // kFileHeaderV11Size and Load()'s own comment for why a v11 file
+    // still loads cleanly, with these defaulted instead.
+    float    reverb_predelay01;
+    float    reverb_prefilter01;
+    float    reverb_input_diffusion1_01;
+    float    reverb_input_diffusion2_01;
+    float    reverb_decay_diffusion01;
+    float    reverb_damping01;
+
     // Pad synth settings (added in version 7, removed in version 10 when
     // Pad synth itself was removed from the project) -- a performance
     // deals ONLY with the looper (audio + tempo/global/per-layer
@@ -394,11 +410,32 @@ struct LayerHeader
 };
 
 // Bumped 1 -> 2 -> ... -> 10 -> 11 as FileHeader/LayerHeader's layout
-// changed (most recently: added LayerHeader::delay_send01) -- Load()
-// already rejects a version mismatch cleanly (see below), so a
-// performance saved under an older version will correctly fail to load
-// rather than being misread. Same accepted tradeoff as every past bump.
-constexpr uint32_t kFileVersion = 11;
+// changed (most recently: added LayerHeader::delay_send01) -- every one
+// of those bumps made Load() reject the older version cleanly (see
+// below), so a performance saved under an older version correctly
+// failed to load rather than being misread.
+//
+// 11 -> 12 (the 6 new DattorroReverb fields above) is the FIRST
+// exception to that: Load()/LoadPrefs() accept both 11 and 12, reading
+// only the v11-sized prefix (kFileHeaderV11Size) from a v11 file and
+// defaulting the 6 new fields to the Dattorro library's own tuned
+// values, rather than rejecting it. Still version-gated going forward
+// -- anything older than 11 is still a hard, clean reject, same as
+// always; reviving those is explicitly out of scope (see the reverb
+// implementation plan).
+constexpr uint32_t kFileVersion     = 12;
+constexpr uint32_t kFileVersionPrev = 11; // the one older version Load() still accepts
+
+// The exact on-disk size of FileHeader as it existed at version 11 --
+// everything up to and including bypass_reverb_send01, with no padding
+// before it (every preceding field is itself 4-byte, so this lands on a
+// 4-byte boundary already). A v11 file is exactly this many bytes of
+// header; a v12 file is this plus the 6 new trailing floats. Reading
+// exactly this many bytes first (before the 6 new fields are known to
+// even exist) is what lets Load() tell the two apart without needing a
+// separate on-disk version scheme.
+constexpr size_t kFileHeaderV11Size
+    = offsetof(FileHeader, bypass_reverb_send01) + sizeof(float);
 
 } // namespace
 
@@ -640,6 +677,12 @@ bool Save(int                slot,
           float              master_filter_res01,
           float              reverb_size01,
           float              bypass_reverb_send01,
+          float              reverb_predelay01,
+          float              reverb_prefilter01,
+          float              reverb_input_diffusion1_01,
+          float              reverb_input_diffusion2_01,
+          float              reverb_decay_diffusion01,
+          float              reverb_damping01,
           ProgressFn         on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -696,6 +739,12 @@ bool Save(int                slot,
     hdr.master_filter_res01     = master_filter_res01;
     hdr.reverb_size01           = reverb_size01;
     hdr.bypass_reverb_send01    = bypass_reverb_send01;
+    hdr.reverb_predelay01              = reverb_predelay01;
+    hdr.reverb_prefilter01             = reverb_prefilter01;
+    hdr.reverb_input_diffusion1_01     = reverb_input_diffusion1_01;
+    hdr.reverb_input_diffusion2_01     = reverb_input_diffusion2_01;
+    hdr.reverb_decay_diffusion01       = reverb_decay_diffusion01;
+    hdr.reverb_damping01               = reverb_damping01;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -785,6 +834,12 @@ bool Load(int          slot,
           float*       out_master_filter_res01,
           float*       out_reverb_size01,
           float*       out_bypass_reverb_send01,
+          float*       out_reverb_predelay01,
+          float*       out_reverb_prefilter01,
+          float*       out_reverb_input_diffusion1_01,
+          float*       out_reverb_input_diffusion2_01,
+          float*       out_reverb_decay_diffusion01,
+          float*       out_reverb_damping01,
           ProgressFn   on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -802,19 +857,51 @@ bool Load(int          slot,
         return false;
     }
 
+    // Read only the v11-sized prefix first -- that's every byte this
+    // struct had BEFORE the 6 new DattorroReverb fields were appended,
+    // so it's always present (and always in this same shape) whether
+    // the file on disk is v11 or v12. Reading `sizeof(hdr)` (the full
+    // v12 size) unconditionally would, for a genuine v11 file, read
+    // past its real header into whatever LayerHeader/audio bytes follow
+    // it in the same file -- there's no EOF to stop it early, since the
+    // rest of the file is still real content, just not more header.
     static FileHeader hdr;
     hdr = FileHeader{};
     UINT br;
-    fr        = f_read(&file, &hdr, sizeof(hdr), &br);
-    bool ok   = fr == FR_OK && br == sizeof(hdr);
-    if(ok && (memcmp(hdr.magic, "OURO", 4) != 0 || hdr.version != kFileVersion))
+    fr      = f_read(&file, &hdr, kFileHeaderV11Size, &br);
+    bool ok = fr == FR_OK && br == (UINT)kFileHeaderV11Size;
+    bool version_ok
+        = ok && memcmp(hdr.magic, "OURO", 4) == 0
+          && (hdr.version == kFileVersion || hdr.version == kFileVersionPrev);
+    if(ok && version_ok && hdr.version == kFileVersion)
     {
-        ok = false;
-        SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
+        // v12 -- the 6 new fields are real, read them too (continuing
+        // from the current file position, right after the prefix above).
+        UINT br2;
+        fr = f_read(&file, &hdr.reverb_predelay01, sizeof(FileHeader) - kFileHeaderV11Size,
+                     &br2);
+        ok = fr == FR_OK && br2 == (UINT)(sizeof(FileHeader) - kFileHeaderV11Size);
     }
-    else if(!ok)
+    else if(ok && version_ok)
     {
-        SetError("hdr", fr);
+        // v11 -- no more header bytes to read; the file's position is
+        // already exactly where the first LayerHeader begins. Default
+        // the 6 new fields to the Dattorro library's own tuned values
+        // (same ones DattorroReverb::Init() uses), not zero.
+        hdr.reverb_predelay01          = 0.1f;
+        hdr.reverb_prefilter01         = 0.85f;
+        hdr.reverb_input_diffusion1_01 = 0.75f;
+        hdr.reverb_input_diffusion2_01 = 0.625f;
+        hdr.reverb_decay_diffusion01   = 0.70f;
+        hdr.reverb_damping01           = 0.05f; // -> internal damping_amount_ 0.95
+    }
+    if(!ok || !version_ok)
+    {
+        if(ok && !version_ok)
+            SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
+        else if(!ok)
+            SetError("hdr", fr);
+        ok = false;
     }
 
     if(ok)
@@ -849,6 +936,12 @@ bool Load(int          slot,
         *out_master_filter_res01     = hdr.master_filter_res01;
         *out_reverb_size01           = hdr.reverb_size01;
         *out_bypass_reverb_send01    = hdr.bypass_reverb_send01;
+        *out_reverb_predelay01              = hdr.reverb_predelay01;
+        *out_reverb_prefilter01             = hdr.reverb_prefilter01;
+        *out_reverb_input_diffusion1_01     = hdr.reverb_input_diffusion1_01;
+        *out_reverb_input_diffusion2_01     = hdr.reverb_input_diffusion2_01;
+        *out_reverb_decay_diffusion01       = hdr.reverb_decay_diffusion01;
+        *out_reverb_damping01               = hdr.reverb_damping01;
     }
 
     int n = ok ? (int)hdr.num_layers : 0;
@@ -2104,6 +2197,12 @@ bool ExportWav(TempoClock&  tempo,
               float        master_filter_cutoff01,
               float        master_filter_res01,
               float        reverb_size01,
+              float        reverb_predelay01,
+              float        reverb_prefilter01,
+              float        reverb_input_diffusion1_01,
+              float        reverb_input_diffusion2_01,
+              float        reverb_decay_diffusion01,
+              float        reverb_damping01,
               float        delay_time01,
               float        delay_feedback01,
               bool         for_microdexed,
@@ -2251,11 +2350,20 @@ bool ExportWav(TempoClock&  tempo,
     // (being `static`) whatever a previous export call left behind on
     // every call after that -- re-zeroing each time keeps every export
     // starting from the same clean state.
-    static daisysp::ReverbSc DSY_SDRAM_BSS export_reverb;
+    static DattorroReverb DSY_SDRAM_BSS export_reverb;
     memset(&export_reverb, 0, sizeof(export_reverb));
     export_reverb.Init((float)sample_rate);
-    export_reverb.SetLpFreq(9000.f); // fixed damping, matches the live default
-    export_reverb.SetFeedback(Clampf(reverb_size01, 0.f, 1.f));
+    // All 7 parameters re-applied from the live values passed in, same
+    // treatment as main.cpp's AudioCallback() -- so an exported WAV
+    // actually matches live playback instead of silently falling back
+    // to Init()'s own tuned defaults for the 6 non-Decay parameters.
+    export_reverb.SetDecay01(Clampf(reverb_size01, 0.f, 1.f));
+    export_reverb.SetPreDelay01(Clampf(reverb_predelay01, 0.f, 1.f));
+    export_reverb.SetPreFilter01(Clampf(reverb_prefilter01, 0.f, 1.f));
+    export_reverb.SetInputDiffusion1_01(Clampf(reverb_input_diffusion1_01, 0.f, 1.f));
+    export_reverb.SetInputDiffusion2_01(Clampf(reverb_input_diffusion2_01, 0.f, 1.f));
+    export_reverb.SetDecayDiffusion01(Clampf(reverb_decay_diffusion01, 0.f, 1.f));
+    export_reverb.SetDamping01(Clampf(reverb_damping01, 0.f, 1.f));
 
     // Local shared delay bus, mirroring main.cpp's fx_delay_l/r -- same
     // cross-feedback ("ping-pong") pair, same reasoning as export_reverb
@@ -2482,7 +2590,13 @@ bool SavePrefs(TempoClock&  tempo,
               float        master_filter_cutoff01,
               float        master_filter_res01,
               float        reverb_size01,
-              float        bypass_reverb_send01)
+              float        bypass_reverb_send01,
+              float        reverb_predelay01,
+              float        reverb_prefilter01,
+              float        reverb_input_diffusion1_01,
+              float        reverb_input_diffusion2_01,
+              float        reverb_decay_diffusion01,
+              float        reverb_damping01)
 {
     if(!card_ready)
         return false;
@@ -2512,6 +2626,12 @@ bool SavePrefs(TempoClock&  tempo,
     hdr.master_filter_res01     = master_filter_res01;
     hdr.reverb_size01           = reverb_size01;
     hdr.bypass_reverb_send01    = bypass_reverb_send01;
+    hdr.reverb_predelay01              = reverb_predelay01;
+    hdr.reverb_prefilter01             = reverb_prefilter01;
+    hdr.reverb_input_diffusion1_01     = reverb_input_diffusion1_01;
+    hdr.reverb_input_diffusion2_01     = reverb_input_diffusion2_01;
+    hdr.reverb_decay_diffusion01       = reverb_decay_diffusion01;
+    hdr.reverb_damping01               = reverb_damping01;
 
     UINT bw;
     fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -2536,7 +2656,13 @@ bool LoadPrefs(float*      out_bpm,
               float*      out_reverb_size01,
               float*      out_bypass_reverb_send01,
               bool*       out_metronome_enabled,
-              float*      out_metronome_vol01)
+              float*      out_metronome_vol01,
+              float*      out_reverb_predelay01,
+              float*      out_reverb_prefilter01,
+              float*      out_reverb_input_diffusion1_01,
+              float*      out_reverb_input_diffusion2_01,
+              float*      out_reverb_decay_diffusion01,
+              float*      out_reverb_damping01)
 {
     // No card, no file, or wrong shape -- all silently "nothing saved
     // yet", not an error (see the header comment: the caller's own
@@ -2549,13 +2675,37 @@ bool LoadPrefs(float*      out_bpm,
     if(fr != FR_OK)
         return false;
 
+    // Same v11/v12 two-stage read as Load() -- see its own comment.
+    // PREFS.DAT is header-only (no LayerHeader/audio follows it), so
+    // there's no risk of a short v11 read spilling into unrelated
+    // content either way, but the same two-stage shape keeps this in
+    // sync with Load() and avoids a second, subtly different scheme.
     static FileHeader hdr;
     hdr = FileHeader{};
     UINT br;
-    fr      = f_read(&file, &hdr, sizeof(hdr), &br);
-    bool ok = fr == FR_OK && br == sizeof(hdr);
+    fr      = f_read(&file, &hdr, kFileHeaderV11Size, &br);
+    bool ok = fr == FR_OK && br == (UINT)kFileHeaderV11Size;
+    bool version_ok
+        = ok && memcmp(hdr.magic, "PREF", 4) == 0
+          && (hdr.version == kFileVersion || hdr.version == kFileVersionPrev);
+    if(ok && version_ok && hdr.version == kFileVersion)
+    {
+        UINT br2;
+        fr = f_read(&file, &hdr.reverb_predelay01, sizeof(FileHeader) - kFileHeaderV11Size,
+                     &br2);
+        ok = fr == FR_OK && br2 == (UINT)(sizeof(FileHeader) - kFileHeaderV11Size);
+    }
+    else if(ok && version_ok)
+    {
+        hdr.reverb_predelay01          = 0.1f;
+        hdr.reverb_prefilter01         = 0.85f;
+        hdr.reverb_input_diffusion1_01 = 0.75f;
+        hdr.reverb_input_diffusion2_01 = 0.625f;
+        hdr.reverb_decay_diffusion01   = 0.70f;
+        hdr.reverb_damping01           = 0.05f;
+    }
     f_close(&file);
-    if(!ok || memcmp(hdr.magic, "PREF", 4) != 0 || hdr.version != kFileVersion)
+    if(!ok || !version_ok)
         return false;
 
     *out_bpm                    = hdr.bpm;
@@ -2569,6 +2719,12 @@ bool LoadPrefs(float*      out_bpm,
     *out_bypass_reverb_send01   = hdr.bypass_reverb_send01;
     *out_metronome_enabled      = hdr.metronome_enabled != 0;
     *out_metronome_vol01        = hdr.metronome_vol01;
+    *out_reverb_predelay01              = hdr.reverb_predelay01;
+    *out_reverb_prefilter01             = hdr.reverb_prefilter01;
+    *out_reverb_input_diffusion1_01     = hdr.reverb_input_diffusion1_01;
+    *out_reverb_input_diffusion2_01     = hdr.reverb_input_diffusion2_01;
+    *out_reverb_decay_diffusion01       = hdr.reverb_decay_diffusion01;
+    *out_reverb_damping01               = hdr.reverb_damping01;
     return true;
 }
 

@@ -169,12 +169,16 @@ void Ui::Init(daisy::DaisyPod*              pod,
 void Ui::ApplyStartupDefaults()
 {
     float      bpm, master_vol01, cutoff01, res01, reverb_sz01, byp_send01, metro_vol01;
+    float      rev_predelay01, rev_prefilter01, rev_diff1_01, rev_diff2_01, rev_decdiff01,
+        rev_damping01;
     int        bars;
     bool       byp, metro_on;
     FilterMode mode;
     if(!PerformanceStore::LoadPrefs(&bpm, &bars, &master_vol01, &byp, &mode, &cutoff01,
                                       &res01, &reverb_sz01, &byp_send01, &metro_on,
-                                      &metro_vol01))
+                                      &metro_vol01, &rev_predelay01, &rev_prefilter01,
+                                      &rev_diff1_01, &rev_diff2_01, &rev_decdiff01,
+                                      &rev_damping01))
         return; // nothing saved yet -- Init()'s hardcoded defaults already stand
 
     // SetBpm()/SetBars() are no-ops while locked, but nothing can be
@@ -195,6 +199,12 @@ void Ui::ApplyStartupDefaults()
     master_filter_res01_     = res01;
     reverb_size01_           = reverb_sz01;
     bypass_reverb_send01_    = byp_send01;
+    reverb_predelay01_          = rev_predelay01;
+    reverb_prefilter01_         = rev_prefilter01;
+    reverb_input_diffusion1_01_ = rev_diff1_01;
+    reverb_input_diffusion2_01_ = rev_diff2_01;
+    reverb_decay_diffusion01_   = rev_decdiff01;
+    reverb_damping01_           = rev_damping01;
 
     // Init() already called this once with the pre-defaults values (see
     // its own comment above) -- re-seed now that the real starting
@@ -880,6 +890,8 @@ void Ui::OnButton1Short()
             }
             else if(global_page_ == GlobalPage::Reverb)
                 global_fx_target_delay_ = false; // knobs -> Reverb (Size/Bypass Send)
+            else if(global_page_ == GlobalPage::ReverbTone)
+                global_reverb_tone_target_b_ = false; // knobs -> PreDelay/PreFilter
             else if(global_page_ == GlobalPage::Speed)
             {
                 // Cycle Normal -> Scrub -> Freeze -> Normal. Leaving
@@ -1258,6 +1270,8 @@ void Ui::OnButton2Short()
         bypass_ = !bypass_;
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Reverb)
         global_fx_target_delay_ = true; // knobs -> Delay (Time/Feedback)
+    else if(screen_ == Screen::Global && global_page_ == GlobalPage::ReverbTone)
+        global_reverb_tone_target_b_ = true; // knobs -> DecayDiffusion/Damping
     else if(screen_ == Screen::Global && global_page_ == GlobalPage::Speed)
     {
         SetProjectSpeed01(0.5f); // tap = reset to 1.0x, mirrors Layer:Speed's Button1 tap
@@ -1343,6 +1357,11 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GlobalPage::Reverb:
                     return global_fx_target_delay_ ? KnobContext::GlobalDelay
                                                       : KnobContext::GlobalReverb;
+                case GlobalPage::ReverbTone:
+                    return global_reverb_tone_target_b_
+                               ? KnobContext::GlobalReverbToneDecayDamping
+                               : KnobContext::GlobalReverbTonePreDelay;
+                case GlobalPage::ReverbDiffusion: return KnobContext::GlobalReverbDiffusion;
                 case GlobalPage::Speed: return KnobContext::GlobalSpeed;
                 case GlobalPage::File: return KnobContext::GlobalFile;
                 case GlobalPage::Export: return KnobContext::GlobalExport;
@@ -1477,6 +1496,18 @@ void Ui::SyncPickupTargets(KnobContext ctx)
         case KnobContext::GlobalDelay:
             k1_pickup_raw_[i] = delay_time01_;
             k2_pickup_raw_[i] = delay_feedback01_;
+            break;
+        case KnobContext::GlobalReverbTonePreDelay:
+            k1_pickup_raw_[i] = reverb_predelay01_;
+            k2_pickup_raw_[i] = reverb_prefilter01_;
+            break;
+        case KnobContext::GlobalReverbToneDecayDamping:
+            k1_pickup_raw_[i] = reverb_decay_diffusion01_;
+            k2_pickup_raw_[i] = reverb_damping01_;
+            break;
+        case KnobContext::GlobalReverbDiffusion:
+            k1_pickup_raw_[i] = reverb_input_diffusion1_01_;
+            k2_pickup_raw_[i] = reverb_input_diffusion2_01_;
             break;
         case KnobContext::GlobalSpeed:
             k1_pickup_raw_[i] = project_speed01_;
@@ -1926,6 +1957,30 @@ void Ui::ApplyKnobs()
                     if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                         delay_feedback01_ = Clampf(k2, 0.f, 1.f);
                 }
+            }
+            else if(global_page_ == GlobalPage::ReverbTone)
+            {
+                if(!global_reverb_tone_target_b_)
+                {
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        reverb_predelay01_ = Clampf(k1, 0.f, 1.f);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        reverb_prefilter01_ = Clampf(k2, 0.f, 1.f);
+                }
+                else
+                {
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        reverb_decay_diffusion01_ = Clampf(k1, 0.f, 1.f);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        reverb_damping01_ = Clampf(k2, 0.f, 1.f);
+                }
+            }
+            else if(global_page_ == GlobalPage::ReverbDiffusion)
+            {
+                if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    reverb_input_diffusion1_01_ = Clampf(k1, 0.f, 1.f);
+                if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                    reverb_input_diffusion2_01_ = Clampf(k2, 0.f, 1.f);
             }
             else if(global_page_ == GlobalPage::Speed)
             {
@@ -3189,6 +3244,10 @@ void Ui::DrawGlobalScreen()
         title = "Global:Filter";
     else if(global_page_ == GlobalPage::Reverb)
         title = "Global:GLB-FX";
+    else if(global_page_ == GlobalPage::ReverbTone)
+        title = "Global:RevTone";
+    else if(global_page_ == GlobalPage::ReverbDiffusion)
+        title = "Global:RevDiff";
     disp_->SetCursor(0, 0);
     WriteUpper(title);
     DrawBeatIndicator(disp_->Width() - 41, 0, 3);
@@ -3289,8 +3348,8 @@ void Ui::DrawGlobalScreen()
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                          "Reverb*", "", "", "Delay");
     }
-    else // GlobalPage::Reverb && global_fx_target_delay_ -- Delay pair,
-         // shared Time/Feedback for the ONE cross-feedback delay bus
+    else if(global_page_ == GlobalPage::Reverb) // global_fx_target_delay_ -- Delay
+         // pair, shared Time/Feedback for the ONE cross-feedback delay bus
          // both Dexed and Grains send into (see main.cpp's fx_delay_l/r).
     {
         char time_val[8], fb_val[8];
@@ -3300,6 +3359,47 @@ void Ui::DrawGlobalScreen()
                          "Feedback");
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                          "Reverb", "", "", "Delay*");
+    }
+    else if(global_page_ == GlobalPage::ReverbTone && !global_reverb_tone_target_b_)
+    // PreDelay + PreFilter pair -- gap before the tail starts, and input
+    // tone/brightness going into the tank (see DattorroReverb).
+    {
+        char predelay_val[8], prefilter_val[8];
+        snprintf(predelay_val, sizeof(predelay_val), "%d%%",
+                  (int)(reverb_predelay01_ * 100.f + 0.5f));
+        snprintf(prefilter_val, sizeof(prefilter_val), "%d%%",
+                  (int)(reverb_prefilter01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "PreDelay", predelay_val,
+                         prefilter_val, "PreFilt");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                         "PreDelay*", "", "", "Decay/Damp");
+    }
+    else if(global_page_ == GlobalPage::ReverbTone) // global_reverb_tone_target_b_ --
+         // DecayDiffusion + Damping pair -- tail density/smoothness and
+         // brightness-over-time.
+    {
+        char decdiff_val[8], damping_val[8];
+        snprintf(decdiff_val, sizeof(decdiff_val), "%d%%",
+                  (int)(reverb_decay_diffusion01_ * 100.f + 0.5f));
+        snprintf(damping_val, sizeof(damping_val), "%d%%",
+                  (int)(reverb_damping01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "DecDiff", decdiff_val,
+                         damping_val, "Damping");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
+                         "PreDelay", "", "", "Decay/Damp*");
+    }
+    else // GlobalPage::ReverbDiffusion -- Input Diffusion 1+2, no toggle
+         // needed (only 2 knobs left). Shapes how smeared/soft the attack
+         // transient is going into the reverb.
+    {
+        char diff1_val[8], diff2_val[8];
+        snprintf(diff1_val, sizeof(diff1_val), "%d%%",
+                  (int)(reverb_input_diffusion1_01_ * 100.f + 0.5f));
+        snprintf(diff2_val, sizeof(diff2_val), "%d%%",
+                  (int)(reverb_input_diffusion2_01_ * 100.f + 0.5f));
+        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Diff 1", diff1_val, diff2_val,
+                         "Diff 2");
+        DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
     }
 }
 
@@ -5482,7 +5582,10 @@ void Ui::TriggerSave(bool force_new)
     bool ok = PerformanceStore::Save(slot, *tempo_, layers_, num_layers_, master_volume01_,
                                        bypass_, master_filter_mode_, master_filter_cutoff01_,
                                        master_filter_res01_, reverb_size01_,
-                                       bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
+                                       bypass_reverb_send01_, reverb_predelay01_,
+                                       reverb_prefilter01_, reverb_input_diffusion1_01_,
+                                       reverb_input_diffusion2_01_, reverb_decay_diffusion01_,
+                                       reverb_damping01_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
 
@@ -5533,7 +5636,11 @@ void Ui::TriggerLoad()
     bool ok = PerformanceStore::Load(slot, *tempo_, layers_, num_layers_, &master_volume01_,
                                        &bypass_, &master_filter_mode_, &master_filter_cutoff01_,
                                        &master_filter_res01_, &reverb_size01_,
-                                       &bypass_reverb_send01_, &Ui::OnSaveLoadProgress);
+                                       &bypass_reverb_send01_, &reverb_predelay01_,
+                                       &reverb_prefilter01_, &reverb_input_diffusion1_01_,
+                                       &reverb_input_diffusion2_01_,
+                                       &reverb_decay_diffusion01_, &reverb_damping01_,
+                                       &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
     g_audio_suspended     = false; // every layer + tempo phase is consistent now
@@ -6176,7 +6283,10 @@ void Ui::TriggerSaveDefaults()
     bool ok = PerformanceStore::SavePrefs(*tempo_, master_volume01_, bypass_,
                                             master_filter_mode_, master_filter_cutoff01_,
                                             master_filter_res01_, reverb_size01_,
-                                            bypass_reverb_send01_);
+                                            bypass_reverb_send01_, reverb_predelay01_,
+                                            reverb_prefilter01_, reverb_input_diffusion1_01_,
+                                            reverb_input_diffusion2_01_,
+                                            reverb_decay_diffusion01_, reverb_damping01_);
     if(ok)
         snprintf(tempo_status_, sizeof(tempo_status_), "Saved as default");
     else
@@ -6193,7 +6303,11 @@ void Ui::TriggerExport()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            reverb_size01_, delay_time01_, delay_feedback01_,
+                                            reverb_size01_, reverb_predelay01_,
+                                            reverb_prefilter01_, reverb_input_diffusion1_01_,
+                                            reverb_input_diffusion2_01_,
+                                            reverb_decay_diffusion01_, reverb_damping01_,
+                                            delay_time01_, delay_feedback01_,
                                             /*for_microdexed=*/false, project_speed_,
                                             &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
@@ -6216,7 +6330,11 @@ void Ui::TriggerExportMicroDexed()
     export_op_in_progress_  = true;
     bool ok = PerformanceStore::ExportWav(*tempo_, layers_, num_layers_, master_filter_mode_,
                                             master_filter_cutoff01_, master_filter_res01_,
-                                            reverb_size01_, delay_time01_, delay_feedback01_,
+                                            reverb_size01_, reverb_predelay01_,
+                                            reverb_prefilter01_, reverb_input_diffusion1_01_,
+                                            reverb_input_diffusion2_01_,
+                                            reverb_decay_diffusion01_, reverb_damping01_,
+                                            delay_time01_, delay_feedback01_,
                                             /*for_microdexed=*/true, project_speed_,
                                             &Ui::OnSaveLoadProgress);
     export_op_in_progress_  = false;
