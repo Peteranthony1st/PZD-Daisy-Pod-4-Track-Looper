@@ -59,11 +59,17 @@ The name, general concept, and file organization are based on
   layer recorded sets the tempo-locked length every other layer records
   to, so everything stays in sync automatically.
 - Record, play/pause, and overdub (additively layer new material onto an
-  existing take) on any layer.
+  existing take) on any layer — overdub gets its own tempo-locked
+  count-in too, then auto-stops after exactly one full pass (or stop it
+  early with a tap).
 - Tempo-locked count-in with an audible metronome click, or record
   instantly with the metronome off.
 - Live waveform display per layer with a moving playhead, auto-scaled so
   quiet input still shows clearly.
+- Undo last overdub — a short tap of Button 2 on Layer:Status instantly
+  restores that layer to right before its most recent overdub. One
+  shared slot across all 4 layers (undoes only the single most recent
+  overdub, not a full history per layer).
 
 **Per-layer controls**
 - Volume, Pan, Speed (0.3x–2x, tape-style — affects pitch too)
@@ -75,8 +81,9 @@ The name, general concept, and file organization are based on
 - Input gain (1x–4x) for quiet sources
 
 **Global**
-- Tempo (40–240 BPM), bars per loop (1–16), metronome on/off — locked
-  once any layer holds a recording, so you can't pull layers out of sync
+- Tempo (50–240 BPM), bars per loop (1–16, though slower tempos cap out
+  lower — see Control reference), metronome on/off — locked once any
+  layer holds a recording, so you can't pull layers out of sync
 - Master-bus filter, applied to the full mix
 - Reverb — one shared Dattorro-topology plate reverb (a real port of
   [el-visio/dattorro-verb](https://github.com/el-visio/dattorro-verb),
@@ -135,7 +142,10 @@ alongside the looper (`Global:Dexed`, opened by clicking the encoder
 there), built around Google's own **msfa** DX7 emulation core — the real
 32 algorithms, the real envelope/scaling model, not an approximation.
 Off by default; switch it on from `Global:Dexed` (independent of
-Grains — no mutex, both can run together).
+Grains — no mutex, both can run together). Its own `MIDI` page sets
+which incoming MIDI channel it listens to (Omni or 1-16) — independent
+of Grains' own channel, so a keyboard split across channels can play
+just one engine at a time, or both can stay on Omni as before.
 - **3129 factory presets** across 54 folders — **Rom 1**-**Rom 4** (the
   real, unsorted contents of the actual Yamaha factory ROM cartridges),
   plus 50 more from one real ~100-bank collection that came already
@@ -217,7 +227,9 @@ card's `IMPORT/` folder accepts 16/24/32-bit PCM or 32-bit float, mono
 or stereo, and any of the common real-world WAV rates (8000-192000Hz) —
 anything other than 48kHz is resampled automatically, with a real
 anti-aliasing filter for genuine downsampling. Also switchable off from
-`Global:Granular` to free its CPU share.
+`Global:Granular` to free its CPU share. Its own `MIDI` page sets which
+incoming MIDI channel it listens to (Omni or 1-16), independent of
+Dexed's own channel.
 
 Grains demo:
 https://github.com/user-attachments/assets/8aa7bd86-f749-4e34-a360-c5dd3af774d0
@@ -356,13 +368,13 @@ Export gets baked into the file on purpose.
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
 | Home | Master volume | Metronome volume | Rec / Pause / Overdub (tap/hold, state-dependent) | Toggle bypass |
-| Layer: Status | Volume | Pan | Same transport as Home | Hold 800ms = Clear layer |
+| Layer: Status | Volume | Pan | Same transport as Home | Tap = Undo last overdub, hold 800ms = Clear layer |
 | Layer: Gain | Input gain | — | — | — |
 | Layer: Speed | Speed | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect | — |
 | Layer: LYR-FX | Send | — | — | — |
-| Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
+| Global: Tempo | BPM (50–240) | Bars (1–16, lower-capped at slower BPM) | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Speed | Vari-speed | — | Cycle Normal/Scrub/Freeze | Reset to 1.0x |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Global: GLB-FX | Size (= Decay) | Bypass reverb send | — | — |
@@ -388,6 +400,7 @@ Export gets baked into the file on purpose.
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Mix | Reverb send | Output level | — | — |
 | DX-FX | Reverb send / Delay send | Shared reverb size / delay time | Toggle Reverb/Delay | — |
+| MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Advanced | — | — | — | — (push encoder to enter the operator editor) |
 | Preset | Top: Files/Import/New. Files → Roms/Dexed/Imports/User group → folder → presets | — | Save / Select (top) / Back (group+folder) | Open (group+folder) / Hold: Import / Tap: preview, Hold: confirm |
 
@@ -426,6 +439,7 @@ else. The real DX7 operator number (1-6) is always shown in the title.
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Mix | Grain volume / Reverb send | Scan volume | Knobs → Grain+Scan | Knobs → Reverb send |
 | GR-FX | Reverb send / Delay send | Shared reverb size / delay time | Toggle Reverb/Delay | — |
+| MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Capture | — | — | Cycle source (Direct/Layer/Import) | Hold = record or capture |
 | Trim | Trim start | Trim end | — | — |
 | Preset | See Save/load above | — | Save / Select (Load) / Back | Hold 800ms = confirm |

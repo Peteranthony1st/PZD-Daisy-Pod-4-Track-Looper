@@ -57,10 +57,20 @@ class TempoClock
     // every layer has been cleared back to empty.
     float GetSampleRate() const { return sample_rate_; }
 
-    void  SetBpm(float bpm);   // clamped to [40, 240]
+    void  SetBpm(float bpm);   // clamped to [50, 240]
     float GetBpm() const { return bpm_; }
-    void  SetBars(int bars);   // clamped to [1, 16]
+    // Clamped to [1, MaxBarsForBpm(bpm_)] -- see MaxBarsForBpm()'s own
+    // comment for why the top end depends on the current BPM.
+    void  SetBars(int bars);
     int   GetBars() const { return bars_; }
+    // The real ceiling on Bars at a given BPM, so that
+    // bars * kBeatsPerBar * (60/bpm) never exceeds kMaxLoopSeconds -- the
+    // length a loop can reach under the new 50-240 BPM floor is what the
+    // shared Undo-overdub backup buffer (main.cpp) is sized for, so no
+    // combination this allows can ever produce a loop that backup can't
+    // hold. Below ~200 BPM this is the real limit; at/above it the
+    // existing absolute ceiling of 16 is already satisfied on its own.
+    static int MaxBarsForBpm(float bpm);
     void  Lock() { locked_ = true; }
     void  Unlock() { locked_ = false; }
     bool  IsLocked() const { return locked_; }
@@ -143,8 +153,10 @@ class TempoClock
     // 0 if the metronome is disabled.
     float RenderClick(const TempoTick& tick);
 
-    static constexpr int kBeatsPerBar  = 4; // 4/4 time is assumed throughout
-    static constexpr int kCountInBeats = 4; // 1 bar count-in
+    static constexpr int   kBeatsPerBar  = 4; // 4/4 time is assumed throughout
+    static constexpr int   kCountInBeats = 4; // 1 bar count-in
+    // The real ceiling MaxBarsForBpm() enforces -- see its own comment.
+    static constexpr float kMaxLoopSeconds = 19.2f;
 
   private:
     float SamplesPerBeat() const;

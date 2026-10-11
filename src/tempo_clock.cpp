@@ -43,14 +43,26 @@ void TempoClock::SetBpm(float bpm)
 {
     if(locked_)
         return;
-    bpm_ = Clamp(bpm, 40.f, 240.f);
+    bpm_ = Clamp(bpm, 50.f, 240.f);
+}
+
+int TempoClock::MaxBarsForBpm(float bpm)
+{
+    // bars * kBeatsPerBar * (60/bpm) <= kMaxLoopSeconds
+    // <=> bars <= kMaxLoopSeconds * bpm / (60 * kBeatsPerBar)
+    // 60 * kBeatsPerBar == 240, and kMaxLoopSeconds/240 == 1/12.5, so this
+    // is exactly "one more bar every 12.5 BPM" -- see the header's own
+    // comment for why that's the real boundary, not a rounded one.
+    int max_bars = (int)(kMaxLoopSeconds * bpm / (60.f * (float)kBeatsPerBar));
+    return max_bars > 16 ? 16 : (max_bars < 1 ? 1 : max_bars);
 }
 
 void TempoClock::SetBars(int bars)
 {
     if(locked_)
         return;
-    bars_ = bars < 1 ? 1 : (bars > 16 ? 16 : bars);
+    int ceiling = MaxBarsForBpm(bpm_);
+    bars_       = bars < 1 ? 1 : (bars > ceiling ? ceiling : bars);
     if(bar_in_loop_ >= bars_)
         bar_in_loop_ = 0; // avoid a stale "Bar 5 of 3"-style display if Bars shrinks
 }

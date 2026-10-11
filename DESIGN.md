@@ -140,13 +140,13 @@ Full control map:
 | Screen / Page | Knob 1 | Knob 2 | Button 1 (tap / hold) | Button 2 |
 |---|---|---|---|---|
 | Home | Master volume | Metronome volume | Rec/Pause/Overdub cycle for cursor layer (see transport state machine) | Toggle bypass |
-| Layer: Status | Volume | Pan | Same transport as Home, for this layer | Hold 800ms = Clear |
+| Layer: Status | Volume | Pan | Same transport as Home, for this layer | Tap = Undo last overdub, hold 800ms = Clear |
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Layer: Speed | Speed (0.3x-2x, deadzone-centered on 1.0x) | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
 | Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
 | Layer: LYR-FX | Send (into the shared reverb bus, see below) | — | — | — |
-| Global: Tempo | BPM (40-240) | Bars per loop (1-16) | Toggle metronome | Hold 800ms = save as startup default |
+| Global: Tempo | BPM (50-240) | Bars per loop (1-16, lower-capped at slower BPM — see *Tempo, metronome, and count-in* below) | Toggle metronome | Hold 800ms = save as startup default |
 | Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Cycle transport mode: Normal/Scrub/Freeze (see below) | Reset to 1.0x |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: GLB-FX | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
@@ -167,6 +167,7 @@ Full control map:
 | Dexed: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Dexed: Mix | Reverb send | Output level | — | — |
 | Dexed: DX-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
+| Dexed: MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Dexed: Advanced | — | — | — | — (push encoder to enter Screen::DexedOperator) |
 | Dexed: Preset | Top: Files/Import/Load New. Files → group (Roms/Dexed/Imports/User) → folder list (not User) → presets | — | Save / Select (top+group) / Back (group+folder levels) | Open (group+folder levels) / Hold: Import (Import list) / Tap: preview, Hold 800ms: confirm (a real preset) |
 | DexedOperator: RatioLevel | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
@@ -182,6 +183,7 @@ Full control map:
 | Granular: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Granular: Mix | Grain volume (or Reverb send) | Scan volume | Knobs → Grain+Scan volume | Knobs → Reverb send |
 | Granular: GR-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
+| Granular: MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
 | Granular: Trim | Trim start | Trim end | — | — |
 | Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
@@ -220,19 +222,66 @@ Empty ──long-press──► ArmedCountIn ──(count-in finishes)──► 
                                                                  │ short  │ short
                                                                  ▼        │
                                                               Paused ─────┘
-      Playing/Paused ──long-press (hold)──► Overdubbing ──release──► Playing
+      Playing/Paused ──long-press──► ArmedOverdubCountIn ──(count-in finishes)──► Overdubbing
+                                                                 │ (auto-stops after
+                                                                 │  one full pass, or
+                                                                 │  short-press to
+                                                                 │  stop early)
+                                                                 ▼
+                                                              Playing
       Playing/Paused ──Button2 held 800ms (Status page only)──► Empty (cleared)
+      Overdubbing/Playing (just finished one) ──Button2 short tap (Status page,
+        only while this layer still owns the single shared Undo slot)──►
+        Playing (buffer restored to pre-overdub)
 ```
+
+(Overdub used to start the instant the button was long-pressed and run for
+exactly as long as it stayed held — changed to its own count-in, then a
+fixed one-pass auto-stop, matching Recording's own shape, after a real user
+report: "the original recording and the overdub were about 1 beat late...
+can't we set it to also have a 4 beat count in like layer record?")
 
 ## Tempo, metronome, and count-in
 
 One `TempoClock`, shared by all 4 layers, is the single source of timing
 truth:
 
-- **BPM** (40-240) and **Bars** (1-16) together define the loop length
-  every layer records to: `samples = 60/BPM * 4 beats/bar * Bars * sample_rate`.
+- **BPM** (50-240) and **Bars** together define the loop length every
+  layer records to: `samples = 60/BPM * 4 beats/bar * Bars * sample_rate`.
   4/4 time is assumed throughout (not configurable — it's one constant in
   `tempo_clock.h` if you ever want to change it).
+- **Bars' own ceiling is dynamic, not a flat 16**: `TempoClock::
+  MaxBarsForBpm(bpm)` = `floor(bpm/12.5)`, clamped to the existing
+  absolute ceiling of 16 — one more bar unlocks every 12.5 BPM, so the
+  knob's own usable range (and the "current/max" shown on Global:Tempo)
+  shrinks at slower tempos instead of letting you dial in a BPM/Bars
+  combination with no further restriction. This guarantees
+  `Bars * 4 beats * (60/BPM) <= kMaxLoopSeconds` (19.2s) for every
+  reachable combination, which exists for two reasons at once, not just
+  one: it bounds the one shared Undo backup buffer's size (see
+  *Undo last overdub* below) to something affordable in SDRAM, and it
+  closes a real truncation bug that predates Undo entirely — a 40 BPM/
+  16-bar loop used to request 96s of audio against a hard ~33.3s buffer
+  ceiling, silently cutting a recording off mid-phrase under 6 bars in,
+  with no indication anything had gone wrong. The BPM floor itself moved
+  40→50 as part of the same change, since 40 BPM could no longer reach
+  even 1 bar under the new ceiling without it.
+- **The main per-layer buffers themselves shrank alongside this** (`main.cpp`'s
+  `kBuffSize`, 1,600,000 → 921,600 samples/layer/channel — the exact new
+  19.2s ceiling, not a round number) — the dynamic Bars ceiling above
+  means nothing new can ever be recorded past it, so there was no reason
+  to keep paying SDRAM for the old ~33.3s allocation. Net effect, with
+  the new shared Undo backup (see below) added back in: SDRAM usage
+  84.70% → 63.34%, a net *reduction*. A performance saved before either
+  ceiling existed, whose recorded length lands between the new 19.2s
+  buffer size and the old ~33.3s one, hits the same defensive
+  `len > GetBufferSize()` clamp `Load()` already had for a corrupt/
+  foreign file (`performance_store.cpp`) — it loads and plays, just
+  truncated to the new ceiling instead of its full original length. The
+  shared Undo backup (see below) is sized to this exact same `kBuffSize`,
+  so once a layer has loaded at all (and is therefore already within
+  this ceiling), Undo is never separately unavailable to it on size
+  grounds — there's nothing left for it to not fit.
 - The metronome is a single on/off switch governing both the audible
   click during playback *and* whether arming a recording does a count-in
   first. Metronome off = pressing record starts immediately. Metronome
@@ -370,11 +419,109 @@ one correctly longer.
 
 ## Overdubbing
 
-Long-press-and-hold the transport button on any layer that's Playing or
-Paused to overdub: new input is additively mixed into the existing loop
-buffer, sample-for-sample, in sync with playback, then clamped to ±1.5 to
-stop runaway buildup over many passes. Release to stop. Works identically
-on every layer.
+Long-press the transport button on any layer that's Playing or Paused to
+arm an overdub: like a fresh Recording, it waits for its own count-in
+(same tempo-locked, metronome-gated bar wait, `LayerState::
+ArmedOverdubCountIn`) rather than starting the instant the button is
+pressed — added after a real user report ("the original recording and
+the overdub were about 1 beat late... can't we set it to also have a 4
+beat count in like layer record?"). Once the count-in finishes, new
+input is additively mixed into the existing loop buffer, sample-for-
+sample, in sync with playback, clamped to ±1.5 to stop runaway buildup
+over many passes. The pass auto-stops back to Playing after exactly one
+full loop (`overdub_remaining_`, the same "runs a fixed duration
+automatically" shape `Recording`'s own `write_idx_`/`target_len_` pair
+already has) — holding the button down for the overdub's own duration is
+no longer required, same as a fresh Recording already didn't require
+it. A short press of the transport button while actively Overdubbing
+stops that one pass early, same idiom as Recording's own early stop.
+Works identically on every layer.
+
+### Undo last overdub
+
+A single-level "undo the last overdub" (`Ui::TriggerUndoOverdub()`,
+`LooperLayer::RestoreFromBackup()`), triggered by a **short tap of
+Button 2 on Layer:Status** (previously unclaimed — that page's only
+existing Button 2 behavior was an 800ms+ hold for Clear).
+
+**One shared backup, not one per layer**: `main.cpp`'s
+`g_undo_backup_l/r` (sized to `kBuffSize`, the same 921,600-sample/19.2s
+ceiling as the main per-layer buffers — see *Tempo, metronome, and
+count-in* above) and a single `g_undo_owner_layer` index (-1 = none) are
+process-wide, shared by every layer, not duplicated per layer — a
+deliberate choice, not an oversight: only one layer can ever be
+mid-overdub at a time, so one buffer suffices, and a 4x-per-layer
+version would cost roughly 4x the SDRAM for a feature that, by design,
+only ever needs to undo the single most recent overdub anyway. The
+direct consequence: if you overdub layer A, then B, then C, then D in
+sequence, only **D's** last overdub stays recoverable — starting a new
+layer's overdub silently invalidates whatever layer previously held the
+shared slot, the same "undo the most recent action" semantics every
+other action in this firmware already has (there's no undo history
+anywhere else either). Pressing Undo with nothing pending (or on a
+different layer than the current owner) shows a brief "Nothing to
+undo" message that self-expires after `kUndoStatusTimeoutMs` (1.5s) —
+it deliberately can't just wait for some unrelated action to clear it
+(the usual convention for this file's other transient status_ messages)
+since it squats on the one thing Layer:Status is *for*, the live
+waveform/playhead, and an idle user needs that back on its own.
+
+**How the backup is actually captured — two rejected designs first**:
+the overdub write (`LooperLayer::Process()`) mixes new audio in-place
+with an immediate lossy `Clampf(-1.5, 1.5)`, so Undo needs a real
+pre-overdub snapshot, not a computed reversal (subtracting back out
+isn't valid once clipping has happened).
+1. ***Deferred to the main loop entirely*** — tried first, wrong: the
+   main loop's own `Ui::Update()` does blocking OLED I2C writes with no
+   time bound, so by the time a main-loop-driven copy actually ran,
+   real overdub audio could already have landed in the buffer, and the
+   "pre-overdub" snapshot silently included the first several,
+   sometimes many, milliseconds of the new take — audible on hardware
+   as "the start of the overdub survives Undo."
+2. ***A bulk copy inside the audio ISR, chunked across the count-in***
+   — moved the copy into `Process()` itself, spread in fixed-size
+   chunks (`kUndoCopyChunkSamples`) across the count-in that already
+   precedes every overdub, with a defensive instant-finish fallback at
+   the exact transition. Correct, but a real, measured, audible glitch
+   on hardware every time overdub was armed or held — confirmed in two
+   stages: first, the chunk logic had accidentally been placed *inside*
+   the per-sample loop instead of running once per 48-sample block,
+   so one block could attempt up to 48x its intended copy size,
+   badly overrunning the audio callback's ~1ms budget (an easy mistake
+   to miss, since the code still reads as "once per chunk" either way).
+   Fixing that scope bug fixed the loud version, but shrinking the
+   chunk size further (4000 → 1500 samples/channel/block) still left an
+   audible, smaller glitch — confirmed, by disabling the copy entirely
+   as a diagnostic, to be a real, inherent cost of *any* dedicated bulk
+   SDRAM-to-SDRAM sweep on this hardware, regardless of chunk size: it's
+   cold (first-touch, no cache reuse) and source/destination are
+   different regions of the same physical SDRAM chip, so every access
+   risks a row-close/row-open round trip on top of the raw transfer
+   cost.
+
+**What's actually implemented — lazy, per-sample capture**: the overdub
+write loop in `Process()` already reads `buffer_l_[wrapped]`/
+`buffer_r_[wrapped]` immediately before overwriting it, to mix the new
+audio in. Capturing that same, already-hot value into the backup one
+line earlier is one extra read+write on a cache line the very next two
+lines were going to touch anyway — not a separate sweep, so it
+introduces no new cost class at all, and sidesteps the count-in-window
+timing problem entirely: there's no separate "finish the copy before
+overdubbing starts" step to race, because the backup is always exactly
+as complete as the pass itself is, by construction. `overdub_start_idx_`
+(where `play_pos_` was when this pass began) plus the existing
+`overdub_remaining_` together define exactly which wrapped arc of the
+backup is valid — indices the pass hasn't reached yet were never
+touched this time around, so `buffer_l_`/`buffer_r_` there is *already*
+the correct pre-overdub value with or without a backup entry, and
+`RestoreFromBackup()` only ever touches that same arc, nothing more.
+This also makes a (currently unreachable via the UI, but not actively
+prevented) Undo invoked *mid-overdub* correct for free: it just restores
+less, exactly as much as has actually been overwritten so far — the
+alternative, a bulk snapshot taken once at the overdub's start, would
+have stayed fully valid for that case too, but only because it paid the
+cost of capturing the *entire* buffer up front regardless of how much of
+the pass ever actually runs.
 
 ## Per-layer signal chain
 
@@ -558,16 +705,36 @@ audio block ever seeing the note as held — a silent note instead of a
 short blip. Pitch bend updates read more naturally at this steady rate
 too, for the same reason.
 
-- **NoteOn/NoteOff** currently drive **both** Dexed and Grains from
-  the same incoming stream — there's no per-engine MIDI channel or
-  screen-based routing yet (flagged in `main.cpp` as a temporary,
-  first-pass simplification). Playing a note plays it on whichever
-  engines are enabled (see *Per-engine on/off* below).
+- **NoteOn/NoteOff** are filtered per-engine by **MIDI channel**
+  (`DexedParamPage::MIDI`/`GranularParamPage::MIDI`, each engine's own
+  new page — K1 only, quantized across 17 buckets: Omni + channels 1-16,
+  same knob-quantized idiom the Bars knob already uses) before reaching
+  either engine — `Ui::dexed_midi_channel_`/`granular_midi_channel_`
+  (`-1` = Omni, 0-15 = that 0-indexed channel, matching how libDaisy's
+  own `MidiEvent` fields already arrive 0-indexed) live on `Ui`, not
+  inside `DexedSynth`/`GranularEngine` — a routing/IO setting, not a
+  sound parameter, same reasoning `reverb_size01_` and friends are
+  already owned by `Ui` and just read every poll rather than pushed into
+  an engine. `main.cpp`'s MIDI block reads both channels once per poll
+  (not once per event, since they can only change between UI redraws
+  anyway) and gates each of NoteOn/NoteOff's two forwarding calls
+  independently — Omni matches every channel, otherwise the event's own
+  channel must match exactly, so Dexed and Grains can each listen on
+  their own channel, the same channel as each other, or either stay on
+  Omni. Playing a note still only reaches an engine that's actually
+  enabled (see *Per-engine on/off* below) regardless of channel.
 - **Pitch bend** (±2 semitones, the MIDI standard default) feeds Dexed
-  — Grains has no pitch bend input.
+  — Grains has no pitch bend input. Gated by Dexed's own MIDI channel
+  the same way NoteOn/NoteOff are.
 - **Mod wheel** (CC1) feeds Dexed's own vibrato (real DX7 LFO pitch-mod
   depth, gated by the wheel same as real DX7 hardware) — Grains has no
-  mod wheel input.
+  mod wheel input. Also gated by Dexed's own MIDI channel.
+- Both channels persist exactly like the Dattorro reverb parameters did
+  when they were added: per-performance (`FileHeader`, `kFileVersion`
+  13) and as a startup default (`PREFS.DAT`) — see *Save/load* below for
+  the version chain. Default Omni for both, so an existing v11/v12
+  performance or prefs file loads with every engine still listening to
+  everything, matching its pre-upgrade behavior exactly.
 
 ## Per-engine on/off
 
@@ -1646,21 +1813,26 @@ plus tempo/global/per-layer settings) as one flat binary file per slot,
 own subfolder for the same reason WAV exports get their own (see below):
 a tidier SD root, and it keeps `ListSlots()`/`NextFreeSlot()`'s directory
 scan scoped to just that folder. The on-disk layout has a
-version tag (`kFileVersion` in `performance_store.cpp`, currently **12**)
+version tag (`kFileVersion` in `performance_store.cpp`, currently **13**)
 that gets bumped whenever a field is added or removed — a save from an
 older firmware version is normally rejected cleanly on load (shown as a
 short error on the File page) rather than being misread, so a firmware
 update can mean older saves need re-saving under the new version.
-**11 → 12 (adding the Dattorro reverb's 6 new parameters) is the one
-exception so far**: `Load()`/`LoadPrefs()` accept both versions,
-reading only the smaller v11-sized prefix from an older file and
-defaulting the 6 new fields to the reverb library's own tuned values
-rather than rejecting it outright — `Decay` itself needed no new field
-at all, since it's the same `reverb_size01` the Size knob already
-wrote under every version back to 7. Every version older than 11 is
-still a hard, clean reject, same as always; reviving those would need
-several historical `FileHeader` layouts reconstructed from git history,
-which hasn't been done. Dexed Presets
+**11 → 12 → 13 is a backward-compatible chain, not a hard cutoff**:
+`Load()`/`LoadPrefs()` accept all three versions, reading only as much
+of the file as that version actually wrote and defaulting whatever
+comes after. 11 → 12 added the Dattorro reverb's 6 new parameters
+(`Decay` itself needed no new field, since it's the same
+`reverb_size01` the Size knob already wrote under every version back to
+7); 12 → 13 added the two per-engine MIDI channel fields (see *MIDI*
+above), both defaulting to Omni for anything older than 13 — a v11 file
+loads both the reverb defaults *and* the MIDI defaults in one pass, not
+two separate upgrade steps. Every version older than 11 is still a
+hard, clean reject, same as always; reviving those would need several
+historical `FileHeader` layouts reconstructed from git history, which
+hasn't been done. `ExportWav()` only needs the reverb fields, never the
+MIDI channels — routing has no effect on audio already recorded, so
+that call site was left untouched by the 12 → 13 bump. Dexed Presets
 (`DEXP/PRESnnn.DAT`) and Grains Presets
 (`GRNP/PRESnnn.DAT`, audio-inclusive — see *Grains* above) are each their
 own separate on-disk format with their own independent numbering, not
@@ -1833,11 +2005,12 @@ A few things that are intentional, not bugs:
 - **Export is one stereo mixdown, not per-track stems**: all 4 layers'
   post-effects signal is summed into a single file (either export mode)
   — there's no way to export each layer as its own file.
-- **No per-engine MIDI routing yet**: NoteOn/NoteOff (and, for Dexed,
-  pitch bend and mod wheel) drive every enabled engine from the same
-  incoming MIDI stream (see *MIDI* above) — there's no way to play just
-  Grains from a keyboard without it also reaching Dexed if it's enabled
-  too.
+- **Undo is a single global slot, not per-layer history**: see *Undo
+  last overdub* above — overdubbing layer A then B then C then D in
+  sequence leaves only D's last overdub recoverable, not all four. A
+  true per-layer version would need 4 separate backup buffers instead
+  of 1 (roughly 4x the SDRAM this feature currently costs) — a real,
+  deliberate choice, not a currently-affordable one.
 - **Bypass's mix Volume/Pan don't persist**: like Master Volume and
   vari-speed, they're live-performance controls that always reset to
   their defaults on boot and after Load — not part of a saved
@@ -1892,13 +2065,14 @@ A few things that are intentional, not bugs:
   footer rows (see `README.md`'s Thanks section for credit)
 - `performance_store.h/.cpp` — SD card save/load (performances, Dexed
   Presets, Grains Presets), WAV export, and SD Mgmt's
-  Duplicate/Delete. Performance on-disk format is at `kFileVersion = 12`
+  Duplicate/Delete. Performance on-disk format is at `kFileVersion = 13`
   (see *Save/load* above; bumped from 5→6 when Pitch's fields were
   removed — see *Pitch removal* below — up through Pad Synth's sound
   being embedded at version 7, then removed again at version 10 once the
   save-file "bubbles" principle was adopted — see *Save-file "bubbles"*
-  above — then 11→12 adding the Dattorro reverb's 6 new parameters, the
-  first backward-compatible bump).
+  above — then 11→12 adding the Dattorro reverb's 6 new parameters and
+  12→13 adding the two per-engine MIDI channels, both backward-
+  compatible bumps, chained together).
 - `dattorro_reverb.h/.cpp` — the shared reverb bus (see *Dattorro plate
   reverb* above)
 - `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio

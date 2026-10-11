@@ -18,6 +18,10 @@ inline float Clampf(float v, float lo, float hi)
     return v < lo ? lo : (v > hi ? hi : v);
 }
 
+// How long "Nothing to undo" squats on Layer:Status's waveform before an
+// idle user gets it back -- see undo_status_set_ms_'s own comment in ui.h.
+constexpr uint32_t kUndoStatusTimeoutMs = 1500;
+
 // Set just before a blocking PerformanceStore::Save()/Load() call so the
 // static Ui::OnSaveLoadProgress() callback (a plain C function pointer,
 // so it can't carry a `this`) has something to draw the progress bar to.
@@ -129,7 +133,11 @@ void Ui::Init(daisy::DaisyPod*              pod,
               size_t                        master_scope_capacity,
               const float*                  dexed_scope_buf,
               size_t                        dexed_scope_capacity,
-              DexedSynth*                   dexed)
+              DexedSynth*                   dexed,
+              float*                        undo_backup_l,
+              float*                        undo_backup_r,
+              int*                          undo_owner_layer,
+              size_t*                       undo_backup_len)
 {
     pod_        = pod;
     disp_       = display;
@@ -149,6 +157,10 @@ void Ui::Init(daisy::DaisyPod*              pod,
     dexed_                 = dexed;
     dexed_scope_buf_        = dexed_scope_buf;
     dexed_scope_capacity_   = dexed_scope_capacity;
+    undo_backup_l_          = undo_backup_l;
+    undo_backup_r_          = undo_backup_r;
+    undo_owner_layer_       = undo_owner_layer;
+    undo_backup_len_        = undo_backup_len;
 
     // Same curve ApplyKnobs() uses for knob1 on Home, applied once here
     // so master_volume_ actually matches master_volume01_'s starting
@@ -175,14 +187,14 @@ void Ui::ApplyStartupDefaults()
     float      bpm, master_vol01, cutoff01, res01, reverb_sz01, byp_send01, metro_vol01;
     float      rev_predelay01, rev_prefilter01, rev_diff1_01, rev_diff2_01, rev_decdiff01,
         rev_damping01;
-    int        bars;
+    int        bars, dexed_ch, granular_ch;
     bool       byp, metro_on;
     FilterMode mode;
     if(!PerformanceStore::LoadPrefs(&bpm, &bars, &master_vol01, &byp, &mode, &cutoff01,
                                       &res01, &reverb_sz01, &byp_send01, &metro_on,
                                       &metro_vol01, &rev_predelay01, &rev_prefilter01,
                                       &rev_diff1_01, &rev_diff2_01, &rev_decdiff01,
-                                      &rev_damping01))
+                                      &rev_damping01, &dexed_ch, &granular_ch))
         return; // nothing saved yet -- Init()'s hardcoded defaults already stand
 
     // SetBpm()/SetBars() are no-ops while locked, but nothing can be
@@ -209,6 +221,8 @@ void Ui::ApplyStartupDefaults()
     reverb_input_diffusion2_01_ = rev_diff2_01;
     reverb_decay_diffusion01_   = rev_decdiff01;
     reverb_damping01_           = rev_damping01;
+    dexed_midi_channel_         = dexed_ch;
+    granular_midi_channel_      = granular_ch;
 
     // Init() already called this once with the pre-defaults values (see
     // its own comment above) -- re-seed now that the real starting
@@ -525,6 +539,8 @@ void Ui::HandleButton2(const UiControlEvents& events)
             // matching comment and main.cpp's g_btn2_held_ms.
             if(!button2_long_fired_ && events.btn2_held_ms > 800.f)
                 Cur().Clear();
+            else if(!button2_long_fired_)
+                TriggerUndoOverdub(); // a genuine short tap -- see its own comment
             button2_long_fired_ = false;
         }
     }
@@ -1391,6 +1407,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case DexedParamPage::FX:
                     return dexed_fx_target_delay_ ? KnobContext::DexedFxDelay
                                                      : KnobContext::DexedFxReverb;
+                case DexedParamPage::MIDI: return KnobContext::DexedMidi;
                 case DexedParamPage::Advanced: return KnobContext::DexedAdvanced;
                 case DexedParamPage::Preset: return KnobContext::DexedPreset;
                 default: return KnobContext::DexedAlgo;
@@ -1432,6 +1449,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case GranularParamPage::FX:
                     return granular_fx_target_delay_ ? KnobContext::GranularFxDelay
                                                         : KnobContext::GranularFxReverb;
+                case GranularParamPage::MIDI: return KnobContext::GranularMidi;
                 case GranularParamPage::Capture: return KnobContext::GranularCapture;
                 case GranularParamPage::Trim: return KnobContext::GranularTrim;
                 case GranularParamPage::Preset: return KnobContext::GranularPreset;
@@ -1485,9 +1503,19 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             // Bars' inverse uses the bucket midpoint since its forward
             // map floors to an integer (a whole range of k2 produces the
             // same Bars value); BPM's is exact (SetBpm is continuous).
-            k1_pickup_raw_[i] = Clampf((tempo_->GetBpm() - 40.f) / 200.f, 0.f, 1.f);
-            k2_pickup_raw_[i]
-                = Clampf(((float)(tempo_->GetBars() - 1) + 0.5f) / 15.99f, 0.f, 1.f);
+            // Bars' own span is TempoClock::MaxBarsForBpm(bpm) -- not a
+            // flat 16 -- so turning the knob fully clockwise always lands
+            // on whatever's actually reachable at the current BPM, see
+            // ApplyKnobs()'s matching forward map.
+            k1_pickup_raw_[i] = Clampf((tempo_->GetBpm() - 50.f) / 190.f, 0.f, 1.f);
+            {
+                // -0.01 matches the forward map's own epsilon (see
+                // ApplyKnobs() below) so k2==1.0 still floors to exactly
+                // max_bars, not max_bars+1.
+                float max_bars_span = (float)TempoClock::MaxBarsForBpm(tempo_->GetBpm()) - 0.01f;
+                k2_pickup_raw_[i] = Clampf(
+                    ((float)(tempo_->GetBars() - 1) + 0.5f) / max_bars_span, 0.f, 1.f);
+            }
             break;
         case KnobContext::GlobalFilter:
             k1_pickup_raw_[i] = master_filter_cutoff01_;
@@ -1577,6 +1605,13 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k1_pickup_raw_[i] = dexed_->GetDelaySend01();
                 k2_pickup_raw_[i] = delay_time01_;
             }
+            break;
+        case KnobContext::DexedMidi:
+            // -1 (Omni) .. 15 (channel 16) -- same bucket-midpoint inverse
+            // idiom as GlobalTempo's own Bars knob, just an 18-wide span
+            // (17 buckets - 0.01, matching that same epsilon convention)
+            // starting at -1 instead of 1.
+            k1_pickup_raw_[i] = Clampf(((float)(dexed_midi_channel_ + 1) + 0.5f) / 16.99f, 0.f, 1.f);
             break;
         case KnobContext::DexedAdvanced: break; // entry point only -- see Screen::DexedOperator instead
         case KnobContext::DexedPreset: break; // browses a list directly, no pickup used
@@ -1722,6 +1757,11 @@ void Ui::SyncPickupTargets(KnobContext ctx)
                 k1_pickup_raw_[i] = granular_->GetDelaySend01();
                 k2_pickup_raw_[i] = delay_time01_;
             }
+            break;
+        case KnobContext::GranularMidi:
+            // Same bucket-midpoint idiom as KnobContext::DexedMidi above.
+            k1_pickup_raw_[i]
+                = Clampf(((float)(granular_midi_channel_ + 1) + 0.5f) / 16.99f, 0.f, 1.f);
             break;
         case KnobContext::GranularCapture: break; // no continuous knobs, Button1/Button2 only
         case KnobContext::GranularTrim:
@@ -1934,9 +1974,18 @@ void Ui::ApplyKnobs()
             if(global_page_ == GlobalPage::Tempo && !tempo_->IsLocked())
             {
                 if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
-                    tempo_->SetBpm(40.f + k1 * (240.f - 40.f));
+                    tempo_->SetBpm(50.f + k1 * (240.f - 50.f));
                 if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
-                    tempo_->SetBars(1 + (int)(k2 * 15.99f));
+                {
+                    // Bars' own span is TempoClock::MaxBarsForBpm(bpm) --
+                    // turning K2 fully clockwise always reaches whatever's
+                    // actually allowed at the BPM just set above, not a
+                    // flat 16. -0.01 keeps k2==1.0 landing on exactly
+                    // max_bars (see SyncPickupTargets()'s matching inverse).
+                    float max_bars_span
+                        = (float)TempoClock::MaxBarsForBpm(tempo_->GetBpm()) - 0.01f;
+                    tempo_->SetBars(1 + (int)(k2 * max_bars_span));
+                }
             }
             else if(global_page_ == GlobalPage::Filter)
             {
@@ -2159,6 +2208,10 @@ void Ui::ApplyKnobs()
                             delay_time01_ = Clampf(k2, 0.f, 1.f);
                     }
                     break;
+                case GranularParamPage::MIDI:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        granular_midi_channel_ = -1 + (int)(k1 * 16.99f);
+                    break;
                 case GranularParamPage::Capture:
                 {
                     // Only meaningful in Import mode -- Direct Record and
@@ -2343,6 +2396,10 @@ void Ui::ApplyKnobs()
                         if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                             delay_time01_ = Clampf(k2, 0.f, 1.f);
                     }
+                    break;
+                case DexedParamPage::MIDI:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        dexed_midi_channel_ = -1 + (int)(k1 * 16.99f);
                     break;
                 case DexedParamPage::Advanced: break; // no knobs, encoder click drills in
                 case DexedParamPage::Preset:
@@ -2997,6 +3054,20 @@ void Ui::DrawLayerScreen()
                 if(w > 0)
                     disp_->DrawRect(1, 29, w, 41, true, true);
             }
+            else if(undo_status_[0] != '\0'
+                    && System::GetNow() - undo_status_set_ms_ < kUndoStatusTimeoutMs)
+            {
+                // Same "takes over the body" treatment as "Hold to
+                // clear..." above -- brief, rare (only shown when Undo
+                // was tapped with nothing pending). Unlike this file's other
+                // transient status_ messages, this one can't just wait for
+                // some unrelated action to overwrite it -- it squats on the
+                // waveform, the one thing an idle user is actually looking
+                // at on this page -- so it times out on its own instead.
+                int w = (int)strlen(undo_status_) * 6; // Font_6x8
+                disp_->SetCursor((disp_->Width() - w) / 2, 24);
+                WriteUpper(undo_status_);
+            }
             else
             {
                 // Downsampled waveform with a moving playhead tick above
@@ -3030,8 +3101,11 @@ void Ui::DrawLayerScreen()
                 case LayerState::Empty: rec_label = "Rec"; break;
                 case LayerState::ArmedCountIn: rec_label = "Cancel"; break;
                 case LayerState::Recording: rec_label = "Stop"; break;
-                case LayerState::Playing: rec_label = "Overdub/Pause"; break;
-                case LayerState::Paused: rec_label = "Overdub/Play"; break;
+                // "ShortPressFn/LongPressFn" order, consistently -- see
+                // the Button2 label right below for the matching
+                // "Undo/Clear" convention on this same row.
+                case LayerState::Playing: rec_label = "Pause/Overdub"; break;
+                case LayerState::Paused: rec_label = "Play/Overdub"; break;
                 // "Stop", not "Overdubbing" -- a tap now ends it early
                 // (same as Recording's own "Stop" above), now that
                 // overdub runs a full pass automatically instead of
@@ -3039,7 +3113,9 @@ void Ui::DrawLayerScreen()
                 case LayerState::Overdubbing: rec_label = "Stop"; break;
                 case LayerState::ArmedOverdubCountIn: rec_label = "Cancel"; break;
             }
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, rec_label, "", "", "Hold=Clear");
+            // "Undo/Clear" -- short tap Undoes the last overdub (see
+            // TriggerUndoOverdub()), 800ms hold Clears the whole layer.
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, rec_label, "", "", "Undo/Clear");
             break;
         }
         case LayerPage::Speed:
@@ -3286,8 +3362,13 @@ void Ui::DrawGlobalScreen()
         // row's left side free of a variable-length suffix that would
         // otherwise sometimes collide with the right-aligned Bars text.
         snprintf(line1, sizeof(line1), "BPM: %d", (int)(tempo_->GetBpm() + 0.5f));
-        char bars_line[12];
-        snprintf(bars_line, sizeof(bars_line), "Bars: %d", tempo_->GetBars());
+        char bars_line[16];
+        // Shown as "current/max", not just the number -- Bars' own
+        // ceiling now depends on BPM (see TempoClock::MaxBarsForBpm()),
+        // so without this the knob can visibly stop climbing with no
+        // explanation of why.
+        snprintf(bars_line, sizeof(bars_line), "Bars: %d/%d", tempo_->GetBars(),
+                  TempoClock::MaxBarsForBpm(tempo_->GetBpm()));
         snprintf(line2, sizeof(line2), "Metro: %s",
                   tempo_->IsMetronomeEnabled() ? "On" : "Off");
         disp_->SetCursor(0, 12);
@@ -3631,8 +3712,11 @@ void Ui::DrawSdMgmtScreen()
     }
 
     DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Scroll", "", "", "");
+    // "Back/Duplicate" -- ShortPressFn/LongPressFn, same convention as
+    // Layer:Status's "Pause/Overdub"/"Undo/Clear". Delete stays
+    // "Hold=Delete" (Button2 has no short-tap meaning in-folder here).
     DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
-                     sd_mgmt_in_folder_ ? "Back/Hold=Dup" : "Select", "", "",
+                     sd_mgmt_in_folder_ ? "Back/Duplicate" : "Select", "", "",
                      sd_mgmt_in_folder_ ? "Hold=Delete" : "");
 }
 
@@ -3739,6 +3823,7 @@ void Ui::DrawGranularScreen()
         case GranularParamPage::Filter: page_name = "Filter"; break;
         case GranularParamPage::Mix: page_name = "Mix"; break;
         case GranularParamPage::FX: page_name = "GR-FX"; break;
+        case GranularParamPage::MIDI: page_name = "MIDI"; break;
         case GranularParamPage::Capture: page_name = "Capture"; break;
         case GranularParamPage::Trim: page_name = "Trim"; break;
         case GranularParamPage::Preset: page_name = "Preset"; break;
@@ -4098,6 +4183,18 @@ void Ui::DrawGranularScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                              granular_fx_target_delay_ ? "Reverb" : "Reverb*", "", "",
                              granular_fx_target_delay_ ? "Delay*" : "Delay");
+            break;
+        }
+        case GranularParamPage::MIDI:
+        {
+            char chan_val[8];
+            if(granular_midi_channel_ < 0)
+                snprintf(chan_val, sizeof(chan_val), "Omni");
+            else
+                snprintf(chan_val, sizeof(chan_val), "%d", granular_midi_channel_ + 1);
+            // No body text of its own needed (title already says "MIDI").
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Channel", chan_val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
         case GranularParamPage::Capture:
@@ -4545,6 +4642,7 @@ void Ui::DrawDexedScreen()
         case DexedParamPage::Filter: page_name = "Filter"; break;
         case DexedParamPage::Mix: page_name = "Mix"; break;
         case DexedParamPage::FX: page_name = "DX-FX"; break;
+        case DexedParamPage::MIDI: page_name = "MIDI"; break;
         case DexedParamPage::Advanced: page_name = "Advanced"; break;
         case DexedParamPage::Preset: page_name = "Preset"; break;
         default: break;
@@ -4954,6 +5052,20 @@ void Ui::DrawDexedScreen()
                              dexed_fx_target_delay_ ? "Delay*" : "Delay");
             break;
         }
+        case DexedParamPage::MIDI:
+        {
+            char chan_val[8];
+            if(dexed_midi_channel_ < 0)
+                snprintf(chan_val, sizeof(chan_val), "Omni");
+            else
+                snprintf(chan_val, sizeof(chan_val), "%d", dexed_midi_channel_ + 1);
+            // No body text of its own needed (title already says "MIDI")
+            // -- same idiom as Feedback/Mix above.
+            DrawOscilloscope(12, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Channel", chan_val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            break;
+        }
         case DexedParamPage::Advanced:
         {
             // Entry point into Screen::DexedOperator -- same "Click to
@@ -5211,7 +5323,9 @@ void Ui::DrawDexedScreen()
                 else if(browsing_group || browsing_folders)
                     b2_label = "Open";
                 else if(dexed_files_ready)
-                    b2_label = "Prev./Hold=Load";
+                    // "Preview/Load" -- ShortPressFn/LongPressFn, same
+                    // convention as Layer:Status's "Pause/Overdub".
+                    b2_label = "Preview/Load";
                 else if(browsing_import && can_hold_load)
                     b2_label = "Hold=Import";
                 else if(can_hold_load)
@@ -5597,7 +5711,8 @@ void Ui::TriggerSave(bool force_new)
                                        bypass_reverb_send01_, reverb_predelay01_,
                                        reverb_prefilter01_, reverb_input_diffusion1_01_,
                                        reverb_input_diffusion2_01_, reverb_decay_diffusion01_,
-                                       reverb_damping01_, &Ui::OnSaveLoadProgress);
+                                       reverb_damping01_, dexed_midi_channel_,
+                                       granular_midi_channel_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
 
@@ -5652,6 +5767,7 @@ void Ui::TriggerLoad()
                                        &reverb_prefilter01_, &reverb_input_diffusion1_01_,
                                        &reverb_input_diffusion2_01_,
                                        &reverb_decay_diffusion01_, &reverb_damping01_,
+                                       &dexed_midi_channel_, &granular_midi_channel_,
                                        &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
@@ -6298,11 +6414,29 @@ void Ui::TriggerSaveDefaults()
                                             bypass_reverb_send01_, reverb_predelay01_,
                                             reverb_prefilter01_, reverb_input_diffusion1_01_,
                                             reverb_input_diffusion2_01_,
-                                            reverb_decay_diffusion01_, reverb_damping01_);
+                                            reverb_decay_diffusion01_, reverb_damping01_,
+                                            dexed_midi_channel_, granular_midi_channel_);
     if(ok)
         snprintf(tempo_status_, sizeof(tempo_status_), "Saved as default");
     else
         snprintf(tempo_status_, sizeof(tempo_status_), "Fail:%s", PerformanceStore::GetLastError());
+}
+
+void Ui::TriggerUndoOverdub()
+{
+    if(!undo_owner_layer_ || *undo_owner_layer_ != cursor_layer_)
+    {
+        snprintf(undo_status_, sizeof(undo_status_), "Nothing to undo");
+        undo_status_set_ms_ = System::GetNow();
+        return;
+    }
+    Cur().RestoreFromBackup(undo_backup_l_, undo_backup_r_, *undo_backup_len_);
+    // Single-level undo, same "restores the one most recent action" shape
+    // as every pedal looper's own Undo -- invalidate ownership so a
+    // second tap can't re-apply the same restore (or, worse, restore
+    // from a backup a DIFFERENT layer has since overwritten).
+    *undo_owner_layer_ = -1;
+    undo_status_[0]    = '\0'; // the restored waveform is its own feedback
 }
 
 void Ui::TriggerExport()

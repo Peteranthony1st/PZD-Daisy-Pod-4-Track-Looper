@@ -381,6 +381,13 @@ struct FileHeader
     float    reverb_decay_diffusion01;
     float    reverb_damping01;
 
+    // Which MIDI channel each engine listens on -- added in version 13,
+    // same "append fields, bump the version, stay backward-compatible"
+    // treatment as the 6 reverb fields above. -1 = Omni. See
+    // Ui::GetDexedMidiChannel()/GetGranularMidiChannel()'s own comment.
+    int32_t  dexed_midi_channel;
+    int32_t  granular_midi_channel;
+
     // Pad synth settings (added in version 7, removed in version 10 when
     // Pad synth itself was removed from the project) -- a performance
     // deals ONLY with the looper (audio + tempo/global/per-layer
@@ -415,27 +422,33 @@ struct LayerHeader
 // below), so a performance saved under an older version correctly
 // failed to load rather than being misread.
 //
-// 11 -> 12 (the 6 new DattorroReverb fields above) is the FIRST
-// exception to that: Load()/LoadPrefs() accept both 11 and 12, reading
-// only the v11-sized prefix (kFileHeaderV11Size) from a v11 file and
-// defaulting the 6 new fields to the Dattorro library's own tuned
-// values, rather than rejecting it. Still version-gated going forward
-// -- anything older than 11 is still a hard, clean reject, same as
-// always; reviving those is explicitly out of scope (see the reverb
-// implementation plan).
-constexpr uint32_t kFileVersion     = 12;
-constexpr uint32_t kFileVersionPrev = 11; // the one older version Load() still accepts
+// 11 -> 12 (the 6 new DattorroReverb fields) was the FIRST exception to
+// that: Load()/LoadPrefs() accept 11, 12, or 13 (see below), reading one
+// more incremental chunk per version step and defaulting whatever wasn't
+// present yet. 12 -> 13 (the 2 new MIDI-channel fields) extends the SAME
+// chain one more link rather than replacing it -- dropping v11 support
+// now would regress a compatibility promise already shipped. Still
+// version-gated going forward -- anything older than 11 is still a
+// hard, clean reject, same as always; reviving those is explicitly out
+// of scope (see the reverb implementation plan).
+constexpr uint32_t kFileVersion      = 13;
+constexpr uint32_t kFileVersionV12   = 12;
+constexpr uint32_t kFileVersionPrev  = 11; // the oldest version Load() still accepts
 
 // The exact on-disk size of FileHeader as it existed at version 11 --
 // everything up to and including bypass_reverb_send01, with no padding
 // before it (every preceding field is itself 4-byte, so this lands on a
 // 4-byte boundary already). A v11 file is exactly this many bytes of
-// header; a v12 file is this plus the 6 new trailing floats. Reading
-// exactly this many bytes first (before the 6 new fields are known to
-// even exist) is what lets Load() tell the two apart without needing a
-// separate on-disk version scheme.
+// header. Reading exactly this many bytes first (before anything newer
+// is known to even exist) is what lets Load() tell the versions apart
+// without needing a separate on-disk version scheme.
 constexpr size_t kFileHeaderV11Size
     = offsetof(FileHeader, bypass_reverb_send01) + sizeof(float);
+// Same idea, marking the boundary right after the 6 reverb fields (v12's
+// own real size) -- everything from here to kFileHeaderV11Size is what a
+// v12-but-not-v13 file has beyond a v11 one.
+constexpr size_t kFileHeaderV12Size
+    = offsetof(FileHeader, reverb_damping01) + sizeof(float);
 
 } // namespace
 
@@ -683,6 +696,8 @@ bool Save(int                slot,
           float              reverb_input_diffusion2_01,
           float              reverb_decay_diffusion01,
           float              reverb_damping01,
+          int                dexed_midi_channel,
+          int                granular_midi_channel,
           ProgressFn         on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -745,6 +760,8 @@ bool Save(int                slot,
     hdr.reverb_input_diffusion2_01     = reverb_input_diffusion2_01;
     hdr.reverb_decay_diffusion01       = reverb_decay_diffusion01;
     hdr.reverb_damping01               = reverb_damping01;
+    hdr.dexed_midi_channel             = (int32_t)dexed_midi_channel;
+    hdr.granular_midi_channel          = (int32_t)granular_midi_channel;
 
     UINT bw;
     fr        = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -840,6 +857,8 @@ bool Load(int          slot,
           float*       out_reverb_input_diffusion2_01,
           float*       out_reverb_decay_diffusion01,
           float*       out_reverb_damping01,
+          int*         out_dexed_midi_channel,
+          int*         out_granular_midi_channel,
           ProgressFn   on_progress)
 {
     if(!card_ready || slot < 1 || slot > kMaxSlots)
@@ -858,13 +877,18 @@ bool Load(int          slot,
     }
 
     // Read only the v11-sized prefix first -- that's every byte this
-    // struct had BEFORE the 6 new DattorroReverb fields were appended,
-    // so it's always present (and always in this same shape) whether
-    // the file on disk is v11 or v12. Reading `sizeof(hdr)` (the full
-    // v12 size) unconditionally would, for a genuine v11 file, read
-    // past its real header into whatever LayerHeader/audio bytes follow
-    // it in the same file -- there's no EOF to stop it early, since the
-    // rest of the file is still real content, just not more header.
+    // struct had BEFORE the 6 DattorroReverb fields (v12) or the 2
+    // MIDI-channel fields (v13) were appended, so it's always present
+    // (and always in this same shape) whether the file on disk is v11,
+    // v12, or v13. Reading `sizeof(hdr)` (the full current size)
+    // unconditionally would, for an older file, read past its real
+    // header into whatever LayerHeader/audio bytes follow it in the
+    // same file -- there's no EOF to stop it early, since the rest of
+    // the file is still real content, just not more header. Each
+    // version's own fields are read (or defaulted) incrementally below,
+    // one chunk per version step, rather than a single binary check --
+    // this is what lets v11 support keep working even after v13 adds
+    // its own fields on top of what v12 already added.
     static FileHeader hdr;
     hdr = FileHeader{};
     UINT br;
@@ -872,22 +896,24 @@ bool Load(int          slot,
     bool ok = fr == FR_OK && br == (UINT)kFileHeaderV11Size;
     bool version_ok
         = ok && memcmp(hdr.magic, "OURO", 4) == 0
-          && (hdr.version == kFileVersion || hdr.version == kFileVersionPrev);
-    if(ok && version_ok && hdr.version == kFileVersion)
+          && (hdr.version == kFileVersion || hdr.version == kFileVersionV12
+              || hdr.version == kFileVersionPrev);
+
+    if(ok && version_ok && hdr.version >= kFileVersionV12)
     {
-        // v12 -- the 6 new fields are real, read them too (continuing
-        // from the current file position, right after the prefix above).
+        // v12 or v13 -- the 6 reverb fields are real, read them too
+        // (continuing from the current file position, right after the
+        // v11 prefix above).
         UINT br2;
-        fr = f_read(&file, &hdr.reverb_predelay01, sizeof(FileHeader) - kFileHeaderV11Size,
+        fr = f_read(&file, &hdr.reverb_predelay01, kFileHeaderV12Size - kFileHeaderV11Size,
                      &br2);
-        ok = fr == FR_OK && br2 == (UINT)(sizeof(FileHeader) - kFileHeaderV11Size);
+        ok = fr == FR_OK && br2 == (UINT)(kFileHeaderV12Size - kFileHeaderV11Size);
     }
     else if(ok && version_ok)
     {
-        // v11 -- no more header bytes to read; the file's position is
-        // already exactly where the first LayerHeader begins. Default
-        // the 6 new fields to the Dattorro library's own tuned values
-        // (same ones DattorroReverb::Init() uses), not zero.
+        // v11 -- default the 6 reverb fields to the Dattorro library's
+        // own tuned values (same ones DattorroReverb::Init() uses), not
+        // zero.
         hdr.reverb_predelay01          = 0.1f;
         hdr.reverb_prefilter01         = 0.85f;
         hdr.reverb_input_diffusion1_01 = 0.75f;
@@ -895,6 +921,24 @@ bool Load(int          slot,
         hdr.reverb_decay_diffusion01   = 0.70f;
         hdr.reverb_damping01           = 0.05f; // -> internal damping_amount_ 0.95
     }
+
+    if(ok && version_ok && hdr.version == kFileVersion)
+    {
+        // v13 -- the 2 MIDI-channel fields are real, read them too.
+        UINT br3;
+        fr = f_read(&file, &hdr.dexed_midi_channel, sizeof(FileHeader) - kFileHeaderV12Size,
+                     &br3);
+        ok = fr == FR_OK && br3 == (UINT)(sizeof(FileHeader) - kFileHeaderV12Size);
+    }
+    else if(ok && version_ok)
+    {
+        // v11 or v12 -- no MIDI-channel fields on disk yet; default both
+        // to Omni, matching this project's own behavior before
+        // per-engine routing existed.
+        hdr.dexed_midi_channel    = -1;
+        hdr.granular_midi_channel = -1;
+    }
+
     if(!ok || !version_ok)
     {
         if(ok && !version_ok)
@@ -942,6 +986,8 @@ bool Load(int          slot,
         *out_reverb_input_diffusion2_01     = hdr.reverb_input_diffusion2_01;
         *out_reverb_decay_diffusion01       = hdr.reverb_decay_diffusion01;
         *out_reverb_damping01               = hdr.reverb_damping01;
+        *out_dexed_midi_channel             = (int)hdr.dexed_midi_channel;
+        *out_granular_midi_channel          = (int)hdr.granular_midi_channel;
     }
 
     int n = ok ? (int)hdr.num_layers : 0;
@@ -2596,7 +2642,9 @@ bool SavePrefs(TempoClock&  tempo,
               float        reverb_input_diffusion1_01,
               float        reverb_input_diffusion2_01,
               float        reverb_decay_diffusion01,
-              float        reverb_damping01)
+              float        reverb_damping01,
+              int          dexed_midi_channel,
+              int          granular_midi_channel)
 {
     if(!card_ready)
         return false;
@@ -2632,6 +2680,8 @@ bool SavePrefs(TempoClock&  tempo,
     hdr.reverb_input_diffusion2_01     = reverb_input_diffusion2_01;
     hdr.reverb_decay_diffusion01       = reverb_decay_diffusion01;
     hdr.reverb_damping01               = reverb_damping01;
+    hdr.dexed_midi_channel             = (int32_t)dexed_midi_channel;
+    hdr.granular_midi_channel          = (int32_t)granular_midi_channel;
 
     UINT bw;
     fr      = f_write(&file, &hdr, sizeof(hdr), &bw);
@@ -2662,7 +2712,9 @@ bool LoadPrefs(float*      out_bpm,
               float*      out_reverb_input_diffusion1_01,
               float*      out_reverb_input_diffusion2_01,
               float*      out_reverb_decay_diffusion01,
-              float*      out_reverb_damping01)
+              float*      out_reverb_damping01,
+              int*        out_dexed_midi_channel,
+              int*        out_granular_midi_channel)
 {
     // No card, no file, or wrong shape -- all silently "nothing saved
     // yet", not an error (see the header comment: the caller's own
@@ -2675,11 +2727,11 @@ bool LoadPrefs(float*      out_bpm,
     if(fr != FR_OK)
         return false;
 
-    // Same v11/v12 two-stage read as Load() -- see its own comment.
-    // PREFS.DAT is header-only (no LayerHeader/audio follows it), so
-    // there's no risk of a short v11 read spilling into unrelated
-    // content either way, but the same two-stage shape keeps this in
-    // sync with Load() and avoids a second, subtly different scheme.
+    // Same v11/v12/v13 incremental-chunk read as Load() -- see its own
+    // comment. PREFS.DAT is header-only (no LayerHeader/audio follows
+    // it), so there's no risk of a short older-version read spilling
+    // into unrelated content either way, but the same shape keeps this
+    // in sync with Load() and avoids a second, subtly different scheme.
     static FileHeader hdr;
     hdr = FileHeader{};
     UINT br;
@@ -2687,13 +2739,15 @@ bool LoadPrefs(float*      out_bpm,
     bool ok = fr == FR_OK && br == (UINT)kFileHeaderV11Size;
     bool version_ok
         = ok && memcmp(hdr.magic, "PREF", 4) == 0
-          && (hdr.version == kFileVersion || hdr.version == kFileVersionPrev);
-    if(ok && version_ok && hdr.version == kFileVersion)
+          && (hdr.version == kFileVersion || hdr.version == kFileVersionV12
+              || hdr.version == kFileVersionPrev);
+
+    if(ok && version_ok && hdr.version >= kFileVersionV12)
     {
         UINT br2;
-        fr = f_read(&file, &hdr.reverb_predelay01, sizeof(FileHeader) - kFileHeaderV11Size,
+        fr = f_read(&file, &hdr.reverb_predelay01, kFileHeaderV12Size - kFileHeaderV11Size,
                      &br2);
-        ok = fr == FR_OK && br2 == (UINT)(sizeof(FileHeader) - kFileHeaderV11Size);
+        ok = fr == FR_OK && br2 == (UINT)(kFileHeaderV12Size - kFileHeaderV11Size);
     }
     else if(ok && version_ok)
     {
@@ -2704,6 +2758,20 @@ bool LoadPrefs(float*      out_bpm,
         hdr.reverb_decay_diffusion01   = 0.70f;
         hdr.reverb_damping01           = 0.05f;
     }
+
+    if(ok && version_ok && hdr.version == kFileVersion)
+    {
+        UINT br3;
+        fr = f_read(&file, &hdr.dexed_midi_channel, sizeof(FileHeader) - kFileHeaderV12Size,
+                     &br3);
+        ok = fr == FR_OK && br3 == (UINT)(sizeof(FileHeader) - kFileHeaderV12Size);
+    }
+    else if(ok && version_ok)
+    {
+        hdr.dexed_midi_channel    = -1;
+        hdr.granular_midi_channel = -1;
+    }
+
     f_close(&file);
     if(!ok || !version_ok)
         return false;
@@ -2719,6 +2787,8 @@ bool LoadPrefs(float*      out_bpm,
     *out_bypass_reverb_send01   = hdr.bypass_reverb_send01;
     *out_metronome_enabled      = hdr.metronome_enabled != 0;
     *out_metronome_vol01        = hdr.metronome_vol01;
+    *out_dexed_midi_channel     = (int)hdr.dexed_midi_channel;
+    *out_granular_midi_channel  = (int)hdr.granular_midi_channel;
     *out_reverb_predelay01              = hdr.reverb_predelay01;
     *out_reverb_prefilter01             = hdr.reverb_prefilter01;
     *out_reverb_input_diffusion1_01     = hdr.reverb_input_diffusion1_01;
