@@ -22,6 +22,13 @@ distributed SysEx bank dumps drawn from the broader Dexed/MicroDexed
 open-source ecosystem that msfa's own lineage traces through, not one
 single traceable upstream repo.
 
+The shared **reverb** bus (`src/dattorro_reverb.h/.cpp`, see *Dattorro
+plate reverb* below) ports Jon Dattorro's 1997 figure-8 plate reverb
+topology from [el-visio/dattorro-verb](https://github.com/el-visio/dattorro-verb),
+released under the MIT License (Copyright (c) 2022 Pauli Pölkki) — its
+real delay lengths, tap offsets, and tuned default coefficients are
+kept exactly as that implementation has them.
+
 See **Known limitations & assumptions** below for the handful of things
 that deliberately differ from the original pedal's behaviour.
 
@@ -143,6 +150,8 @@ Full control map:
 | Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Cycle transport mode: Normal/Scrub/Freeze (see below) | Reset to 1.0x |
 | Global: Filter | Cutoff (master bus) | Resonance | Cycle filter mode | — |
 | Global: GLB-FX | Size/decay (shared bus, see below) | Bypass reverb send (independent of every layer's own Send) | — | — |
+| Global: RevTone | PreDelay (or DecayDiffusion) | PreFilter (or Damping) | Knobs → PreDelay+PreFilter | Knobs → DecayDiffusion+Damping |
+| Global: RevDiff | Input Diffusion 1 | Input Diffusion 2 | — | — |
 | Global: File | Idle: nothing. ChoosingSave: Overwrite/Save New. BrowsingLoad chooser: Files/New, drilled-in: browse files | — | Idle: tap = reveal Save; chooser: tap = drill into file list (Files) or Back (New); elsewhere: tap = Back | Idle: tap = reveal Load; ChoosingSave/drilled-into-Load: hold 800ms = confirm |
 | Global: SD Mgmt | Folder select / file browse (same list, always "Scroll") | — | Tap = drill into folder / back up a level; hold 800ms = Duplicate the browsed file | Hold `kSdMgmtDeleteHoldMs` (1500ms) = Delete the browsed file |
 | Global: Export | — | — | Tap = render to native 48kHz WAV ("Studio") | Tap = render to 44.1kHz WAV for MicroDexed ("CD") |
@@ -392,33 +401,102 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   verified against DaisySP's actual source, not assumed) so a newly
   selected effect never starts already dialed in loud — you turn each
   knob up from 0 to bring it in.
-- **Reverb**: ONE shared `ReverbSc` bus (`main.cpp`'s `fx_reverb_shared`),
-  not one per layer. Every layer's Send-scaled signal is summed into a
-  shared accumulator (`LooperLayer::Process()`'s `reverb_send_out`
-  parameter) and run through the single instance once per sample, in
-  `AudioCallback()`, after every layer's own `Process()` call. Send stays
-  independent per layer; Size/decay (Global:Reverb) is one setting shared
-  by everyone's send. This used to be 4 independent instances (one per
-  layer) — that was by far the heaviest thing in this signal chain
-  (~386KB per instance) and, in the worst case (reverb active on all 4
-  layers at once), was enough real-time DSP cost to starve the main loop/
-  TIM5 badly enough to cause actual audio glitches and OLED corruption,
-  not just UI lag. Consolidating to one instance cut that worst case
-  ~4x. See *Boot process: bootloader + QSPI flash* below for the current,
-  real-hardware-measured worst-case CPU number.
+- **Reverb**: ONE shared `DattorroReverb` bus (`main.cpp`'s
+  `fx_reverb_shared`), not one per layer. Every layer's Send-scaled
+  signal is summed into a shared accumulator (`LooperLayer::Process()`'s
+  `reverb_send_out` parameter) and run through the single instance once
+  per sample, in `AudioCallback()`, after every layer's own `Process()`
+  call. Send stays independent per layer; Size/decay (Global:GLB-FX) is
+  one setting shared by everyone's send. This used to be 4 independent
+  `ReverbSc` instances (one per layer) — that was by far the heaviest
+  thing in this signal chain (~386KB per instance) and, in the worst
+  case (reverb active on all 4 layers at once), was enough real-time DSP
+  cost to starve the main loop/TIM5 badly enough to cause actual audio
+  glitches and OLED corruption, not just UI lag. Consolidating to one
+  instance cut that worst case ~4x; replacing `ReverbSc` with
+  `DattorroReverb` (see *Dattorro plate reverb* below) is the second,
+  more recent cut on top of that. See *Boot process: bootloader + QSPI
+  flash* below for the current, real-hardware-measured worst-case CPU
+  number.
+
+### Dattorro plate reverb
+
+The shared bus (`src/dattorro_reverb.h/.cpp`) is a from-scratch `float`
+port of Jon Dattorro's 1997 figure-8 plate reverb topology, built from
+`el-visio/dattorro-verb`'s real C source (MIT, Pauli Pölkki 2022; see
+*Credit* above) rather than a from-scratch re-derivation from the paper
+— same real delay lengths, tap offsets, and tuned default coefficients,
+kept byte-for-byte, with only the storage changed (`double` → `float`,
+`malloc()`'d buffers → fixed-size static member arrays, matching this
+project's own no-heap-allocation convention for every other audio
+object). Verified natively (off-target, same technique used elsewhere
+in this project for DSP ports) against a reference build of the
+original `double` code before ever touching hardware: a 15,000-sample
+impulse response, both at the library's own defaults and at a second
+set of non-default parameters, matched to ~1.5e-7 relative error (pure
+float-vs-double rounding) with identical onset timing and energy-decay
+curves.
+
+Replaced `daisysp::ReverbSc` entirely (not a second, selectable engine)
+for two reasons: `ReverbSc` runs 8 delay lines with continuous
+random-walk pitch modulation, needing fractional interpolation on every
+read, every sample — Dattorro's network (11 delay buffers) uses plain
+integer-indexed circular reads, no interpolation, no modulation math,
+genuinely cheaper per sample. And as `float` with static buffers it's
+~166KB total (11 delay buffers, sized to the original's own real delay
+lengths rounded up to the next power of 2) versus `ReverbSc`'s ~386KB
+`aux_[]`.
+
+Mono-in, stereo-out by design — `Process(in1, in2, &out1, &out2)` sums
+`in1+in2` before the signal ever enters the tank, same as a real
+physical plate reverb (one exciter, stereo pickup) and the real
+algorithm's own intent, not a limitation of this port. The previously
+genuinely-stereo shared send becomes one mono signal feeding the tank.
+
+Seven parameters total, matching the original library's own real
+`Set*` functions one-to-one (just reshaped to 0..1, `float`):
+`Decay` (Size, Global:GLB-FX's existing knob, unchanged in meaning),
+`Damping` (inverted from the library's own internal convention — there,
+higher means *less* damping; this project's knob reads the normal
+hardware-reverb way, higher = darker), `PreDelay`, `PreFilter`,
+`InputDiffusion1`, `InputDiffusion2`, `DecayDiffusion` (the tank's own
+`DecayDiffusion2` stays internally derived from `Decay`, matching the
+library's own design — not separately exposed). The last 6 live on two
+new Global pages, `Global:RevTone` (PreDelay/PreFilter toggled with
+DecayDiffusion/Damping, same Button-toggle idiom as Global:GLB-FX's own
+Reverb/Delay toggle) and `Global:RevDiff` (Input Diffusion 1+2, no
+toggle needed — only 2 knobs).
+
+One small built-in modulation is inherited as-is from the original
+algorithm: the `DecayDiffusion` all-pass stage's read offset wobbles by
+a fixed ±1 sample, direction flipping every 2048 samples over a ~1.4s
+cycle, breaking up metallic ringing in that stage. Fixed amount/rate,
+not exposed to any setter — the original library never exposed it as
+a parameter either.
+
+None of these 7 parameters are smoothed against live changes — turning
+`DecayDiffusion` (or any of the others) while audio is actively
+circulating in the tank can produce an audible click/glitch, since each
+`Set*` call writes straight into a feedback-loop coefficient with no
+ramp. This matches the original library's own design (every `Set*`
+function there is an instant assignment too) rather than being
+introduced by this port, but it's the same category of issue as the
+Dexed multi-note headroom click fixed earlier in this project's history
+— a real, fixable gap if live-twiddling these knobs turns out to matter
+in practice, not yet addressed.
 
 ### Bypass reverb send
 
 Bypass (Home, Button 2 — the live-input monitor mix, e.g. for a powered
 mic plugged straight into the Pod) has its own independent send into
-that same shared reverb bus, set on Global:Reverb's Knob 2. In
+that same shared reverb bus, set on Global:GLB-FX's Knob 2. In
 `AudioCallback()` this is one small block right before the shared
 reverb's `Process()` call (the same `bypass_gain`-scaled, L+R-summed-to-
 mono treatment the existing dry bypass mix already uses, for the same
 reason — see *Bypass sums to mono* below): if Bypass is on and the send
 is above zero, the live input adds into `reverb_send_l/r` alongside
 whatever the 4 layers are already contributing, then the one shared
-`ReverbSc` processes the combined total as usual. No new reverb
+`DattorroReverb` processes the combined total as usual. No new reverb
 instance, no measurable extra cost — a multiply-add per sample. Turning
 Bypass off silences this contribution too, and recordings stay
 completely dry regardless of this setting (it only ever feeds the
@@ -426,21 +504,22 @@ monitor-mix reverb tail, never the recording path).
 
 ### SDRAM-placed effects are explicitly zeroed before use
 
-`Phaser` (per-layer) and `ReverbSc` (the shared bus, plus its counterpart
-in `PerformanceStore::ExportWav()`) both live in SDRAM — libDaisy's
-`sdram.h` documents, and this project's linker script/startup code
-confirm, that `.sdram_bss` is **not** zero-initialized at boot, unlike
-ordinary SRAM `.bss`. `LooperLayer::Init()` and the equivalent setup in
-`main.cpp`/`performance_store.cpp` `memset()` each of these objects to
-zero before calling their own `Init()`. This isn't cosmetic: it was a
-real, reproducible bug, first found via the (since-removed, see *Pitch
-removal* below) `PitchShifter` effect, whose `Init()` didn't touch
-several of its own internal fields, so without zeroing first they started
-out holding raw leftover SDRAM contents, and on some boots that decoded
-as NaN/Inf. Since NaN survives a plain min/max clamp unchanged (NaN
-compares false against both bounds) and DaisySP's `ReverbSc` has no
-NaN/Inf guard anywhere in its feedback path, one bad sample could
-permanently poison the shared reverb bus's internal state — silencing the
+`Phaser` (per-layer) and `DattorroReverb` (the shared bus, plus its
+counterpart in `PerformanceStore::ExportWav()`) both live in SDRAM —
+libDaisy's `sdram.h` documents, and this project's linker script/
+startup code confirm, that `.sdram_bss` is **not** zero-initialized at
+boot, unlike ordinary SRAM `.bss`. `LooperLayer::Init()` and the
+equivalent setup in `main.cpp`/`performance_store.cpp` `memset()` each
+of these objects to zero before calling their own `Init()`. This isn't
+cosmetic: it was a real, reproducible bug, first found via the
+(since-removed, see *Pitch removal* below) `PitchShifter` effect, whose
+`Init()` didn't touch several of its own internal fields, so without
+zeroing first they started out holding raw leftover SDRAM contents, and
+on some boots that decoded as NaN/Inf. Since NaN survives a plain
+min/max clamp unchanged (NaN compares false against both bounds) and
+neither `ReverbSc` (the previous shared-bus engine) nor `DattorroReverb`
+has any NaN/Inf guard anywhere in its feedback path, one bad sample
+could permanently poison the shared reverb bus's internal state — silencing the
 *entire* mix, not just that layer, until a full power cycle. The zeroing
 is kept as cheap insurance against this exact failure shape for any
 current or future SDRAM-placed effect, not just the one that first
@@ -950,7 +1029,7 @@ self-capture feedback loop).
 **Reverb never gets recorded, for either instrument -- not a bug**: a
 real user question ("if reverb is active on Dexed, why doesn't it
 record with that reverb?"). `mixed_in` above is built entirely from dry
-per-source signals; the shared `ReverbSc` bus (fed by every source's own
+per-source signals; the shared `DattorroReverb` bus (fed by every source's own
 Reverb Send, loop layers included) is computed once per sample and
 added straight into `out[]` afterward, never routed back into
 `mixed_in`. This has always been true for the loop layers' own reverb
@@ -1567,11 +1646,21 @@ plus tempo/global/per-layer settings) as one flat binary file per slot,
 own subfolder for the same reason WAV exports get their own (see below):
 a tidier SD root, and it keeps `ListSlots()`/`NextFreeSlot()`'s directory
 scan scoped to just that folder. The on-disk layout has a
-version tag (`kFileVersion` in `performance_store.cpp`, currently **10**)
+version tag (`kFileVersion` in `performance_store.cpp`, currently **12**)
 that gets bumped whenever a field is added or removed — a save from an
-older firmware version is rejected cleanly on load (shown as a short
-error on the File page) rather than being misread, so a firmware update
-can mean older saves need re-saving under the new version. Dexed Presets
+older firmware version is normally rejected cleanly on load (shown as a
+short error on the File page) rather than being misread, so a firmware
+update can mean older saves need re-saving under the new version.
+**11 → 12 (adding the Dattorro reverb's 6 new parameters) is the one
+exception so far**: `Load()`/`LoadPrefs()` accept both versions,
+reading only the smaller v11-sized prefix from an older file and
+defaulting the 6 new fields to the reverb library's own tuned values
+rather than rejecting it outright — `Decay` itself needed no new field
+at all, since it's the same `reverb_size01` the Size knob already
+wrote under every version back to 7. Every version older than 11 is
+still a hard, clean reject, same as always; reviving those would need
+several historical `FileHeader` layouts reconstructed from git history,
+which hasn't been done. Dexed Presets
 (`DEXP/PRESnnn.DAT`) and Grains Presets
 (`GRNP/PRESnnn.DAT`, audio-inclusive — see *Grains* above) are each their
 own separate on-disk format with their own independent numbering, not
@@ -1678,9 +1767,9 @@ either button.
   main loop (with `g_audio_suspended` held for the whole operation, same
   as `TriggerLoad()`, so it doesn't race the real audio ISR touching the
   same objects). Reverb is handled the same way live playback does it: a
-  local `ReverbSc` mirroring `main.cpp`'s shared bus, fed by every
-  layer's Send-scaled signal summed together, rather than a separate
-  instance per layer.
+  local `DattorroReverb` mirroring `main.cpp`'s shared bus, fed by every
+  layer's Send-scaled signal summed together and all 7 of its live
+  parameters (not just Decay), rather than a separate instance per layer.
 - **Master volume and the metronome click are excluded.** Master volume
   is a monitor/output-level control, not mix content — including it would
   mean the exported file's loudness depended on wherever that knob
@@ -1728,7 +1817,19 @@ A few things that are intentional, not bugs:
   only ever rise within a take (max-hold), never fall, even if an
   overdub happens to reduce net amplitude somewhere — a deliberate
   simplification, not a bug.
-- **Save files are version-locked**: see *Save/load* above.
+- **Save files are version-locked**: see *Save/load* above (with one
+  exception now — see the 11→12 backward-compatible bump there).
+- **Reverb parameters aren't smoothed against live knob changes**: see
+  *Dattorro plate reverb* above — turning `DecayDiffusion` or any of
+  the other 6 parameters while the tank has real energy in it can click
+  or glitch audibly. Matches the original library's own design (every
+  `Set*` call there is an instant assignment too), not introduced by
+  this port, and not yet fixed.
+- **`Decay`'s stability near 100% is unverified**: unlike `ReverbSc`'s
+  own documented "becomes infinite at 1.0" ceiling for `SetFeedback()`,
+  the Dattorro library has no equivalent documented safe bound for
+  `Decay`. Works fine at the ranges tested so far; the very top of the
+  knob's range hasn't been deliberately stress-tested.
 - **Export is one stereo mixdown, not per-track stems**: all 4 layers'
   post-effects signal is summed into a single file (either export mode)
   — there's no way to export each layer as its own file.
@@ -1791,12 +1892,15 @@ A few things that are intentional, not bugs:
   footer rows (see `README.md`'s Thanks section for credit)
 - `performance_store.h/.cpp` — SD card save/load (performances, Dexed
   Presets, Grains Presets), WAV export, and SD Mgmt's
-  Duplicate/Delete. Performance on-disk format is at `kFileVersion = 10`
+  Duplicate/Delete. Performance on-disk format is at `kFileVersion = 12`
   (see *Save/load* above; bumped from 5→6 when Pitch's fields were
   removed — see *Pitch removal* below — up through Pad Synth's sound
   being embedded at version 7, then removed again at version 10 once the
   save-file "bubbles" principle was adopted — see *Save-file "bubbles"*
-  above).
+  above — then 11→12 adding the Dattorro reverb's 6 new parameters, the
+  first backward-compatible bump).
+- `dattorro_reverb.h/.cpp` — the shared reverb bus (see *Dattorro plate
+  reverb* above)
 - `audio_engine.h` — `g_audio_suspended`, a flag that makes the audio
   callback output silence without touching any layer/tempo state, so
   `PerformanceStore::Load()` (which restores layers one at a time,

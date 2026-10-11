@@ -10,6 +10,7 @@
 #include "itcm.h"
 #include "granular_engine.h"
 #include "dexed_synth.h"
+#include "dattorro_reverb.h"
 
 using namespace daisy;
 
@@ -75,7 +76,7 @@ daisysp::Phaser DSY_SDRAM_BSS fx_phaser[kNumLayers];
 // per sample in AudioCallback() -- see fx_reverb_size01 below for how
 // its shared Size control works. In SDRAM for the same reason as
 // fx_phaser above.
-daisysp::ReverbSc DSY_SDRAM_BSS fx_reverb_shared;
+DattorroReverb DSY_SDRAM_BSS fx_reverb_shared;
 
 // ONE shared cross-feedback ("ping-pong") delay, same "one shared
 // instance, fed by per-engine sends" architecture as fx_reverb_shared
@@ -138,6 +139,16 @@ volatile float    g_btn2_held_ms        = 0.f;
 constexpr size_t kGranularScopeSamples = 1024;
 static float      g_granular_scope_l[kGranularScopeSamples];
 static size_t      g_granular_scope_write_pos = 0;
+
+// Same convention, for Screen::Dexed's own live oscilloscope pages
+// (Feedback/Brightness/EnvSpeed/Filter/Mix/FX) -- captures Dexed's own
+// dry output (dexed_l), same "instrument's own signal, not the final
+// mix" treatment as the Granular scope above, so each page's own knobs
+// (Feedback amount, Brightness, etc.) visibly change Dexed's actual
+// output shape without other layers/instruments cluttering the trace.
+constexpr size_t kDexedScopeSamples = 1024;
+static float      g_dexed_scope_l[kDexedScopeSamples];
+static size_t      g_dexed_scope_write_pos = 0;
 
 // Same convention, for Screen::Mixer's own oscilloscope page -- captures
 // the actual final post-fader mix (after reverb/bypass/master filter/
@@ -346,6 +357,15 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
 
+    // Same for Dexed's own oscilloscope pages (see g_dexed_scope_l's own
+    // comment above) -- captured after the enabled/disabled branch above
+    // either way, so the scope just shows silence while Dexed's off.
+    for(size_t i = 0; i < size; i++)
+    {
+        g_dexed_scope_l[g_dexed_scope_write_pos] = dexed_l[i];
+        g_dexed_scope_write_pos = (g_dexed_scope_write_pos + 1) % kDexedScopeSamples;
+    }
+
     // Grains' Direct Record capture -- see g_granular_capturing's own
     // comment above. Writes live input PLUS Dexed's own generated audio
     // (not Grains' own gran_l/r -- that would be a self-capture feedback
@@ -458,7 +478,17 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Shared reverb's Size/decay -- one Global:Reverb setting (see
     // Ui::GetReverbSize01()) applied to the single shared instance,
     // replacing what used to be an independent SetFeedback() per layer.
-    fx_reverb_shared.SetFeedback(ui.GetReverbSize01());
+    // "Size" is the direct continuation of this same knob/field; it maps
+    // straight onto the Dattorro engine's own Decay parameter.
+    fx_reverb_shared.SetDecay01(ui.GetReverbSize01());
+    // The other 6 DattorroReverb parameters -- Global:Reverb Tone/
+    // Diffusion (see Ui::GetReverbPreDelay01() and friends).
+    fx_reverb_shared.SetPreDelay01(ui.GetReverbPreDelay01());
+    fx_reverb_shared.SetPreFilter01(ui.GetReverbPreFilter01());
+    fx_reverb_shared.SetInputDiffusion1_01(ui.GetReverbInputDiffusion1_01());
+    fx_reverb_shared.SetInputDiffusion2_01(ui.GetReverbInputDiffusion2_01());
+    fx_reverb_shared.SetDecayDiffusion01(ui.GetReverbDecayDiffusion01());
+    fx_reverb_shared.SetDamping01(ui.GetReverbDamping01());
 
     // Shared delay's Time/Feedback -- same "one Global:FX setting drives
     // the single shared instance" pattern as the reverb above. Time maps
@@ -657,10 +687,12 @@ int main(void)
     // confirm it -- only ordinary .bss gets zero-filled at boot).
     memset(&fx_reverb_shared, 0, sizeof(fx_reverb_shared));
     fx_reverb_shared.Init(hw.AudioSampleRate());
-    fx_reverb_shared.SetLpFreq(9000.f); // fixed damping, matches the old per-layer default
-    // SetFeedback() itself is applied every block in AudioCallback() from
-    // Ui::GetReverbSize01() (see there), same live-update pattern as the
-    // master filter's cutoff/res just above -- no need to set it here too.
+    // Init() itself seeds every parameter (PreDelay, PreFilter, both Input
+    // Diffusions, DecayDiffusion, Damping) to the original library's own
+    // tuned defaults -- nothing else to set here. Decay itself (the one
+    // parameter that WAS already user-facing as "Size") is applied every
+    // block in AudioCallback() from Ui::GetReverbSize01() (see there), same
+    // live-update pattern as the master filter's cutoff/res just above.
 
     // Same zero-before-Init() safety as fx_reverb_shared above --
     // DelayLine::Init()/Reset() does zero its own buffer either way, but
@@ -694,7 +726,8 @@ int main(void)
     ui.Init(&hw, &display, &tempo, layers, kNumLayers, &granular, g_granular_scope_l,
             kGranularScopeSamples, g_granular_capture_l, g_granular_capture_r,
             kGranularCaptureSamples, &g_granular_capturing, &g_granular_capture_write_pos,
-            g_master_scope_l, kMasterScopeSamples, &dexed);
+            g_master_scope_l, kMasterScopeSamples, g_dexed_scope_l, kDexedScopeSamples,
+            &dexed);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();

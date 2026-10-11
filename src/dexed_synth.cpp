@@ -54,6 +54,15 @@ namespace
 // on any patch.
 constexpr float kQ24Scale      = 1.f / (float)(1 << 24);
 constexpr float kHeadroomScale = 1.f / 8.82f;
+
+// Temporarily false for an A/B listening test against the original
+// "classic DX7" behavior (notes stacking up saturates the final
+// tanhf() limiter together, same as real DX7 hardware's own
+// fixed-headroom output stage, instead of being proactively scaled
+// down) -- see voice_headroom_target_'s own comment in RenderQuantum()
+// for why. All the compensation/ramping machinery stays in place
+// either way; this is the one line to flip back to re-enable it.
+constexpr bool kEnableVoiceHeadroomCompensation = false;
 } // namespace
 
 void DexedSynth::Init(float sample_rate)
@@ -284,7 +293,16 @@ void DexedSynth::RenderQuantum()
     // margin. Only the TARGET is set here; voice_headroom_scale_ itself
     // ramps toward it sample-by-sample in Process(), so a NoteOn/NoteOff
     // changing this mid-block doesn't step the output discontinuously.
-    voice_headroom_target_ = held > 1 ? 1.f / sqrtf((float)held) : 1.f;
+    //
+    // Temporarily disabled (kEnableVoiceHeadroomCompensation, see its
+    // own comment) for an A/B listen against the original "classic DX7"
+    // behavior -- notes stacking up saturates the final tanhf() limiter
+    // together instead of being proactively scaled down, same as real
+    // DX7 hardware's own fixed-headroom output stage. Compensation code
+    // is left completely in place, just gated off, so this is a
+    // one-line flip back once we've actually compared the two.
+    voice_headroom_target_
+        = (kEnableVoiceHeadroomCompensation && held > 1) ? 1.f / sqrtf((float)held) : 1.f;
 
     stage_pos_ = 0;
 }
