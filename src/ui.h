@@ -85,6 +85,8 @@ class Ui
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
               size_t                        master_scope_capacity,
+              const float*                  dexed_scope_buf,
+              size_t                        dexed_scope_capacity,
               DexedSynth*                   dexed);
 
     // Call once from main(), right after Init() -- applies the user's
@@ -1308,6 +1310,11 @@ class Ui
     // --- Dexed engine (Screen::Dexed) ------------------------------------
     DexedSynth*    dexed_            = nullptr;
     DexedParamPage dexed_param_page_ = DexedParamPage::Algo;
+    // Live output ring buffer for Dexed's own oscilloscope pages
+    // (Feedback/Brightness/EnvSpeed/Filter/Mix/FX) -- Dexed's own dry
+    // output, same ownership convention as granular_scope_buf_ above.
+    const float* dexed_scope_buf_      = nullptr;
+    size_t       dexed_scope_capacity_ = 0;
 
     // --- Dexed presets (DexedParamPage::Preset) --------------------------
     // Three levels now (see DexedFilesGroup's own doc comment for why):

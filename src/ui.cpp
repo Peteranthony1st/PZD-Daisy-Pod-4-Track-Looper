@@ -127,6 +127,8 @@ void Ui::Init(daisy::DaisyPod*              pod,
               volatile size_t*              granular_capture_write_pos,
               const float*                  master_scope_buf,
               size_t                        master_scope_capacity,
+              const float*                  dexed_scope_buf,
+              size_t                        dexed_scope_capacity,
               DexedSynth*                   dexed)
 {
     pod_        = pod;
@@ -145,6 +147,8 @@ void Ui::Init(daisy::DaisyPod*              pod,
     master_scope_buf_      = master_scope_buf;
     master_scope_capacity_ = master_scope_capacity;
     dexed_                 = dexed;
+    dexed_scope_buf_        = dexed_scope_buf;
+    dexed_scope_capacity_   = dexed_scope_capacity;
 
     // Same curve ApplyKnobs() uses for knob1 on Home, applied once here
     // so master_volume_ actually matches master_volume01_'s starting
@@ -4815,8 +4819,10 @@ void Ui::DrawDexedScreen()
         {
             char val[8];
             snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(135));
-            disp_->SetCursor(0, 20);
-            WriteUpper("Feedback");
+            // No body text of its own needed (the title already says
+            // "Feedback") -- the freed-up space goes to Dexed's own live
+            // scope instead, same idiom as GranularParamPage::Filter.
+            DrawOscilloscope(12, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
@@ -4856,10 +4862,12 @@ void Ui::DrawDexedScreen()
         {
             char val[8];
             snprintf(val, sizeof(val), "%d%%", (int)(dexed_->GetBrightness01() * 100.f + 0.5f));
-            disp_->SetCursor(0, 20);
-            WriteUpper("Brightness");
-            disp_->SetCursor(0, 30);
-            WriteUpper("50% = as saved");
+            // The redundant big "Brightness" repeat of the title is gone --
+            // the real, non-redundant hint (what 50% means) moves to Tom
+            // Thumb, same space-freeing idiom as GranularParamPage::Filter,
+            // and the scope takes the rest.
+            TomThumbDrawText(disp_, 0, 15, "50% = as saved", true);
+            DrawOscilloscope(18, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
@@ -4868,21 +4876,22 @@ void Ui::DrawDexedScreen()
         {
             char val[8];
             snprintf(val, sizeof(val), "%d%%", (int)(dexed_->GetEnvSpeed01() * 100.f + 0.5f));
-            disp_->SetCursor(0, 20);
-            WriteUpper("Envelope Speed");
-            disp_->SetCursor(0, 30);
-            WriteUpper("50% = as saved");
+            TomThumbDrawText(disp_, 0, 15, "50% = as saved", true);
+            DrawOscilloscope(18, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
         case DexedParamPage::Filter:
         {
+            // Mode name in Tom Thumb (was the big font) -- frees up real
+            // room for the scope, same treatment as
+            // GranularParamPage::Filter.
             char mode_line[20];
             snprintf(mode_line, sizeof(mode_line), "Mode: %s",
                       FilterModeName(dexed_->GetFilterMode()));
-            disp_->SetCursor(0, 20);
-            WriteUpper(mode_line);
+            TomThumbDrawText(disp_, 0, 15, mode_line, true);
+            DrawOscilloscope(18, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
 
             char cutoff_val[8], res_val[8];
             snprintf(cutoff_val, sizeof(cutoff_val), "%d%%",
@@ -4901,8 +4910,12 @@ void Ui::DrawDexedScreen()
                       (int)(dexed_->GetReverbSend01() * 100.f + 0.5f));
             snprintf(out_val, sizeof(out_val), "%d%%",
                       (int)(dexed_->GetOutputLevel01() * 100.f + 0.5f));
-            disp_->SetCursor(0, 20);
-            WriteUpper("Mix");
+            // No body text of its own needed (title already says "Mix") --
+            // Level's effect is directly visible on the scope; Send isn't
+            // (it feeds the shared reverb bus, not Dexed's own dry output
+            // this scope taps -- same limitation GranularParamPage::Filter's
+            // own scope already has for its own Reverb Send knob).
+            DrawOscilloscope(12, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Rev", send_val, out_val,
                              "Level");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
@@ -4920,8 +4933,7 @@ void Ui::DrawDexedScreen()
                           (int)(dexed_->GetReverbSend01() * 100.f + 0.5f));
                 snprintf(size_val, sizeof(size_val), "%d%%",
                           (int)(reverb_size01_ * 100.f + 0.5f));
-                disp_->SetCursor(0, 20);
-                WriteUpper("Reverb");
+                TomThumbDrawText(disp_, 0, 15, "Reverb", true);
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, size_val,
                                  "Size");
             }
@@ -4932,11 +4944,11 @@ void Ui::DrawDexedScreen()
                           (int)(dexed_->GetDelaySend01() * 100.f + 0.5f));
                 snprintf(time_val, sizeof(time_val), "%d%%",
                           (int)(delay_time01_ * 100.f + 0.5f));
-                disp_->SetCursor(0, 20);
-                WriteUpper("Delay");
+                TomThumbDrawText(disp_, 0, 15, "Delay", true);
                 DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Send", send_val, time_val,
                                  "Time");
             }
+            DrawOscilloscope(18, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                              dexed_fx_target_delay_ ? "Reverb" : "Reverb*", "", "",
                              dexed_fx_target_delay_ ? "Delay*" : "Delay");

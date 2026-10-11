@@ -140,6 +140,16 @@ constexpr size_t kGranularScopeSamples = 1024;
 static float      g_granular_scope_l[kGranularScopeSamples];
 static size_t      g_granular_scope_write_pos = 0;
 
+// Same convention, for Screen::Dexed's own live oscilloscope pages
+// (Feedback/Brightness/EnvSpeed/Filter/Mix/FX) -- captures Dexed's own
+// dry output (dexed_l), same "instrument's own signal, not the final
+// mix" treatment as the Granular scope above, so each page's own knobs
+// (Feedback amount, Brightness, etc.) visibly change Dexed's actual
+// output shape without other layers/instruments cluttering the trace.
+constexpr size_t kDexedScopeSamples = 1024;
+static float      g_dexed_scope_l[kDexedScopeSamples];
+static size_t      g_dexed_scope_write_pos = 0;
+
 // Same convention, for Screen::Mixer's own oscilloscope page -- captures
 // the actual final post-fader mix (after reverb/bypass/master filter/
 // click/master volume), not any one instrument's own signal.
@@ -345,6 +355,15 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             dexed_l[i] = 0.f;
             dexed_r[i] = 0.f;
         }
+    }
+
+    // Same for Dexed's own oscilloscope pages (see g_dexed_scope_l's own
+    // comment above) -- captured after the enabled/disabled branch above
+    // either way, so the scope just shows silence while Dexed's off.
+    for(size_t i = 0; i < size; i++)
+    {
+        g_dexed_scope_l[g_dexed_scope_write_pos] = dexed_l[i];
+        g_dexed_scope_write_pos = (g_dexed_scope_write_pos + 1) % kDexedScopeSamples;
     }
 
     // Grains' Direct Record capture -- see g_granular_capturing's own
@@ -707,7 +726,8 @@ int main(void)
     ui.Init(&hw, &display, &tempo, layers, kNumLayers, &granular, g_granular_scope_l,
             kGranularScopeSamples, g_granular_capture_l, g_granular_capture_r,
             kGranularCaptureSamples, &g_granular_capturing, &g_granular_capture_write_pos,
-            g_master_scope_l, kMasterScopeSamples, &dexed);
+            g_master_scope_l, kMasterScopeSamples, g_dexed_scope_l, kDexedScopeSamples,
+            &dexed);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();
