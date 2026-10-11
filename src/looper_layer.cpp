@@ -20,12 +20,16 @@ void LooperLayer::Init(float*           buf_l,
                        float*           buf_r,
                        size_t           buffer_size,
                        float            sample_rate,
-                       daisysp::Phaser* fx_phaser)
+                       daisysp::Phaser* fx_phaser,
+                       float*           undo_backup_l,
+                       float*           undo_backup_r)
 {
     buffer_l_    = buf_l;
     buffer_r_    = buf_r;
     buffer_size_ = buffer_size;
     sample_rate_ = sample_rate;
+    undo_backup_l_ = undo_backup_l;
+    undo_backup_r_ = undo_backup_r;
 
     filter_l_.Init(sample_rate_);
     filter_r_.Init(sample_rate_);
@@ -309,6 +313,60 @@ void LooperLayer::RestoreRecordedLength(size_t len)
     }
 }
 
+void LooperLayer::RestoreFromBackup(const float* backup_l, const float* backup_r, size_t len)
+{
+    // Clamp defensively -- the caller (main.cpp) already only takes a
+    // snapshot sized to this layer's own GetRecordedLength() at the time,
+    // which can never exceed buffer_size_, but there's no reason to trust
+    // that invariant blindly from inside the one function that writes
+    // straight into the audio buffer.
+    if(len > buffer_size_)
+        len = buffer_size_;
+
+    // Only the wrapped arc this overdub pass has actually reached so far
+    // was ever captured (see undo_backup_l_'s own comment for why this is
+    // lazy, not a bulk pre-copy) -- indices beyond that were never
+    // touched this pass, so buffer_l_/r_ there is STILL the correct
+    // pre-overdub value with or without a backup, and restoring from
+    // whatever stale data happens to sit in backup_l_/r_ there would be
+    // actively wrong, not just redundant. This also makes a mid-overdub
+    // Undo (the pass hasn't auto-stopped back to Playing yet) correct
+    // for free: it just restores less, exactly as much as has actually
+    // been overwritten so far.
+    float touched_f = (float)len - overdub_remaining_;
+    if(touched_f < 0.f)
+        touched_f = 0.f;
+    if(touched_f > (float)len)
+        touched_f = (float)len;
+    size_t touched = (size_t)touched_f;
+
+    for(size_t n = 0; n < touched; n++)
+    {
+        size_t idx         = (overdub_start_idx_ + n) % len;
+        buffer_l_[idx] = backup_l[idx];
+        buffer_r_[idx] = backup_r[idx];
+    }
+
+    // play_pos_/state_/record_len_ are deliberately left untouched -- just
+    // the buffer content underneath whatever's already playing. Same
+    // one-time full rebuild as RestoreRecordedLength() above, for the
+    // same reason -- the incremental per-sample cache update in Process()
+    // never ran for this restored audio. Rebuilt from the WHOLE buffer,
+    // not just the restored arc, since whatever wasn't restored is still
+    // exactly what it was already contributing to the cached peaks.
+    for(int i = 0; i < kWaveformCols; i++)
+        waveform_peaks_[i] = 0.f;
+    for(size_t i = 0; i < len; i++)
+    {
+        int bucket = (int)(i * (size_t)kWaveformCols / len);
+        if(bucket >= kWaveformCols)
+            bucket = kWaveformCols - 1;
+        float a = fabsf(buffer_l_[i]);
+        if(a > waveform_peaks_[bucket])
+            waveform_peaks_[bucket] = a;
+    }
+}
+
 // --- Effects chain --------------------------------------------------------
 
 DSY_ITCM_TEXT
@@ -440,6 +498,7 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             // treats this state the same as Playing/Paused -- unlike
             // ArmedCountIn above, there's nothing to reset here, just a
             // wait for the same count-in to finish.
+
             if(tick.record_start)
             {
                 state_ = LayerState::Overdubbing;
@@ -449,11 +508,24 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 // Playing once this reaches 0, in the overdub-write block
                 // below.
                 overdub_remaining_ = (float)record_len_;
+                // Where this pass starts, in buffer-index space -- see
+                // overdub_start_idx_'s own comment for why Undo needs
+                // this, together with overdub_remaining_, to know exactly
+                // which wrapped arc of the backup is actually valid.
+                overdub_start_idx_ = record_len_ > 0 ? (size_t)play_pos_ % record_len_ : 0;
                 // Fresh interpolation state -- don't blend the first
                 // sample of this overdub against whatever was captured
                 // the last time this layer recorded or overdubbed.
                 prev_input_sample_l_ = 0.f;
                 prev_input_sample_r_ = 0.f;
+                // Ownership can be claimed immediately -- unlike the old
+                // bulk-copy design, there's no "finish copying first"
+                // step to wait for: the backup now fills in lazily, one
+                // sample at a time, exactly in step with the overdub
+                // write below, so it's always exactly as complete as the
+                // pass itself is. See ConsumeOverdubSnapshotRequest()'s
+                // own doc comment for what happens next.
+                overdub_snapshot_pending_ = true;
             }
         }
 
@@ -551,6 +623,19 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 float t = (idx - old_pos) / effective_speed;
                 float add_l = prev_input_sample_l_ + t * (sample_l - prev_input_sample_l_);
                 float add_r = prev_input_sample_r_ + t * (sample_r - prev_input_sample_r_);
+
+                // Lazy Undo-overdub backup: capture this sample's
+                // pre-overdub value the instant before it's overwritten,
+                // not ahead of time -- see undo_backup_l_'s own comment
+                // in the header for why this is free (same cache line
+                // the very next two lines already touch) where a
+                // separate bulk copy ahead of the write was a real,
+                // measured, audible cost.
+                if(undo_backup_l_ && undo_backup_r_)
+                {
+                    undo_backup_l_[wrapped] = buffer_l_[wrapped];
+                    undo_backup_r_[wrapped] = buffer_r_[wrapped];
+                }
                 buffer_l_[wrapped] = Clampf(buffer_l_[wrapped] + add_l, -1.5f, 1.5f);
                 buffer_r_[wrapped] = Clampf(buffer_r_[wrapped] + add_r, -1.5f, 1.5f);
 

@@ -87,7 +87,11 @@ class Ui
               size_t                        master_scope_capacity,
               const float*                  dexed_scope_buf,
               size_t                        dexed_scope_capacity,
-              DexedSynth*                   dexed);
+              DexedSynth*                   dexed,
+              float*                        undo_backup_l,
+              float*                        undo_backup_r,
+              int*                          undo_owner_layer,
+              size_t*                       undo_backup_len);
 
     // Call once from main(), right after Init() -- applies the user's
     // saved startup defaults (see PerformanceStore::LoadPrefs()) on top
@@ -134,6 +138,14 @@ class Ui
     // runaway self-oscillation in the cross-feedback pair.
     float GetDelayTime01() const { return delay_time01_; }
     float GetDelayFeedback01() const { return delay_feedback01_; }
+    // Which MIDI channel each engine responds to -- -1 = Omni (respond to
+    // everything, the default, matching this project's own behavior
+    // before per-engine routing existed). 0-15 = a specific channel
+    // (0-indexed, matching libDaisy's own MidiEvent::channel convention
+    // -- "channel 5" is stored/compared as 4). Read once per incoming
+    // MIDI event in main.cpp's MIDI block, not per audio sample.
+    int GetDexedMidiChannel() const { return dexed_midi_channel_; }
+    int GetGranularMidiChannel() const { return granular_midi_channel_; }
     // How much of the Bypass live-monitor signal feeds the shared reverb
     // bus above -- independent of every layer's own Send, same shared
     // bus though (see main.cpp's AudioCallback()). 0 (default) = none,
@@ -397,6 +409,10 @@ class Ui
         // Full reverb/delay control from within Grains itself -- same
         // shape/reasoning as DexedParamPage::FX.
         FX,
+        // K1 only, same knob-quantized idiom as DexedParamPage::MIDI --
+        // which incoming MIDI channel this engine responds to. Default
+        // Omni.
+        MIDI,
         // Button1 cycles the source (Direct Record / From the currently
         // selected loop layer); Button2 held either records live input
         // for as long as it's held (Direct) or, past an 800ms threshold,
@@ -454,6 +470,11 @@ class Ui
         // places, same "same value, multiple entry points" idiom already
         // established for Reverb Send across Mix/Global Mixer).
         FX,
+        // K1 only, knob-quantized across 17 buckets (Omni + channels
+        // 1-16) -- which incoming MIDI channel this engine responds to.
+        // Default Omni (respond to everything), same behavior as before
+        // this existed -- see main.cpp's MIDI block for the actual filter.
+        MIDI,
         // Entry point into Screen::DexedOperator (encoder click) -- no
         // continuous knobs of its own, same "entry point only" idiom as
         // GlobalPage::Granular/Dexed. Positioned right before Preset so
@@ -580,6 +601,7 @@ class Ui
         // to share room with 4 more FX parameters.
         GranularFxReverb,
         GranularFxDelay,
+        GranularMidi, // K1 only -- which MIDI channel this engine listens on
         GranularCapture, // no continuous knobs -- Button1/Button2 only
         GranularTrim,
         GranularPreset, // browses a list directly, no pickup used
@@ -614,6 +636,7 @@ class Ui
         // GranularFxReverb/GranularFxDelay above.
         DexedFxReverb,
         DexedFxDelay,
+        DexedMidi, // K1 only -- which MIDI channel this engine listens on
         DexedAdvanced, // entry point only -- see Screen::DexedOperator instead
         DexedPreset, // browses a list directly, no pickup used
         // Screen::DexedOperator -- one context per sub-page, shared
@@ -852,6 +875,14 @@ class Ui
     // not a tap, since this is a deliberate write, same weight as
     // Global:File's hold-to-Load/Layer:Status's hold-to-Clear.
     void TriggerSaveDefaults();
+    // Layer:Status's Button2 short tap -- restores the cursor layer's
+    // buffer from the shared Undo backup if (and only if) it's the one
+    // that actually owns it right now (*undo_owner_layer_ ==
+    // cursor_layer_); otherwise just sets undo_status_ to "Nothing to
+    // undo" and leaves everything else alone. See
+    // LooperLayer::RestoreFromBackup()/ConsumeOverdubSnapshotRequest()
+    // for the snapshot/restore mechanics this depends on.
+    void TriggerUndoOverdub();
     // Button1 short press on Global:Export: renders one full loop of the
     // current in-memory performance (every layer's real filter/effect/
     // reverb chain, plus the master filter) to a new WAV/EXPnnn.wav
@@ -1098,6 +1129,9 @@ class Ui
     bool global_reverb_tone_target_b_ = false;
     float delay_time01_     = 0.3f; // shared delay bus's Time, see GetDelayTime01()
     float delay_feedback01_ = 0.35f; // shared delay bus's Feedback, see GetDelayFeedback01()
+    // -1 = Omni (default) -- see GetDexedMidiChannel()/GetGranularMidiChannel().
+    int dexed_midi_channel_    = -1;
+    int granular_midi_channel_ = -1;
     // Global:FX's own toggle between the Reverb pair (Size/Bypass Send,
     // existing) and the Delay pair (Time/Feedback, new) -- same "Button1
     // = pair A, Button2 = pair B" idiom as Grain's Gap+Scan toggle.
@@ -1192,6 +1226,17 @@ class Ui
 
     // --- Startup defaults (Global:Tempo page) -------------------------
     char tempo_status_[24]          = {};    // last "save as default" result, shown briefly here
+
+    // --- Undo last overdub (Layer:Status page) --------------------------
+    // Unlike tempo_status_ (a settings page nobody idles on), this message
+    // takes over the one thing Layer:Status is FOR -- the waveform/playhead
+    // -- so, unlike every other transient status_ in this file, it can't
+    // just persist until some unrelated action happens to overwrite it;
+    // it needs its own timeout so an idle user gets their waveform back.
+    // Only ever set to "Nothing to undo" (a successful Undo needs no
+    // message of its own; the waveform/audio change is feedback enough).
+    char     undo_status_[24]       = {};
+    uint32_t undo_status_set_ms_    = 0;
 
     // --- Granular engine (Screen::Granular) -----------------------------
     GranularEngine*    granular_             = nullptr;
@@ -1315,6 +1360,18 @@ class Ui
     // output, same ownership convention as granular_scope_buf_ above.
     const float* dexed_scope_buf_      = nullptr;
     size_t       dexed_scope_capacity_ = 0;
+
+    // --- Undo last overdub (Layer:Status, Button2 short tap) ------------
+    // main.cpp-owned shared buffers/state -- see their own comments there
+    // (declared alongside buffer_l/buffer_r) for the full picture. Ui
+    // only reads undo_owner_layer_ (to check whether the cursor layer has
+    // a pending Undo) and, on a successful Undo, writes -1 back through
+    // it to invalidate ownership -- same "main.cpp owns the buffer, Ui
+    // gets a pointer to use it" convention as every scope buffer above.
+    float*  undo_backup_l_    = nullptr;
+    float*  undo_backup_r_    = nullptr;
+    int*    undo_owner_layer_ = nullptr;
+    size_t* undo_backup_len_  = nullptr;
 
     // --- Dexed presets (DexedParamPage::Preset) --------------------------
     // Three levels now (see DexedFilesGroup's own doc comment for why):

@@ -98,14 +98,19 @@ bool Save(int                slot,
           float              reverb_input_diffusion2_01,
           float              reverb_decay_diffusion01,
           float              reverb_damping01,
+          // Which MIDI channel each engine listens on -- -1 = Omni. See
+          // Ui::GetDexedMidiChannel()/GetGranularMidiChannel().
+          int                dexed_midi_channel,
+          int                granular_midi_channel,
           ProgressFn         on_progress = nullptr);
 
-// Accepts both kFileVersion (12) and the previous version (11) -- see
-// Load()'s own comment in performance_store.cpp for why this is the
-// first backward-compatible version bump in this project's history. A
-// v11 file leaves *out_reverb_predelay01 and friends at the Dattorro
-// library's own tuned defaults (the same ones DattorroReverb::Init()
-// itself uses) rather than failing to load.
+// Accepts kFileVersion (13) and the two previous versions (12, 11) -- see
+// Load()'s own comment in performance_store.cpp for the incremental
+// per-version chunk scheme this uses to stay backward-compatible. A v11
+// file leaves *out_reverb_predelay01 and friends at the Dattorro
+// library's own tuned defaults (same ones DattorroReverb::Init() uses);
+// a v11 or v12 file leaves *out_dexed_midi_channel/
+// *out_granular_midi_channel at Omni (-1) -- neither fails to load.
 bool Load(int          slot,
           TempoClock&  tempo,
           LooperLayer* layers,
@@ -123,6 +128,8 @@ bool Load(int          slot,
           float*       out_reverb_input_diffusion2_01,
           float*       out_reverb_decay_diffusion01,
           float*       out_reverb_damping01,
+          int*         out_dexed_midi_channel,
+          int*         out_granular_midi_channel,
           ProgressFn   on_progress = nullptr);
 
 // Grains (GranularEngine) presets: parameters AND the captured audio
@@ -389,9 +396,11 @@ bool SavePrefs(TempoClock&  tempo,
                float        reverb_input_diffusion1_01,
                float        reverb_input_diffusion2_01,
                float        reverb_decay_diffusion01,
-               float        reverb_damping01);
+               float        reverb_damping01,
+               int          dexed_midi_channel,
+               int          granular_midi_channel);
 
-// Same v11/v12 backward compatibility as Load() -- see its own comment.
+// Same v11/v12/v13 backward compatibility as Load() -- see its own comment.
 bool LoadPrefs(float*      out_bpm,
                int*        out_bars,
                float*      out_master_volume01,
@@ -408,6 +417,8 @@ bool LoadPrefs(float*      out_bpm,
                float*      out_reverb_input_diffusion1_01,
                float*      out_reverb_input_diffusion2_01,
                float*      out_reverb_decay_diffusion01,
-               float*      out_reverb_damping01);
+               float*      out_reverb_damping01,
+               int*        out_dexed_midi_channel,
+               int*        out_granular_midi_channel);
 
 } // namespace PerformanceStore

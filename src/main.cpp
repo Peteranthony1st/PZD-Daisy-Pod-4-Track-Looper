@@ -22,7 +22,14 @@ using namespace daisy;
 // LooperLayer array below -- Phaser and ReverbSc are the exceptions
 // (~75KB/~386KB per instance), and are placed in SDRAM alongside these
 // loop buffers.
-#define kBuffSize 1600000
+//
+// 921,600 (~19.2s @ 48kHz) -- was 1,600,000 (~33.3s). TempoClock's own
+// BPM/Bars ceiling (see tempo_clock.h's kMaxLoopSeconds) now guarantees no
+// new recording can ever exceed 19.2s, so sizing these for the old ~33.3s
+// max was pure headroom nobody could reach any more -- shrinking them
+// frees ~20.7MB of SDRAM project-wide, more than enough to cover the new
+// shared Undo backup buffer below (~7.03MB) with plenty to spare.
+#define kBuffSize 921600
 #define kNumLayers 4
 
 DaisyPod hw;
@@ -32,6 +39,27 @@ MyDisplay display;
 
 float DSY_SDRAM_BSS buffer_l[kNumLayers][kBuffSize];
 float DSY_SDRAM_BSS buffer_r[kNumLayers][kBuffSize];
+
+// Shared "undo last overdub" backup -- ONE instance, not one per layer
+// (only one layer can be overdubbing at a time), restorable from
+// Layer:Status's Button2 short tap (see Ui::HandleButton2()). Sized to
+// exactly the same kMaxLoopSeconds ceiling as the main buffers above, so
+// every loop this project can now produce always fits -- no partial/
+// best-effort case to handle for anything recorded going forward. The
+// actual copy happens incrementally, inside LooperLayer::Process()
+// itself (the audio ISR), spread across the overdub's own count-in --
+// see ConsumeOverdubSnapshotRequest()'s own comment for why it can't be
+// deferred to this main loop. A loop from an old save made before this
+// ceiling existed that happens to be longer than this is grandfathered
+// (still plays fine) but simply won't offer Undo -- checked at the
+// moment the snapshot would be taken, not assumed.
+float DSY_SDRAM_BSS g_undo_backup_l[kBuffSize];
+float DSY_SDRAM_BSS g_undo_backup_r[kBuffSize];
+// -1 = no pending undo. Set by the main loop once a layer's incremental
+// snapshot (see above) finishes; cleared either by a successful Undo or
+// by a different layer's overdub taking the shared backup over first.
+int    g_undo_owner_layer = -1;
+size_t g_undo_backup_len  = 0;
 
 // Grains' own dedicated capture buffer -- separate from the loop layers'
 // buffers above (~10s @ 48kHz, chosen to fit comfortably in the SDRAM
@@ -200,22 +228,31 @@ void ControlTimerCallback(void*)
     // read far more natural than whatever's left of them after being
     // bunched up behind an OLED write.
     hw.midi.Listen();
+    // -1 (Omni) matches any channel; otherwise the event's own 0-indexed
+    // channel must match exactly -- see Ui::GetDexedMidiChannel()/
+    // GetGranularMidiChannel()'s own doc comment. Read once per poll
+    // (not once per event) since both can only change between UI
+    // redraws anyway, not mid-event-queue.
+    int dexed_ch    = ui.GetDexedMidiChannel();
+    int granular_ch = ui.GetGranularMidiChannel();
     while(hw.midi.HasEvents())
     {
         MidiEvent event = hw.midi.PopEvent();
         if(event.type == NoteOn)
         {
             NoteOnEvent noteon = event.AsNoteOn();
-            // TEMPORARY (Stage 1) -- same MIDI stream drives every engine
-            // for now, no channel/screen-based routing yet.
-            granular.NoteOn(noteon.note, noteon.velocity);
-            dexed.NoteOn(noteon.note, noteon.velocity);
+            if(granular_ch == -1 || noteon.channel == granular_ch)
+                granular.NoteOn(noteon.note, noteon.velocity);
+            if(dexed_ch == -1 || noteon.channel == dexed_ch)
+                dexed.NoteOn(noteon.note, noteon.velocity);
         }
         else if(event.type == NoteOff)
         {
             NoteOffEvent noteoff = event.AsNoteOff();
-            granular.NoteOff(noteoff.note);
-            dexed.NoteOff(noteoff.note);
+            if(granular_ch == -1 || noteoff.channel == granular_ch)
+                granular.NoteOff(noteoff.note);
+            if(dexed_ch == -1 || noteoff.channel == dexed_ch)
+                dexed.NoteOff(noteoff.note);
         }
         else if(event.type == PitchBend)
         {
@@ -226,15 +263,18 @@ void ControlTimerCallback(void*)
             // raw 0..16383 CC value Dx7Note::compute() itself expects
             // (see SetPitchBend14bit()'s own doc comment) -- re-center
             // and clamp back to that range here.
-            PitchBendEvent pb  = event.AsPitchBend();
-            int32_t        raw = (int32_t)pb.value + 8192;
-            raw                = raw < 0 ? 0 : (raw > 16383 ? 16383 : raw);
-            dexed.SetPitchBend14bit((uint16_t)raw);
+            PitchBendEvent pb = event.AsPitchBend();
+            if(dexed_ch == -1 || pb.channel == dexed_ch)
+            {
+                int32_t raw = (int32_t)pb.value + 8192;
+                raw         = raw < 0 ? 0 : (raw > 16383 ? 16383 : raw);
+                dexed.SetPitchBend14bit((uint16_t)raw);
+            }
         }
         else if(event.type == ControlChange)
         {
             ControlChangeEvent cc = event.AsControlChange();
-            if(cc.control_number == 1) // mod wheel
+            if(cc.control_number == 1 && (dexed_ch == -1 || cc.channel == dexed_ch)) // mod wheel
             {
                 // Grains has no mod-wheel input -- Dexed is the only
                 // engine that reads this (see SetModWheel01()).
@@ -662,7 +702,7 @@ int main(void)
 
     for(int i = 0; i < kNumLayers; i++)
         layers[i].Init(buffer_l[i], buffer_r[i], kBuffSize, hw.AudioSampleRate(),
-                       &fx_phaser[i]);
+                       &fx_phaser[i], g_undo_backup_l, g_undo_backup_r);
 
     fx_master_filter_l.Init(hw.AudioSampleRate());
     fx_master_filter_r.Init(hw.AudioSampleRate());
@@ -727,7 +767,8 @@ int main(void)
             kGranularScopeSamples, g_granular_capture_l, g_granular_capture_r,
             kGranularCaptureSamples, &g_granular_capturing, &g_granular_capture_write_pos,
             g_master_scope_l, kMasterScopeSamples, g_dexed_scope_l, kDexedScopeSamples,
-            &dexed);
+            &dexed, g_undo_backup_l, g_undo_backup_r, &g_undo_owner_layer,
+            &g_undo_backup_len);
     ui.ApplyStartupDefaults(); // no-op if nothing's been saved yet (see PerformanceStore::LoadPrefs())
 
     hw.StartAdc();
@@ -770,6 +811,22 @@ int main(void)
 
         // MIDI is polled from ControlTimerCallback() (TIM5 ISR) now, not
         // here -- see its own comment for why.
+
+        // Claim Undo-backup ownership -- the real copy already happened
+        // inside LooperLayer::Process() itself, spread across the
+        // overdub's own count-in (see ConsumeOverdubSnapshotRequest()'s
+        // own comment for why: a main-loop-deferred bulk copy, like this
+        // used to be, could race real overdub audio already landing in
+        // the buffer). This is just cheap bookkeeping -- which layer's
+        // backup is now valid -- safe to leave at the main loop's own
+        // pace since it's no longer time-critical.
+        for(int L = 0; L < kNumLayers; L++)
+        {
+            if(!layers[L].ConsumeOverdubSnapshotRequest())
+                continue;
+            g_undo_owner_layer = L;
+            g_undo_backup_len  = layers[L].GetRecordedLength();
+        }
 
         ui.Update(events);
 

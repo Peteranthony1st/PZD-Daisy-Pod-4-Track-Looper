@@ -124,11 +124,24 @@ struct LooperLayer
     // (see SetReverbSend01()'s comment) -- there's a single shared
     // ReverbSc, owned and Process()'d by main.cpp, that every layer
     // sends into.
+    // undo_backup_l/r: the shared Undo-overdub backup buffers (main.cpp's
+    // g_undo_backup_l/r) -- same instance handed to every layer, since
+    // only one can ever be mid-overdub at a time. See
+    // ConsumeOverdubSnapshotRequest()'s own doc comment for why this
+    // class needs direct write access to them now (an earlier version
+    // of this design tried to keep LooperLayer blind to them and defer
+    // the whole copy to the main loop -- that was wrong: real overdub
+    // audio could already be landing in buffer_l_/buffer_r_ by the time
+    // a main-loop-deferred copy actually ran, so the "pre-overdub"
+    // snapshot silently included the first several, sometimes many,
+    // milliseconds of the new take).
     void Init(float*           buf_l,
               float*           buf_r,
               size_t           buffer_size,
               float            sample_rate,
-              daisysp::Phaser* fx_phaser);
+              daisysp::Phaser* fx_phaser,
+              float*           undo_backup_l,
+              float*           undo_backup_r);
     void Reset(); // hard reset to Empty, clears controls to defaults
 
     // --- Transport (call from the UI layer on button edges) --------
@@ -154,6 +167,60 @@ struct LooperLayer
     LayerState GetState() const { return state_; }
     bool       HasContent() const { return record_len_ > 0; }
     size_t     GetRecordedLength() const { return record_len_; } // samples, for save
+
+    // --- Undo last overdub ----------------------------------------------
+    // The backup copy happens LAZILY, one sample at a time, inside the
+    // Overdubbing write loop in Process() (the real-time audio ISR) --
+    // see undo_backup_l_'s own comment for why, and for the two earlier
+    // designs that were tried and rejected first:
+    //
+    // 1. Defer the WHOLE copy to the main loop, keeping Process() blind
+    //    to the shared buffers entirely -- wrong: real overdub audio
+    //    could already be landing in buffer_l_/buffer_r_ by the time a
+    //    main-loop-deferred copy actually ran (the main loop also does
+    //    blocking OLED I2C writes, with no bound on how long that takes),
+    //    so the "pre-overdub" snapshot silently included the first
+    //    several, sometimes many, milliseconds of the new take -- audible
+    //    as "the start of the overdub survives Undo."
+    // 2. A bulk copy inside the ISR, spread in fixed-size chunks across
+    //    the count-in that precedes every overdub -- correct, but a real,
+    //    measured, audible glitch on hardware: a dedicated multi-thousand
+    //    -sample SDRAM-to-SDRAM sweep has real cost regardless of chunk
+    //    size (cold/first-touch, source and dest in different regions of
+    //    the same physical SDRAM chip), and no chunk size tried eliminated
+    //    it -- confirmed by disabling the copy entirely as a diagnostic,
+    //    which did.
+    //
+    // Ownership (g_undo_owner_layer in main.cpp) can be claimed the
+    // instant the pass STARTS, not once some separate copy step finishes
+    // -- the lazy backup is always exactly as complete as the pass itself
+    // is, by construction, so there's nothing to wait for.
+    //
+    // volatile for the same reason every other flag shared between the
+    // audio ISR and the main loop is. Consuming this (read-and-clear) is
+    // a destructive, one-shot read -- call it at most once per intended
+    // snapshot.
+    bool ConsumeOverdubSnapshotRequest()
+    {
+        if(!overdub_snapshot_pending_)
+            return false;
+        overdub_snapshot_pending_ = false;
+        return true;
+    }
+
+    // Restores whichever wrapped arc of buffer_l_/buffer_r_ this overdub
+    // pass has actually reached so far (see overdub_start_idx_'s own
+    // comment) from the shared backup (main.cpp's g_undo_backup_l/r), and
+    // recomputes waveform_peaks_ over the whole buffer so the display
+    // matches what's actually there. Called from the main loop (Ui's
+    // Button2 short-tap handling on Layer:Status), never from the audio
+    // ISR -- this can still touch up to kMaxLoopSeconds worth of audio in
+    // the worst case, not something to do synchronously inside
+    // AudioCallback(). Safe to call regardless of this layer's current
+    // state, including mid-overdub (the pass hasn't auto-stopped back to
+    // Playing yet) -- correct either way, since only the already-
+    // overwritten arc is ever touched.
+    void RestoreFromBackup(const float* backup_l, const float* backup_r, size_t len);
 
     // --- Continuous controls (0..1 unless noted), set every control
     // tick from whichever knob is currently mapped to them -------------
@@ -299,6 +366,34 @@ struct LooperLayer
     size_t buffer_size_ = 0;
     float  sample_rate_ = 48000.f;
 
+    // Shared Undo-overdub backup (main.cpp's g_undo_backup_l/r) -- see
+    // Init()'s own comment. Captured LAZILY, one sample at a time, right
+    // inside the Overdubbing write loop in Process() -- NOT copied in
+    // bulk ahead of time. A real block-sized bulk copy (first spread
+    // across the count-in, then shrunk, then even fully disabled as a
+    // diagnostic) was tried first and confirmed as the actual cause of a
+    // real, audible glitch on hardware every time: a dedicated
+    // multi-thousand-sample SDRAM-to-SDRAM sweep has real cost, no matter
+    // how small the chunk, because it's cold (first-touch, no cache
+    // reuse) and source/dest are different regions of the same physical
+    // SDRAM chip (every access risks a row-close/row-open round trip).
+    // The lazy approach sidesteps this entirely: the overdub write loop
+    // already reads buffer_l_[wrapped]/buffer_r_[wrapped] immediately
+    // before overwriting it (to mix the new audio in), so capturing that
+    // same, already-hot address into the backup first is one extra
+    // read+write on a cache line Process() was touching anyway -- not a
+    // separate sweep, so no new cost class is introduced at all.
+    float* undo_backup_l_ = nullptr;
+    float* undo_backup_r_ = nullptr;
+    // Buffer index play_pos_ was at when this (the current or most
+    // recent) overdub pass began -- together with overdub_remaining_,
+    // defines exactly which wrapped arc of the backup is valid: samples
+    // not yet reached by this pass were never touched this time around,
+    // so buffer_l_/r_ there is STILL the correct pre-overdub state with
+    // or without a backup -- see RestoreFromBackup()'s own comment for
+    // why that's exactly the range it restores, not the whole buffer.
+    size_t overdub_start_idx_ = 0;
+
     LayerState state_ = LayerState::Empty;
 
     size_t write_idx_   = 0;
@@ -313,6 +408,10 @@ struct LooperLayer
     // down for its whole duration, see OnRecordButtonLongPress()'s
     // comment.
     float  overdub_remaining_ = 0.f;
+    // See ConsumeOverdubSnapshotRequest()'s own doc comment -- set inside
+    // Process() (the audio ISR), cleared by whoever consumes it from the
+    // main loop.
+    volatile bool overdub_snapshot_pending_ = false;
     float  play_pos_    = 0.f;
     // See SetFreezeActive()/NudgeFreeze()'s own doc comments.
     bool   freeze_active_ = false;
