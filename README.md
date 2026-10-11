@@ -365,12 +365,14 @@ Export gets baked into the file on purpose.
 | Global: Tempo | BPM | Bars | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Speed | Vari-speed | — | Cycle Normal/Scrub/Freeze | Reset to 1.0x |
 | Global: Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Global: GLB-FX | Size | Bypass reverb send | — | — |
+| Global: GLB-FX | Size (= Decay) | Bypass reverb send | — | — |
+| Global: RevTone | PreDelay / DecayDiffusion | PreFilter / Damping | Knobs → PreDelay+PreFilter | Knobs → DecayDiffusion+Damping |
+| Global: RevDiff | Input Diffusion 1 | Input Diffusion 2 | — | — |
 | Global: File | Choosing Save: Overwrite/Save New; Browsing Load: scroll files | — | Save / Select file list (Load) / Back | Hold 800ms = Save or Load, whichever's open |
 | Global: SD Mgmt | Scroll (folder or file list) | — | Tap = drill in/back, Hold 800ms = Duplicate | Hold 1500ms = Delete |
 | Global: Export | — | — | Tap = Export, native 48kHz ("Studio") | Tap = Export, 44.1kHz for MicroDexed ("CD") |
-| Global: Dexed | — | — | Toggle Dexed on/off (off by default) | — |
-| Global: Granular | — | — | Toggle Grains on/off | — |
+| Global: Dexed | — | — | Toggle Dexed on/off (off by default) | — (push encoder to enter Screen::Dexed) |
+| Global: Granular | — | — | Toggle Grains on/off | — (push encoder to enter Screen::Granular) |
 | Global: Looper | — | — | Toggle the whole 4-layer looper on/off | — |
 | Global: Mixer | — | — | — | — (push encoder to enter the Mixer screen) |
 
