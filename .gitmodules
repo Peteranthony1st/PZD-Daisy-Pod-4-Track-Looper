@@ -3,4 +3,4 @@
 	url = https://github.com/Peteranthony1st/libDaisy
 [submodule "src/DaisySP"]
 	path = src/DaisySP
-	url = https://github.com/electro-smith/DaisySP
+	url = https://github.com/Peteranthony1st/DaisySP
