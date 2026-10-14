@@ -1727,9 +1727,54 @@ yet.
 
 One screen covering all 8 mixable channels — Loop Layers 1–4, Grains,
 Dexed (DXD), Bypass, and Master — reached by clicking the encoder on
-`Global:Mixer` (which itself shows a static at-a-glance overview grid:
-all 8 channel names in a row, each with a real vertical Volume bar, no
-numeric readout, via `DrawMixerOverviewGrid()`).
+`Global:Mixer` (which itself shows an at-a-glance overview grid: all 8
+channel names in a row, each with a real vertical bar, via
+`DrawMixerOverviewGrid()`).
+
+### Peak level + clip indicator
+
+Added after a real gap: there was no way to see signal level anywhere in
+the UI before saving/recording, only fader *settings*. `MixerGetLevel01()`/
+`MixerIsClipping()` expose a live, independent-of-any-fader reading per
+channel:
+
+- **Layers 1-4** already had the plumbing — `LooperLayer::GetLevel()`
+  tracks a one-pole-smoothed `|sample|` continuously during both
+  Recording and Playback (pre-fader, the raw buffer content), just never
+  read by the UI before now.
+- **Grains/Dexed/Bypass/Master** didn't exist before this: `main.cpp`
+  now maintains one `UpdateLevelMeter()` call per channel, each reading
+  that channel's own real signal at the point it's computed — `gran_l`/
+  `dexed_l` (post-mixer-gain, the same signal that feeds both the live
+  mix and a recording), `byp_mono` (post-gain/pre-pan), and the final
+  `out[0]` (everything: volume, reverb, delay, filter, click) for
+  Master. See `audio_engine.h` for the 8 globals (4 levels + 4
+  clip-holds) this needs, same cross-file-global convention
+  `g_audio_suspended` already established.
+- **Clip indicator is a hold, not an instant flag** — `kClipThreshold`
+  (1.0, same meaning for every channel: "pushing past nominal
+  full-scale," well under the loop-recording path's actual ±1.5 hard
+  clamp, so it's an early warning, not just a post-mortem) latches
+  `kClipHoldSeconds` (0.5s) of hold time once crossed, the same "peak
+  hold LED" idiom real mixing consoles use — needed because the OLED
+  doesn't redraw fast enough to reliably catch a one-sample transient
+  otherwise. `LooperLayer`'s own `clip_hold_` uses the identical
+  threshold/hold shape, kept as a separate constant rather than shared
+  since each one reads a different signal.
+- **Drawn as a filled cap at the top of the bar's own outline**
+  (`DrawMixerVBar()`'s `clip_lit` parameter) rather than a separate
+  element — costs no extra screen space on either page, and is drawn
+  last so it's never hidden under the level fill.
+- **Overview grid now shows Peak, not Volume** — deliberately: this grid
+  answers "what's loud/clipping right now," and a fader-position bar
+  would just duplicate the Detail page's own Vol bar. Settings (Volume)
+  and live signal (Peak) are now a clean split across the two pages.
+- **Detail page groups 2 channels per screen, not 4** — changed from the
+  original 4-wide layout specifically to make room for a real 3rd bar
+  (Peak, with the clip cap) alongside the existing Vol/Rev pair, rather
+  than cramming a tiny indicator into already-tight space. Rotating
+  through channels works exactly as before (one channel at a time); only
+  how many neighbors are visible around the selected one changed.
 
 **Rotate picks the channel, not the page** — unlike every other
 Dexed/Granular-style screen, `Screen::Mixer` has no sub-pages of its own;

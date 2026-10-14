@@ -278,6 +278,14 @@ struct LooperLayer
     // Cheap 0..1 read-back for VU-style meters on the OLED.
     float GetLevel() const { return meter_; }
 
+    // True for kClipHoldSeconds after the last sample that hit/crossed
+    // kClipThreshold -- a latch, not an instant flag, so a one-sample
+    // peak between two ~30Hz UI redraws still has a real chance of being
+    // seen rather than disappearing before anything ever draws it (same
+    // "peak hold LED" idiom real mixing consoles use). Checked against
+    // the same raw, pre-fader signal GetLevel()/meter_ already tracks.
+    bool IsClipping() const { return clip_hold_ > 0.f; }
+
     // Downsampled waveform for the Status page display: max abs(left
     // channel) seen in each of kWaveformCols buckets spanning the
     // recorded length, updated incrementally per-sample during
@@ -467,6 +475,7 @@ struct LooperLayer
     float reverb_send_ = 0.f; // 0 = nothing sent to the shared reverb bus
     float delay_send_  = 0.f; // 0 = nothing sent to the shared delay bus
 
-    float meter_ = 0.f;
+    float meter_     = 0.f;
+    float clip_hold_ = 0.f; // seconds remaining on the clip-indicator latch, see IsClipping()
     float waveform_peaks_[kWaveformCols] = {};
 };

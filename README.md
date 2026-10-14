@@ -269,9 +269,13 @@ a live mic with the whole looper switched off and using none of its CPU.
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
 there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains, Dexed,
 and Bypass, plus Volume/Reverb-Size for the final Master bus, ending in
-a live oscilloscope of the actual output mix. Rotate the encoder to
-step through each channel in turn; `Global:Mixer` itself shows an
-at-a-glance overview grid of all 8 channels' levels.
+a live oscilloscope of the actual output mix. Each channel also shows a
+real-time Peak meter alongside its Vol/Rev bars, with a clip indicator
+(a brief hold, not just instant) that lights up if that channel pushes
+past nominal full-scale — useful for checking levels before you record,
+since there's no other level feedback anywhere else in the UI. Rotate
+the encoder to step through each channel in turn; `Global:Mixer` itself
+shows an at-a-glance overview grid of all 8 channels' live Peak levels.
 
 **SD card management** — `Global:SdMgmt` lets you browse either of 2
 save categories (Performances/Grains Presets — Dexed Presets aren't

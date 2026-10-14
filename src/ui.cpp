@@ -4632,11 +4632,37 @@ bool Ui::MixerChannelHasPan(int ch) const
     return ch != kNumMixerChannels - 1;
 }
 
+float Ui::MixerGetLevel01(int ch) const
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: return layers_[ch].GetLevel();
+        case 4: return g_grains_level;
+        case 5: return g_dexed_level;
+        case 6: return g_bypass_level;
+        case 7: return g_master_level;
+        default: return 0.f;
+    }
+}
+
+bool Ui::MixerIsClipping(int ch) const
+{
+    switch(ch)
+    {
+        case 0: case 1: case 2: case 3: return layers_[ch].IsClipping();
+        case 4: return g_grains_clip_hold > 0.f;
+        case 5: return g_dexed_clip_hold > 0.f;
+        case 6: return g_bypass_clip_hold > 0.f;
+        case 7: return g_master_clip_hold > 0.f;
+        default: return false;
+    }
+}
+
 // Vertical fader-style bar -- (x0,y0) is the box's top-left corner, fills
 // from the BOTTOM up (unlike every other bar in this project, which fills
 // left-to-right -- see the Mixer design discussion this was built from
 // for why a vertical fader reads better for a per-channel level here).
-void Ui::DrawMixerVBar(int x0, int y0, int w, int h, float v01)
+void Ui::DrawMixerVBar(int x0, int y0, int w, int h, float v01, bool clip_lit)
 {
     int x1 = x0 + w - 1;
     int y1 = y0 + h - 1;
@@ -4644,15 +4670,26 @@ void Ui::DrawMixerVBar(int x0, int y0, int w, int h, float v01)
     int fill_h = (int)(Clampf(v01, 0.f, 1.f) * (float)(h - 2) + 0.5f);
     if(fill_h > 0)
         disp_->DrawRect(x0 + 1, y1 - fill_h, x1 - 1, y1 - 1, true, true);
+    // Clip-indicator latch, drawn as a filled cap right at the top of
+    // the bar's own outline rather than a separate element -- see
+    // DrawMixerVBar()'s own doc comment (ui.h) for why: this costs no
+    // extra screen space on either the cramped Overview grid or the
+    // Detail page. Drawn last so it's never hidden under the fill.
+    if(clip_lit)
+        disp_->DrawRect(x0 + 1, y0 + 1, x1 - 1, y0 + 2, true, true);
 }
 
 void Ui::DrawMixerOverviewGrid(int top_y)
 {
-    // All 8 names across in one row, same per-channel aesthetic as
-    // Screen::Mixer's own Detail page (name on top, a real vertical bar
-    // below whose own outline shows the full min/max range) -- just one
-    // bar per column instead of two, and no numeric readout (the bar
-    // itself is the readout here). No selection box here -- unlike
+    // All 8 names across in one row, name on top, a real vertical bar
+    // below -- but unlike Screen::Mixer's own Detail page, this bar
+    // shows live Peak level, not the Volume fader's own setting (see
+    // MixerGetLevel01()'s own comment): this grid is meant to answer
+    // "what's loud/clipping right now", and a fader-position readout
+    // would just duplicate what the Detail page's Vol bar already
+    // shows. The clip-indicator cap (same DrawMixerVBar() mechanism)
+    // makes this a real "did anything clip" glance too, not just a
+    // relative-loudness readout. No selection box here -- unlike
     // Screen::Mixer's own Detail page, there's no meaningful "currently
     // selected" channel on this at-a-glance summary; mixer_position_ is
     // just wherever Screen::Mixer was last left, not something being
@@ -4674,7 +4711,8 @@ void Ui::DrawMixerOverviewGrid(int top_y)
         int         nw   = TomThumbAdvanceWidth(name);
         TomThumbDrawText(disp_, center_x - nw / 2, top_y + 1, name, true);
 
-        DrawMixerVBar(center_x - kBarW / 2, kBarY0, kBarW, kBarH, MixerGetVolume01(ch));
+        DrawMixerVBar(center_x - kBarW / 2, kBarY0, kBarW, kBarH, MixerGetLevel01(ch),
+                       MixerIsClipping(ch));
     }
 }
 
@@ -5315,31 +5353,32 @@ void Ui::DrawMixerScreen()
         return;
     }
 
-    // A real channel -- whichever group of 4 it belongs to (0-3 = the
-    // loop layers, 4-7 = Grains/Dexed/Bypass/Master), with real Vol/
-    // Rev/Pan bars for each of those 4 at once.
+    // A real channel -- whichever group of 2 it belongs to (groups of 2,
+    // not 4, so each channel gets a real 3rd bar for Peak alongside its
+    // existing Vol/Rev pair -- see DrawMixerVBar()'s own doc comment for
+    // why Peak lives on this page instead of a separate one).
     bool is_master = mixer_position_ == kNumMixerChannels - 1;
     char title[24];
     snprintf(title, sizeof(title), "Mixer:%s", MixerChannelName(mixer_position_));
     disp_->SetCursor(0, 0);
     WriteUpper(title);
 
-    int       group_start = mixer_position_ < 4 ? 0 : 4;
-    const int kColW       = disp_->Width() / 4;
+    int       group_start = (mixer_position_ / 2) * 2;
+    const int kColW       = disp_->Width() / 2;
     // Centered between the header divider (y=9) and footer divider
-    // (kFooterDividerY=46) -- no per-bar "Vol"/"Rev" text any more (the
-    // footer already spells those out for the selected channel), so the
-    // freed-up room goes to real vertical centering instead of cramming
-    // everything against the top.
+    // (kFooterDividerY=46) -- no per-bar "Vol"/"Rev"/"Pk" text any more
+    // (the footer already spells those out for the selected channel),
+    // so the freed-up room goes to real vertical centering instead of
+    // cramming everything against the top.
     const int kBarW = 12, kBarGap = 2, kBarY0 = 20, kBarH = 18;
     const int kPanY = 39, kPanH = 4;
 
-    for(int col = 0; col < 4; col++)
+    for(int col = 0; col < 2; col++)
     {
         int  ch       = group_start + col;
         bool selected = ch == mixer_position_;
         int  col_x    = kColW * col;
-        int  bars_w   = kBarW * 2 + kBarGap;
+        int  bars_w   = kBarW * 3 + kBarGap * 2;
         int  bars_x0  = col_x + (kColW - bars_w) / 2;
 
         if(selected)
@@ -5356,6 +5395,12 @@ void Ui::DrawMixerScreen()
 
         DrawMixerVBar(bars_x0, kBarY0, kBarW, kBarH, vol01);
         DrawMixerVBar(bars_x0 + kBarW + kBarGap, kBarY0, kBarW, kBarH, second01);
+        // Peak -- live signal level, not a fader setting (see
+        // MixerGetLevel01()'s own comment); the clip-indicator latch
+        // lives on this bar specifically, not Vol/Rev, so it's always
+        // unambiguous which bar is "the meter."
+        DrawMixerVBar(bars_x0 + (kBarW + kBarGap) * 2, kBarY0, kBarW, kBarH,
+                       MixerGetLevel01(ch), MixerIsClipping(ch));
 
         if(MixerChannelHasPan(ch))
         {

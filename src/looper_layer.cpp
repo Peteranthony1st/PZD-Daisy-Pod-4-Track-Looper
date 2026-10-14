@@ -14,6 +14,14 @@ inline float Clampf(float v, float lo, float hi)
 constexpr float kPi = 3.14159265358979323846f;
 // kFilterMinHz/kFilterMaxHz now live in looper_layer.h (public), shared
 // with main.cpp's master-bus filter.
+
+// See LooperLayer::IsClipping()'s own comment -- same threshold/hold
+// convention main.cpp's own Grains/Dexed/Bypass/Master meters use (see
+// audio_engine.h), kept in sync by eye rather than shared, since they're
+// each reading a different signal (this one's raw buffer content,
+// pre-fader; main.cpp's are each engine's own post-mixer-gain output).
+constexpr float kClipThreshold   = 1.f;
+constexpr float kClipHoldSeconds = 0.5f;
 } // namespace
 
 void LooperLayer::Init(float*           buf_l,
@@ -70,6 +78,7 @@ void LooperLayer::Reset()
     target_len_        = 0;
     play_pos_          = 0.f;
     meter_             = 0.f;
+    clip_hold_         = 0.f;
     record_write_phase_  = 0.f;
     prev_input_sample_l_ = 0.f;
     prev_input_sample_r_ = 0.f;
@@ -84,6 +93,7 @@ void LooperLayer::Clear()
     record_len_ = 0;
     play_pos_   = 0.f;
     meter_      = 0.f;
+    clip_hold_  = 0.f;
     record_write_phase_  = 0.f;
     prev_input_sample_l_ = 0.f;
     prev_input_sample_r_ = 0.f;
@@ -541,6 +551,10 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             float sample_l = Clampf(mic_in * input_gain_, -1.5f, 1.5f);
             float sample_r = Clampf(guitar_in * input_gain_, -1.5f, 1.5f);
             meter_ = fabsf(sample_l) * 0.3f + meter_ * 0.7f;
+            if(fabsf(sample_l) >= kClipThreshold)
+                clip_hold_ = kClipHoldSeconds;
+            else if(clip_hold_ > 0.f)
+                clip_hold_ -= 1.f / sample_rate_;
 
             // Vari-speed-aware write: real input arrives 1-per-real-sample
             // regardless of project_speed, but target_len_ (native-space)
@@ -732,6 +746,10 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                 }
 
                 meter_ = fabsf(raw_l) * 0.3f + meter_ * 0.7f;
+                if(fabsf(raw_l) >= kClipThreshold)
+                    clip_hold_ = kClipHoldSeconds;
+                else if(clip_hold_ > 0.f)
+                    clip_hold_ -= 1.f / sample_rate_;
 
                 float cutoff = filter_cutoff_hz_;
 
@@ -807,6 +825,8 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             else
             {
                 meter_ *= 0.9f;
+                if(clip_hold_ > 0.f)
+                    clip_hold_ -= 1.f / sample_rate_;
             }
 
             // While frozen, the audible branch above already advanced

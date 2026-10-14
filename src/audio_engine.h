@@ -18,3 +18,23 @@
 // TempoClock::ResetPhase()) have been fully restored, so playback always
 // resumes with everything aligned to sample 0 at once.
 extern volatile bool g_audio_suspended;
+
+// Live level meters + clip-indicator latches for the 4 Mixer channels
+// that don't otherwise have anywhere to track this (the 4 loop layers
+// already have their own, see LooperLayer::GetLevel()/IsClipping()) --
+// Grains and Dexed read their own post-mixer-gain output (gran_l/
+// dexed_l, the same signal that feeds both the live mix and a
+// recording), Bypass reads its own post-gain/pre-pan monitor signal
+// (byp_mono), and Master reads the final out[] after everything
+// (volume, reverb, delay, filter, click) has been mixed in. All 4
+// updated once per sample in AudioCallback() (main.cpp), same one-pole
+// smoothing and clip-hold-latch convention as LooperLayer's own meter_/
+// clip_hold_ -- see Ui::MixerGetLevel01()/MixerIsClipping().
+extern float g_grains_level;
+extern float g_dexed_level;
+extern float g_bypass_level;
+extern float g_master_level;
+extern float g_grains_clip_hold;
+extern float g_dexed_clip_hold;
+extern float g_bypass_clip_hold;
+extern float g_master_clip_hold;

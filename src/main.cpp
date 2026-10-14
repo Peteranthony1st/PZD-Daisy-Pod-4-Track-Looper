@@ -143,6 +143,37 @@ DexedSynth dexed;
 // See audio_engine.h.
 volatile bool g_audio_suspended = false;
 
+// See audio_engine.h.
+float g_grains_level  = 0.f;
+float g_dexed_level   = 0.f;
+float g_bypass_level  = 0.f;
+float g_master_level  = 0.f;
+float g_grains_clip_hold = 0.f;
+float g_dexed_clip_hold  = 0.f;
+float g_bypass_clip_hold = 0.f;
+float g_master_clip_hold = 0.f;
+
+// Same threshold/hold convention as LooperLayer's own clip_hold_ (see
+// its doc comment) -- kept here rather than shared with it, since each
+// one is reading a different signal.
+constexpr float kMeterClipThreshold   = 1.f;
+constexpr float kMeterClipHoldSeconds = 0.5f;
+
+// One-pole level follower + clip-hold latch, shared shape for all 4 of
+// the meters above -- factored out since it's the same 5 lines x 4
+// channels otherwise. Inlined in practice (DSY_ITCM_TEXT callers, tiny
+// body), so this costs nothing over writing it out longhand each time.
+static inline void UpdateLevelMeter(float& level, float& clip_hold, float sample,
+                                      float sample_rate)
+{
+    float mag = fabsf(sample);
+    level      = mag * 0.3f + level * 0.7f;
+    if(mag >= kMeterClipThreshold)
+        clip_hold = kMeterClipHoldSeconds;
+    else if(clip_hold > 0.f)
+        clip_hold -= 1.f / sample_rate;
+}
+
 // Written only by ControlTimerCallback (a 1kHz TIM5 ISR, see below), read
 // only by the main loop, which diffs each against its own "last seen"
 // value to build a UiControlEvents delta every iteration (see ui.h's
@@ -324,6 +355,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // TempoClock::Process(), LooperLayer::Process(). Read here, before
     // the loops below, since both need it.
     const float project_speed = ui.GetProjectSpeed();
+    const float sample_rate   = hw.AudioSampleRate(); // see UpdateLevelMeter() call sites below
 
     // Skipped along with the loop layers below when Global:Looper is off
     // -- ResetPhase() (called once, right when it's switched off) already
@@ -370,12 +402,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         }
     }
 
-    // Same for Granular's own oscilloscope (GranularParamPage::Filter).
+    // Same for Granular's own oscilloscope (GranularParamPage::Filter),
+    // and Screen::Mixer's own Grains level/clip meter -- same signal
+    // either way, runs unconditionally so both correctly show silence
+    // while Grains is off (gran_l already zeroed above in that case).
     for(size_t i = 0; i < size; i++)
     {
         g_granular_scope_l[g_granular_scope_write_pos] = gran_l[i];
         g_granular_scope_write_pos
             = (g_granular_scope_write_pos + 1) % kGranularScopeSamples;
+        UpdateLevelMeter(g_grains_level, g_grains_clip_hold, gran_l[i], sample_rate);
     }
 
     // Skipped entirely when disabled from Global:Dexed -- same real
@@ -400,10 +436,12 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // Same for Dexed's own oscilloscope pages (see g_dexed_scope_l's own
     // comment above) -- captured after the enabled/disabled branch above
     // either way, so the scope just shows silence while Dexed's off.
+    // Also feeds Screen::Mixer's own Dexed level/clip meter, same signal.
     for(size_t i = 0; i < size; i++)
     {
         g_dexed_scope_l[g_dexed_scope_write_pos] = dexed_l[i];
         g_dexed_scope_write_pos = (g_dexed_scope_write_pos + 1) % kDexedScopeSamples;
+        UpdateLevelMeter(g_dexed_level, g_dexed_clip_hold, dexed_l[i], sample_rate);
     }
 
     // Grains' Direct Record capture -- see g_granular_capturing's own
@@ -615,6 +653,16 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             float byp_mono = (in[0][i] + in[1][i]) * bypass_gain * bypass_mix_volume;
             out[0][i] += byp_mono * bypass_pan_l;
             out[1][i] += byp_mono * bypass_pan_r;
+            UpdateLevelMeter(g_bypass_level, g_bypass_clip_hold, byp_mono, sample_rate);
+        }
+        else
+        {
+            // No live bypass signal at all while off -- decay the meter
+            // toward silence instead of leaving it holding a stale
+            // reading (same "else" idiom LooperLayer's own meter_ uses).
+            g_bypass_level *= 0.7f;
+            if(g_bypass_clip_hold > 0.f)
+                g_bypass_clip_hold -= 1.f / sample_rate;
         }
 
         // Master filter -- applied to the full mix (all layers, their
@@ -648,9 +696,11 @@ void AudioCallback(AudioHandle::InputBuffer  in,
 
         // Screen::Mixer's own oscilloscope -- the actual final signal,
         // captured last, same "write every block, wrap" pattern as
-        // g_pad_scope_l/g_granular_scope_l above.
+        // g_pad_scope_l/g_granular_scope_l above. Also feeds the Master
+        // channel's own level/clip meter on the same page.
         g_master_scope_l[g_master_scope_write_pos] = out[0][i];
         g_master_scope_write_pos = (g_master_scope_write_pos + 1) % kMasterScopeSamples;
+        UpdateLevelMeter(g_master_level, g_master_clip_hold, out[0][i], sample_rate);
     }
 
 }

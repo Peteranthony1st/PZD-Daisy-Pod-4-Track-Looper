@@ -741,9 +741,9 @@ class Ui
     void DrawMixerScreen();
     void DrawDexedScreen();
     // Screen::Mixer's own per-channel accessors -- channel index 0..3 is
-    // Layer 1..4, 4 is Grains, 5 is Bypass, 6 is Master.
+    // Layer 1..4, 4 is Grains, 5 is Dexed, 6 is Bypass, 7 is Master.
     // Kept as small indexed switches rather than a polymorphic interface
-    // since there are only 7 cases and they already read/write each
+    // since there are only 8 cases and they already read/write each
     // engine's own real getters/setters directly -- no new state of its
     // own, this is purely another view onto values that already exist.
     static constexpr int kNumMixerChannels = 8;
@@ -763,8 +763,25 @@ class Ui
     // control of its own; it now does (see DexedSynth::SetPan01()), so
     // this is just Master's own exception now.
     bool        MixerChannelHasPan(int ch) const;
-    // Small helper for the Detail page's vertical bars.
-    void DrawMixerVBar(int x0, int y0, int w, int h, float v01);
+    // Live level (0..1ish, not clamped -- see DrawMixerVBar's own clamp)
+    // for the Overview grid and the Detail page's own Peak bar -- ch 0-3
+    // read each layer's own LooperLayer::GetLevel(), 4-7 read the
+    // Grains/Dexed/Bypass/Master globals main.cpp maintains (see
+    // audio_engine.h). Unlike MixerGetVolume01() above, this is signal
+    // level, not a fader setting -- it moves on its own regardless of
+    // what any knob is set to.
+    float MixerGetLevel01(int ch) const;
+    // True while that channel's clip-indicator latch is active -- see
+    // LooperLayer::IsClipping()'s own comment for why this is a hold,
+    // not an instant flag.
+    bool  MixerIsClipping(int ch) const;
+    // Small helper for the Detail page's vertical bars and the Overview
+    // grid's own single-bar-per-channel version. clip_lit draws a
+    // filled cap at the very top of the bar's outline regardless of the
+    // current fill level -- the clip-indicator latch, drawn this way
+    // (rather than a separate element) so it costs no extra screen
+    // space on either page.
+    void DrawMixerVBar(int x0, int y0, int w, int h, float v01, bool clip_lit = false);
     // All 8 channels' names across one row, each with a real vertical
     // Volume bar (no numeric readout) -- GlobalPage::Mixer's at-a-glance
     // summary (see DrawGlobalScreen()). `top_y` is the name row's
