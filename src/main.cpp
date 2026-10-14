@@ -158,16 +158,30 @@ float g_master_clip_hold = 0.f;
 // one is reading a different signal.
 constexpr float kMeterClipThreshold   = 1.f;
 constexpr float kMeterClipHoldSeconds = 0.5f;
+// How long the level bar takes to fall from a peak back toward silence
+// -- real "peak meter" shape (instant attack, slow release), not a
+// symmetric one-pole follower. A symmetric filter decays to ~1% within
+// ~13 samples (~0.27ms @ 48kHz) either way, which is invisible on a
+// ~30Hz OLED redraw for anything that isn't a continuous tone --
+// exactly what made Grains' own bursty, gappy output (discrete grains
+// separated by silence, depending on Fill/Gap) look like it barely
+// moved even at a loud Mixer level: the bar had already decayed back to
+// nothing between grain onsets, long before the next redraw ever read
+// it. 300ms release is the same ballpark a real console VU meter uses.
+constexpr float kMeterReleaseSeconds = 0.3f;
 
-// One-pole level follower + clip-hold latch, shared shape for all 4 of
-// the meters above -- factored out since it's the same 5 lines x 4
+// Peak-hold level follower + clip-hold latch, shared shape for all 4 of
+// the meters above -- factored out since it's the same lines x 4
 // channels otherwise. Inlined in practice (DSY_ITCM_TEXT callers, tiny
 // body), so this costs nothing over writing it out longhand each time.
 static inline void UpdateLevelMeter(float& level, float& clip_hold, float sample,
                                       float sample_rate)
 {
     float mag = fabsf(sample);
-    level      = mag * 0.3f + level * 0.7f;
+    if(mag > level)
+        level = mag; // instant attack -- always show the true peak right away
+    else
+        level -= level * (1.f / (kMeterReleaseSeconds * sample_rate)); // slow release
     if(mag >= kMeterClipThreshold)
         clip_hold = kMeterClipHoldSeconds;
     else if(clip_hold > 0.f)
@@ -659,8 +673,9 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         {
             // No live bypass signal at all while off -- decay the meter
             // toward silence instead of leaving it holding a stale
-            // reading (same "else" idiom LooperLayer's own meter_ uses).
-            g_bypass_level *= 0.7f;
+            // reading, same release rate UpdateLevelMeter() uses (not a
+            // separate, much-faster ad hoc decay).
+            g_bypass_level -= g_bypass_level * (1.f / (kMeterReleaseSeconds * sample_rate));
             if(g_bypass_clip_hold > 0.f)
                 g_bypass_clip_hold -= 1.f / sample_rate;
         }

@@ -1739,9 +1739,9 @@ the UI before saving/recording, only fader *settings*. `MixerGetLevel01()`/
 channel:
 
 - **Layers 1-4** already had the plumbing — `LooperLayer::GetLevel()`
-  tracks a one-pole-smoothed `|sample|` continuously during both
-  Recording and Playback (pre-fader, the raw buffer content), just never
-  read by the UI before now.
+  tracks `|sample|` continuously during both Recording and Playback
+  (pre-fader, the raw buffer content), just never read by the UI before
+  now.
 - **Grains/Dexed/Bypass/Master** didn't exist before this: `main.cpp`
   now maintains one `UpdateLevelMeter()` call per channel, each reading
   that channel's own real signal at the point it's computed — `gran_l`/
@@ -1751,6 +1751,24 @@ channel:
   Master. See `audio_engine.h` for the 8 globals (4 levels + 4
   clip-holds) this needs, same cross-file-global convention
   `g_audio_suspended` already established.
+- **Instant attack, slow (300ms) release — not a symmetric one-pole
+  follower.** The first pass used the same `0.3*|x| + 0.7*prev` shape
+  `LooperLayer`'s own `meter_` already had, which seemed reasonable
+  since it's the established convention here — but that decays to ~1%
+  within ~13 samples (~0.27ms @ 48kHz) either direction, invisible on a
+  ~30Hz OLED redraw for anything that isn't a continuous tone. Grains'
+  own output is exactly that kind of bursty/gappy signal (discrete
+  grains separated by silence, depending on Fill/Gap) -- a real,
+  reported symptom ("even with high volume on Dexed and Grains, the
+  meters don't seem to display much") traced to the bar having already
+  decayed back to nothing between grain onsets, long before the next
+  redraw ever read it. Fixed everywhere (all 4 new meters AND
+  `LooperLayer`'s own `meter_`/`clip_hold_`, for consistency -- Layers
+  just didn't show the flaw as obviously, since loop playback is
+  usually continuous audio) with a real peak-meter shape instead:
+  `kMeterReleaseSeconds` (0.3s) is the same ballpark a hardware VU meter
+  uses, `level = max(level, |sample|)` on the way up (always shows the
+  true peak immediately) with an exponential release on the way down.
 - **Clip indicator is a hold, not an instant flag** — `kClipThreshold`
   (1.0, same meaning for every channel: "pushing past nominal
   full-scale," well under the loop-recording path's actual ±1.5 hard

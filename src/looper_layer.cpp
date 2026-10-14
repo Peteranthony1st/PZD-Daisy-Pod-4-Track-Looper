@@ -22,6 +22,13 @@ constexpr float kPi = 3.14159265358979323846f;
 // pre-fader; main.cpp's are each engine's own post-mixer-gain output).
 constexpr float kClipThreshold   = 1.f;
 constexpr float kClipHoldSeconds = 0.5f;
+// Peak-meter release time -- see main.cpp's own kMeterReleaseSeconds
+// comment for why this replaced the original symmetric one-pole follower
+// (0.3/0.7 per sample, same shape main.cpp's own meters briefly used):
+// it decayed to ~1% within ~0.27ms @ 48kHz, invisible on a ~30Hz OLED
+// redraw for anything bursty. Instant attack + this slow release is a
+// real peak meter instead.
+constexpr float kMeterReleaseSeconds = 0.3f;
 } // namespace
 
 void LooperLayer::Init(float*           buf_l,
@@ -550,8 +557,12 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             // quiet source.
             float sample_l = Clampf(mic_in * input_gain_, -1.5f, 1.5f);
             float sample_r = Clampf(guitar_in * input_gain_, -1.5f, 1.5f);
-            meter_ = fabsf(sample_l) * 0.3f + meter_ * 0.7f;
-            if(fabsf(sample_l) >= kClipThreshold)
+            float mag_l    = fabsf(sample_l);
+            if(mag_l > meter_)
+                meter_ = mag_l;
+            else
+                meter_ -= meter_ * (1.f / (kMeterReleaseSeconds * sample_rate_));
+            if(mag_l >= kClipThreshold)
                 clip_hold_ = kClipHoldSeconds;
             else if(clip_hold_ > 0.f)
                 clip_hold_ -= 1.f / sample_rate_;
@@ -745,8 +756,12 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
                     raw_r = buffer_r_[idx0] * (1.f - frac) + buffer_r_[idx1] * frac;
                 }
 
-                meter_ = fabsf(raw_l) * 0.3f + meter_ * 0.7f;
-                if(fabsf(raw_l) >= kClipThreshold)
+                float mag_raw_l = fabsf(raw_l);
+                if(mag_raw_l > meter_)
+                    meter_ = mag_raw_l;
+                else
+                    meter_ -= meter_ * (1.f / (kMeterReleaseSeconds * sample_rate_));
+                if(mag_raw_l >= kClipThreshold)
                     clip_hold_ = kClipHoldSeconds;
                 else if(clip_hold_ > 0.f)
                     clip_hold_ -= 1.f / sample_rate_;
@@ -824,7 +839,7 @@ void LooperLayer::Process(AudioHandle::InputBuffer  in,
             }
             else
             {
-                meter_ *= 0.9f;
+                meter_ -= meter_ * (1.f / (kMeterReleaseSeconds * sample_rate_));
                 if(clip_hold_ > 0.f)
                     clip_hold_ -= 1.f / sample_rate_;
             }
