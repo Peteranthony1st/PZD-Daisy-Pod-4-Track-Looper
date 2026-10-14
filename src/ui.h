@@ -1187,7 +1187,10 @@ class Ui
     // vs. DecayDiffusion+Damping) -- same idiom as global_fx_target_delay_
     // below. Global:Reverb Diffusion has no toggle (only 2 knobs left).
     bool global_reverb_tone_target_b_ = false;
-    float delay_time01_     = 0.3f; // shared delay bus's Time, see GetDelayTime01()
+    float delay_time01_     = 0.f; // shared delay bus's Time, see GetDelayTime01() -- also
+    // doubles as "delay bypassed" at this exact default (see main.cpp's
+    // own delay_bypassed), so a fresh boot doesn't pay delay's fixed
+    // per-sample cost until you actually turn the knob up.
     float delay_feedback01_ = 0.35f; // shared delay bus's Feedback, see GetDelayFeedback01()
     // -1 = Omni (default) -- see GetDexedMidiChannel()/GetGranularMidiChannel().
     int dexed_midi_channel_    = -1;

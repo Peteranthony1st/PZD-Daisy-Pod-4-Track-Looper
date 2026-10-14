@@ -120,6 +120,30 @@ class DexedSynth
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
+    // True for a hold period after the PRE-limiter signal (before
+    // tanhf(), see Process()) last crossed unity -- i.e. "the limiter
+    // is actually compressing hard right now," not just "the output is
+    // loud." A plain post-tanhf()/post-output_level_ clip check can
+    // never usefully fire here: tanhf() mathematically bounds its own
+    // output to (-1,1) no matter how hard the pre-limiter signal is
+    // driving it (tanhf(10.0) ~= 0.99999), and output_level_ scales
+    // that down further still -- so Screen::Mixer's own Dexed clip
+    // indicator needs this, not a generic level check on dexed_l/r.
+    bool IsLimiting() const { return pre_limiter_clip_hold_ > 0.f; }
+
+    // Live level for Screen::Mixer's own Peak bar -- same PRE-limiter
+    // tap point as IsLimiting() above, not dexed_l/r. Reading dexed_l/r
+    // directly looked permanently quiet even when genuinely driving the
+    // limiter hard: it's post-tanhf() (bounded to (-1,1) regardless of
+    // how hard the input is), post-output_level_ (often well under
+    // unity, see its own comment), AND post-pan (halved again at dead
+    // center) -- three separate attenuation stages stacked on top of
+    // each other between "the engine is working hard" and what that bar
+    // would have shown. This reads the signal before any of them, so a
+    // genuinely hot signal now visibly reaches the top of the bar
+    // instead of topping out around 20-40% of it.
+    float GetPreLimiterLevel01() const { return pre_limiter_level_; }
+
     // Same linear pan law every other engine here uses (panL = 1-v,
     // panR = v). Added after a real user report that live Dexed played
     // disproportionately loud next to a recorded-and-played-back loop
@@ -263,7 +287,7 @@ class DexedSynth
     static constexpr int kMaxVoices = 10;
 
   private:
-    void RenderQuantum(); // fills stage_i32_ with one fresh 64-sample msfa quantum
+    void RenderQuantum(); // fills stage_f_ with one fresh 64-sample msfa quantum
 
     // Real oldest-note-steal allocation -- see NoteOn()'s own doc
     // comment for the 3-tier shape (retrigger / free / steal).
@@ -363,6 +387,16 @@ class DexedSynth
     float output_level01_  = 0.8f;
     float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
 
+    // See IsLimiting()'s own comment. Checked against the PRE-tanhf()
+    // value in Process(), same threshold/hold-seconds convention as
+    // every other clip latch in this project (LooperLayer::clip_hold_,
+    // main.cpp's own Grains/Dexed/Bypass/Master meters) -- 1.0 matches
+    // this engine's own documented limiter behavior ("tanhf() ...
+    // only compresses hard once a peak actually approaches/exceeds
+    // unity", see Process()'s own comment on the limiter).
+    float pre_limiter_clip_hold_ = 0.f;
+    float pre_limiter_level_     = 0.f; // see GetPreLimiterLevel01()
+
     float pan01_      = 0.5f;
     float pan_l_gain_ = 0.5f; // 1-pan01_, control-rate cache
     float pan_r_gain_ = 0.5f; // pan01_
@@ -376,9 +410,32 @@ class DexedSynth
     // always produce exactly this many samples per call (hardcoded via
     // _N_ throughout fm_op_kernel.cpp/env.cpp, see msfa/synth.h).
     static constexpr int kMsfaBlock = 64;
-    int32_t stage_i32_[kMsfaBlock];
-    // Index of the next not-yet-drained sample in stage_i32_ -- starts
-    // at kMsfaBlock so the very first Process() call renders a fresh
+    // Each voice renders into this SAME scratch buffer in turn (reused,
+    // not per-voice state -- cleared fresh before every voice), then
+    // RenderQuantum() clamps and converts that one voice's own raw
+    // output before summing it into stage_f_ below. Reference
+    // implementation (positionhigh/MicroDexed-touch's Synth_Dexed,
+    // dexed.cpp's getSamples()) does the same thing: per-voice scratch
+    // buffer, per-voice saturate, sum in float -- NOT what this engine
+    // originally did (every voice's compute() call sharing one int32
+    // accumulator, meaning multiple voices added together in raw
+    // int32_t arithmetic with no clamp at all, before this fix). That
+    // mattered even for a single voice, not just chords: this engine's
+    // own FM math can transiently produce a raw value outside its
+    // nominal range (expected/normal -- it's exactly what the
+    // reference's own clamp exists to catch), and reading that back out
+    // further downstream can't distinguish a wrapped-but-still-valid-
+    // looking int32 from a real one, so the clamp has to happen here,
+    // right at the source, not later.
+    int32_t voice_scratch_[kMsfaBlock];
+    // The actual accumulator every voice's own clamped contribution
+    // sums into -- float, not int32_t, specifically so summing several
+    // voices can never itself overflow/wrap (floats saturate towards
+    // +-inf instead, and kHeadroomScale/the tanhf() limiter downstream
+    // already assume they might see a generously large value).
+    float stage_f_[kMsfaBlock];
+    // Index of the next not-yet-drained sample in stage_f_ -- starts at
+    // kMsfaBlock so the very first Process() call renders a fresh
     // quantum immediately rather than reading uninitialized data.
     int stage_pos_ = kMsfaBlock;
 };

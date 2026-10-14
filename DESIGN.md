@@ -653,6 +653,69 @@ Bypass off silences this contribution too, and recordings stay
 completely dry regardless of this setting (it only ever feeds the
 monitor-mix reverb tail, never the recording path).
 
+### Reverb/delay bypass-at-zero, and a live CPU meter
+
+Both the shared reverb and the shared delay run their full fixed
+per-sample cost **unconditionally**, regardless of input level or
+settings — confirmed directly: `DattorroReverb::SetDecay01()` only
+reassigns a feedback-gain coefficient, the actual `Process()` call runs
+the same fixed sequence of delay taps/allpass filters every time no
+matter what Decay/Size is set to. Same for the shared delay's cross-
+feedback read/write. Measured on hardware with a live CPU meter (see
+below): with every engine disabled and nothing feeding either bus,
+turning Reverb Size and Delay Time to 0% still cost ~36% average /
+41% peak of the audio ISR's own time budget — paying the full cost of
+both algorithms processing silence.
+
+`reverb_bypassed`/`delay_bypassed` in `AudioCallback()` now skip the
+real `Process()` call (and, for delay, the cross-feedback read/write)
+entirely once the respective knob reaches its own lowest reachable
+position, instead of running the algorithm on near-silent input.
+Confirmed real: that same "everything off" test dropped from
+36%/41% to 10%/12% once this actually worked. Known trade-off for
+delay specifically: dropping Time to 0 while a long Feedback tail is
+still ringing freezes that tail rather than fading it out, since
+nothing drives the delay line forward at all while bypassed — accepted
+deliberately, same spirit as Reverb Size losing its own initial
+diffusion "splash" at Decay 0 (inaudible there, since zero decay
+already kills any tail almost instantly). Delay's own startup default
+moved from 30% to 0% to match — a fresh boot no longer pays this cost
+until Delay is actually turned on.
+
+**A real pot almost never settles on an exact `0.0f`** at its physical
+end-stop — ADC noise, the pot's own tolerance, and `Ui::ApplyKnobs()`'s
+existing drift deadband all mean the real value can easily sit at
+e.g. `0.002` while still rounding to the "0%" the screen shows (that
+rounding is `(int)(v*100+0.5)`, which is 0 for any `v < 0.005`). The
+first version of this used a strict `<= 0.f` check, which — confirmed
+on hardware — almost never actually fired despite both knobs reading
+0% on screen: the bypass code was effectively dead on arrival. Both
+checks now use `< 0.005f` instead, matching the same rounding the
+display already does, so "reads 0% on screen" and "is actually
+bypassed" are guaranteed to agree.
+
+**Live CPU meter** (`Global:Mixer`'s own footer, previously empty on
+that page) made this whole investigation possible to verify rather
+than guess at: `daisy::CpuLoadMeter` (libDaisy, `util/CpuLoadMeter.h` —
+an existing utility built for exactly this, not something written from
+scratch) wraps `AudioCallback()` with `OnBlockStart()`/`OnBlockEnd()`,
+both at the very top of the function and right before *every* return
+path (the normal end and the `g_audio_suspended` early-return both
+need their own call, or the reading would freeze stale during a
+Load/Save). Two separate instances, not one: `GetAvgCpuLoad()`'s own
+smoothing should run forever uninterrupted, but the Peak reading needs
+its own periodic `Reset()` (every `kCpuPeakResetSeconds`, 10s) so a
+just-made change's new peak becomes visible again quickly instead of
+staying stuck on whatever the worst moment was several minutes ago —
+sharing one instance between both readings would reset the average
+too, since `CpuLoadMeter::Reset()` clears `avg_`/`min_`/`max_`
+together. Important caveat: this measures only `AudioCallback()`'s own
+time against its block budget — it does **not** include the 1kHz
+MIDI/encoder/button polling ISR, the OLED display refresh, or general
+main-loop UI work, all of which run on separate schedules this meter
+never touches. The number is real, just narrower in scope than "the
+whole chip's CPU."
+
 ### SDRAM-placed effects are explicitly zeroed before use
 
 `Phaser` (per-layer) and `DattorroReverb` (the shared bus, plus its
@@ -1243,6 +1306,108 @@ how far this ceiling can now push a signal into the limiter -- worth
 knowing before assuming a "no audible ADSR effect" report is a wiring
 bug rather than an Output Level setting.
 
+### FM voice summing and chord headroom
+
+A real, reported symptom ("Dexed sounds very gritty with reverb turned
+off" -- confirmed independent of reverb specifically, present even at
+low-but-nonzero reverb, so just something reverb's own diffuse energy
+had been masking) traced to two separate, stacked issues.
+
+**Every voice sharing one raw `int32_t` accumulator, with no clamp at
+all, was a real bug** -- not just a style choice. `RenderQuantum()`
+originally called every voice's `note.compute()` with the *same*
+shared `stage_i32_` buffer, meaning multiple voices added together in
+raw integer arithmetic with nothing stopping that from silently
+wrapping if any single voice's own FM math (feedback, resonant
+modulation -- normal, expected behavior for this engine, not a defect)
+transiently produced a value outside its nominal range. Confirmed by
+comparing against the reference implementation
+(`positionhigh/MicroDexed-touch`'s vendored `Synth_Dexed`, the exact
+same msfa-derived core files this project also vendors): its own
+`Dexed::getSamples()` renders each voice into its own private scratch
+buffer, clamps *that voice's own* output individually
+(`signed_saturate_rshift`), converts to float, and only then sums into
+the shared result -- specifically so one voice's transient overshoot
+can never corrupt another's contribution via integer wraparound before
+either is even added together. This project's own equivalent
+(`voice_scratch_`, `kVoiceClampQ24`, summed into a `float stage_f_`
+instead of a raw `int32_t` one) now does the same thing, in the same
+shape: a fresh scratch buffer per voice, clamped (64x nominal unity --
+real measured peaks top out around 1.74x for a single voice and 4.41x
+for a 3-note chord, so this is ~15x more headroom than the hottest
+real patch measured so far, comfortably clear of any legitimate signal
+while still well short of actual `int32_t` wraparound), converted, and
+summed in float space. Confirmed this half of the fix on hardware: the
+single-note grit went away immediately; chords still showed residual
+grit, which was the second, separate issue below.
+
+**Fixed headroom margin, not dynamic per-chord compensation** --
+`voice_headroom_scale_`/`kEnableVoiceHeadroomCompensation` (a
+`1/sqrt(N-held-notes)` equal-power pulldown) already existed in the
+code for exactly this, but stays permanently disabled: a real, measured
+artifact confirmed independently by the user's own recollection before
+even reading the code -- it keys off currently-*held* notes, not
+currently-*sounding* voices, so releasing one note of a chord makes
+the *other*, still-held notes audibly louder mid-release-tail, before
+the released note has actually finished ringing out. Fixing that
+properly would mean reworking what the compensation keys off entirely;
+instead `kHeadroomScale` (the fixed scale every voice's summed output
+is multiplied by, before the `tanhf()` safety limiter) was widened in
+two more steps this session -- `1/8.82` → `1/17.64` → `1/35.28`, each
+a plain doubling (~6dB) -- matching the reference implementation's own
+actual strategy once directly compared: a single fixed headroom
+margin, no per-chord dynamic scaling at all. Real trade-off, stated
+plainly rather than hidden: single notes got quieter too each step, not
+just chords, since a flat scale has no way to apply more headroom only
+when it's actually needed -- the Output Level knob (which sits *after*
+this scale and *before* the live/record split point, same as the scale
+itself) compensates for both live monitoring and whatever gets
+recorded into a layer equally, not just one or the other.
+
+**The Output Level knob was never part of the headroom picture at
+all, before or after any of this session's changes** -- a real,
+clarifying question the user raised directly ("is this what
+microdexed does?", "did we boost the Dexed signal somewhere?"). The
+pre-limiter clip/level checks (see *Peak level + clip indicator*
+above) read the signal *before* `output_level_` is ever applied, by
+design: "is the limiter compressing hard" is a property of the raw FM
+synthesis itself (chord size, patch feedback), not of how loud the
+channel's been mixed afterward. Turning that knob down makes an
+already-compressed result quieter; it was never capable of reducing
+how hard the limiter engages in the first place, on this firmware or
+on the reference implementation either -- confirmed by checking
+`PluginFx.cpp` (reference's own post-engine gain/filter stage): no
+polyphony-dependent gain there either, just a fixed multiplier, and no
+limiter on the summed signal at all.
+
+**Why does the reference implementation seem to handle this better,
+if the headroom math is now comparable?** Checked rather than
+guessed: `config.h` sets `MAX_NOTES 64` split across `NUM_DEXED` (2-4)
+engine instances, giving each instance 16-32 voices of polyphony --
+*more* per limiter than this project's single 10-voice engine, not
+fewer, ruling out "smaller chords per limiter" as the explanation.
+Comparing the actual scale factors instead: reference's own conversion
+chain (`audiobuf >> 4`, then `signed_saturate_rshift(x, 24, 9)`, then
+`/32768.0`) works out to an effective divisor of `~2^28` -- 16x more
+conservative than this project's original bare `kQ24Scale` (`1/2^24`,
+before any `kHeadroomScale` multiply) ever was. After this session's
+two doublings, this project's combined scale is now *more*
+conservative than reference's own fixed conversion, not less. The
+remaining, unverified-by-listening-alone difference is likely
+*character*, not margin: reference has no limiter on its summed
+output at all, relying purely on generous fixed headroom plus the
+per-voice hard clamp, so normal play likely never approaches it (rare
+hard clips at genuine extremes, if ever). This project's `tanhf()` is,
+deliberately, an *always-active* soft limiter that starts gently
+coloring the signal below the point it would actually hard-clip --
+smoother in principle, but potentially audible as a persistent texture
+even when technically safe, where reference would simply stay clean
+until a genuine rare extreme. Not a hardware difference either way --
+Teensy 4.1 (NXP i.MX RT1062) and the Daisy Seed (STM32H750) are both
+Cortex-M7 cores with a hardware FPU, same DSP class; Teensy's ~25%
+higher clock and its PSRAM-gated extra polyphony explain its own specs,
+not this specific behavior.
+
 ## Dexed advanced editor (Screen::DexedOperator)
 
 The per-operator FM editor referenced in *Dexed*'s own Presets section
@@ -1793,6 +1958,26 @@ channel:
   than cramming a tiny indicator into already-tight space. Rotating
   through channels works exactly as before (one channel at a time); only
   how many neighbors are visible around the selected one changed.
+- **Grains/Dexed's own bars switched to a PRE-limiter tap, not
+  `gran_l`/`dexed_l`** — a second real bug, found by ear: both bars
+  still looked permanently quiet even while genuinely driving each
+  engine hard ("the bars still hardly move up ... even with lots of
+  volume"). `gran_l`/`dexed_l` are the fully-finished per-channel
+  output -- post-`tanhf()` (mathematically bounded to (-1,1) no matter
+  how hard the input is driving it), post-`output_level_` (often well
+  under unity, see `GranularEngine`/`DexedSynth`'s own comments), AND
+  post-pan (halved again at dead center). Three attenuation stages
+  stacked between "the engine is working hard" and what that bar could
+  ever show. `GranularEngine::GetPreLimiterLevel01()`/
+  `DexedSynth::GetPreLimiterLevel01()` (and their `IsLimiting()` clip
+  counterparts, same root cause -- see *Dexed FM voice summing / chord
+  headroom* below) read the signal immediately before `tanhf()`
+  instead, inside each engine's own `Process()`. `Ui::MixerGetLevel01()`/
+  `MixerIsClipping()` read these two directly for channels 4/5 now;
+  Bypass/Master have no internal limiter of their own, so those two
+  keep the original post-chain check. The old `g_grains_level`/
+  `g_dexed_level` globals are still computed (the scope/meter loops
+  that feed them need to run either way) but no longer drawn.
 
 **Rotate picks the channel, not the page** — unlike every other
 Dexed/Granular-style screen, `Screen::Mixer` has no sub-pages of its own;

@@ -153,6 +153,19 @@ float g_dexed_clip_hold  = 0.f;
 float g_bypass_clip_hold = 0.f;
 float g_master_clip_hold = 0.f;
 
+// See audio_engine.h. daisy::CpuLoadMeter itself (libDaisy, pulled in
+// transitively via daisy_pod.h) does the real measurement -- two
+// separate instances rather than one, since GetAvgCpuLoad()'s own
+// smoothing should run forever uninterrupted, but the peak reading
+// needs its own periodic Reset() (see kCpuPeakResetSeconds below) and
+// Reset() clears a CpuLoadMeter's avg_ right along with its min_/max_,
+// so sharing one instance between both readings would reset the
+// average too.
+daisy::CpuLoadMeter g_cpu_meter_avg;
+daisy::CpuLoadMeter g_cpu_meter_peak;
+float               g_cpu_avg_load  = 0.f;
+float               g_cpu_peak_load = 0.f;
+
 // Same threshold/hold convention as LooperLayer's own clip_hold_ (see
 // its doc comment) -- kept here rather than shared with it, since each
 // one is reading a different signal.
@@ -186,6 +199,35 @@ static inline void UpdateLevelMeter(float& level, float& clip_hold, float sample
         clip_hold = kMeterClipHoldSeconds;
     else if(clip_hold > 0.f)
         clip_hold -= 1.f / sample_rate;
+}
+
+// How often the peak CPU reading rolls over -- short enough that
+// turning a knob/toggling a feature shows its own new peak within a
+// few seconds, rather than that number staying stuck at whatever the
+// worst moment was several minutes ago. GetAvgCpuLoad() is NOT reset on
+// this timer (see g_cpu_meter_avg/g_cpu_meter_peak's own comment for
+// why they're two separate instances) -- only the peak reading rolls.
+constexpr float kCpuPeakResetSeconds    = 10.f;
+float           g_cpu_peak_reset_countdown = kCpuPeakResetSeconds;
+
+// Call once at the very end of every AudioCallback() invocation --
+// both the normal path and the g_audio_suspended early-return path (see
+// their own call sites) -- so the reading stays live (correctly low)
+// even across a Load/Save rather than freezing at whatever it was right
+// before one started.
+static inline void FinishCpuMeterBlock(size_t size, float sample_rate)
+{
+    g_cpu_meter_avg.OnBlockEnd();
+    g_cpu_meter_peak.OnBlockEnd();
+    g_cpu_avg_load  = g_cpu_meter_avg.GetAvgCpuLoad();
+    g_cpu_peak_load = g_cpu_meter_peak.GetMaxCpuLoad();
+
+    g_cpu_peak_reset_countdown -= (float)size / sample_rate;
+    if(g_cpu_peak_reset_countdown <= 0.f)
+    {
+        g_cpu_meter_peak.Reset();
+        g_cpu_peak_reset_countdown = kCpuPeakResetSeconds;
+    }
 }
 
 // Written only by ControlTimerCallback (a 1kHz TIM5 ISR, see below), read
@@ -350,6 +392,10 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     static float dexed_l[256];
     static float dexed_r[256];
 
+    const float sample_rate = hw.AudioSampleRate(); // needed by both paths below
+    g_cpu_meter_avg.OnBlockStart();
+    g_cpu_meter_peak.OnBlockStart();
+
     if(g_audio_suspended)
     {
         for(size_t i = 0; i < size; i++)
@@ -357,6 +403,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
             out[0][i] = 0.f;
             out[1][i] = 0.f;
         }
+        FinishCpuMeterBlock(size, sample_rate);
         return;
     }
 
@@ -368,8 +415,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     // and the tempo clock's own tick rate -- see Ui::GetProjectSpeed(),
     // TempoClock::Process(), LooperLayer::Process(). Read here, before
     // the loops below, since both need it.
-    const float project_speed = ui.GetProjectSpeed();
-    const float sample_rate   = hw.AudioSampleRate(); // see UpdateLevelMeter() call sites below
+    const float project_speed = ui.GetProjectSpeed(); // sample_rate already read above
 
     // Skipped along with the loop layers below when Global:Looper is off
     // -- ResetPhase() (called once, right when it's switched off) already
@@ -600,6 +646,32 @@ void AudioCallback(AudioHandle::InputBuffer  in,
     fx_delay_r.SetDelay(delay_samples);
     float delay_feedback = ui.GetDelayFeedback01() * kMaxDelayFeedback;
 
+    // Both busses otherwise run their full fixed per-sample cost
+    // unconditionally regardless of input level or decay/feedback
+    // settings (confirmed on hardware: Reverb Size/Decay only scales a
+    // feedback coefficient, never changes how much work Process() does)
+    // -- a real, measured chunk of CPU even with every engine disabled
+    // and nothing feeding either bus. Size/Time at their own lowest
+    // reachable knob position now skips the real algorithm entirely
+    // instead of running it on near-silent input. Known trade-off for
+    // delay specifically: dropping Time to 0 while a long Feedback tail
+    // is still ringing freezes that tail rather than fading it out --
+    // accepted deliberately, same spirit as Reverb Size already losing
+    // its own initial diffusion "splash" at Decay 0 (inaudible there
+    // since zero decay already kills the tail almost immediately).
+    // A real pot (Ui::ApplyKnobs()'s raw_k1/raw_k2) almost never settles
+    // on an exact 0.0f at its physical end-stop -- ADC noise, the pot's
+    // own tolerance, and the existing drift deadband all mean the real
+    // value can easily sit at e.g. 0.002 while still rounding to the
+    // "0%" the screen shows (that rounding is `(int)(v*100+0.5)`, which
+    // is 0 for any v < 0.005). A strict `<= 0.f` check would almost
+    // never fire in practice, bypassing nothing despite the screen
+    // reading 0% -- matching that same display-rounding threshold here
+    // instead keeps "shows 0% on screen" and "is actually bypassed"
+    // perfectly in sync.
+    const bool reverb_bypassed = ui.GetReverbSize01() < 0.005f;
+    const bool delay_bypassed  = ui.GetDelayTime01() < 0.005f;
+
     for(size_t i = 0; i < size; i++)
     {
         // Bypass's own Send into the shared reverb bus -- independent of
@@ -620,22 +692,31 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         // Shared reverb: process the summed sends once per sample and
         // mix the wet result into out[] -- BEFORE bypass/master filter/
         // click, same position this used to be added in when it ran
-        // per-layer inside LooperLayer::Process() itself.
-        float rev_wet_l, rev_wet_r;
-        fx_reverb_shared.Process(reverb_send_l[i], reverb_send_r[i], &rev_wet_l, &rev_wet_r);
-        out[0][i] += rev_wet_l;
-        out[1][i] += rev_wet_r;
+        // per-layer inside LooperLayer::Process() itself. Skipped
+        // entirely at Size 0 -- see reverb_bypassed's own comment above.
+        if(!reverb_bypassed)
+        {
+            float rev_wet_l, rev_wet_r;
+            fx_reverb_shared.Process(reverb_send_l[i], reverb_send_r[i], &rev_wet_l,
+                                       &rev_wet_r);
+            out[0][i] += rev_wet_l;
+            out[1][i] += rev_wet_r;
+        }
 
         // Shared delay: read both lines BEFORE either Write() below, so
         // the cross-feedback (L's output feeds R's input and vice versa,
         // the "ping-pong" part) uses this sample's actual output, not a
-        // half-updated value from writing one channel first.
-        float delay_wet_l = fx_delay_l.Read();
-        float delay_wet_r = fx_delay_r.Read();
-        fx_delay_l.Write(delay_send_l[i] + delay_wet_r * delay_feedback);
-        fx_delay_r.Write(delay_send_r[i] + delay_wet_l * delay_feedback);
-        out[0][i] += delay_wet_l;
-        out[1][i] += delay_wet_r;
+        // half-updated value from writing one channel first. Skipped
+        // entirely at Time 0 -- see delay_bypassed's own comment above.
+        if(!delay_bypassed)
+        {
+            float delay_wet_l = fx_delay_l.Read();
+            float delay_wet_r = fx_delay_r.Read();
+            fx_delay_l.Write(delay_send_l[i] + delay_wet_r * delay_feedback);
+            fx_delay_r.Write(delay_send_r[i] + delay_wet_l * delay_feedback);
+            out[0][i] += delay_wet_l;
+            out[1][i] += delay_wet_r;
+        }
 
         if(byp)
         {
@@ -718,6 +799,7 @@ void AudioCallback(AudioHandle::InputBuffer  in,
         UpdateLevelMeter(g_master_level, g_master_clip_hold, out[0][i], sample_rate);
     }
 
+    FinishCpuMeterBlock(size, sample_rate);
 }
 
 // Linker-provided symbols from STM32H750IB_qspi_custom.lds -- .itcm_text
@@ -764,6 +846,14 @@ int main(void)
     hw.SetAudioBlockSize(48);
 
     tempo.Init(hw.AudioSampleRate());
+
+    // See audio_engine.h's own comment on g_cpu_avg_load/g_cpu_peak_load.
+    // Default 1Hz smoothing cutoff (CpuLoadMeter's own default) is fine
+    // for both -- the peak instance's own periodic Reset() (see
+    // kCpuPeakResetSeconds in AudioCallback()) is what actually keeps
+    // its reading current, not a faster smoothing filter.
+    g_cpu_meter_avg.Init(hw.AudioSampleRate(), 48);
+    g_cpu_meter_peak.Init(hw.AudioSampleRate(), 48);
 
     for(int i = 0; i < kNumLayers; i++)
         layers[i].Init(buffer_l[i], buffer_r[i], kBuffSize, hw.AudioSampleRate(),

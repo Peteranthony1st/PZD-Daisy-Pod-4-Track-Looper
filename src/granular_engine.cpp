@@ -13,6 +13,19 @@ inline float Clampf(float v, float lo, float hi)
 }
 constexpr float kPi = 3.14159265358979323846f;
 
+// See GranularEngine::IsLimiting()'s own comment. Same threshold/hold
+// shape as DexedSynth's own equivalent -- 1.0 matches tanhf()'s own
+// documented behavior (near-transparent below unity, compresses hard
+// once a peak approaches/crosses it), 0.5s hold so a one-sample peak
+// between two ~30Hz UI redraws still has a real chance of being seen.
+constexpr float kPreLimiterClipThreshold = 1.f;
+constexpr float kClipHoldSeconds         = 0.5f;
+// Same peak-meter release shape as main.cpp's own kMeterReleaseSeconds
+// -- instant attack, 300ms release, so GetPreLimiterLevel01() tracks a
+// visible peak instead of a symmetric follower that decays to nothing
+// in ~0.27ms @ 48kHz.
+constexpr float kMeterReleaseSeconds = 0.3f;
+
 // Distributes `hits` as evenly as possible across `steps` (the common
 // Bresenham-style approximation to a true Euclidean rhythm -- same
 // maximally-even result as the classic examples, e.g. EuclideanMask(8,3)
@@ -1003,6 +1016,21 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
 
         fl *= output_level_ * pan_l_gain_;
         fr *= output_level_ * pan_r_gain_;
+
+        // See IsLimiting()'s/GetPreLimiterLevel01()'s own comments --
+        // both read the PRE-limiter value specifically, since tanhf()
+        // below bounds its own output to (-1,1) no matter how hard
+        // this is driving it.
+        float pre_limiter_mag = fabsf(fl) > fabsf(fr) ? fabsf(fl) : fabsf(fr);
+        if(pre_limiter_mag > pre_limiter_level_)
+            pre_limiter_level_ = pre_limiter_mag;
+        else
+            pre_limiter_level_
+                -= pre_limiter_level_ * (1.f / (kMeterReleaseSeconds * sample_rate_));
+        if(pre_limiter_mag >= kPreLimiterClipThreshold)
+            pre_limiter_clip_hold_ = kClipHoldSeconds;
+        else if(pre_limiter_clip_hold_ > 0.f)
+            pre_limiter_clip_hold_ -= 1.f / sample_rate_;
 
         // Soft limiter -- output_level_'s own ceiling was raised well past
         // unity (see SetOutputLevel01()'s comment) specifically so the

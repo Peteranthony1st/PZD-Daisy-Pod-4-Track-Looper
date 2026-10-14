@@ -38,3 +38,14 @@ extern float g_grains_clip_hold;
 extern float g_dexed_clip_hold;
 extern float g_bypass_clip_hold;
 extern float g_master_clip_hold;
+
+// Live CPU load, for Global:Mixer's own readout -- see main.cpp's two
+// daisy::CpuLoadMeter instances (that class's own smoothed-average
+// reading feeds g_cpu_avg_load every block; g_cpu_peak_load is the
+// highest single block seen since its own meter's last Reset(), which
+// main.cpp calls on a rolling ~10s timer so a just-made change's new
+// peak becomes visible again quickly instead of staying stuck on
+// whatever the worst moment was several minutes ago). Both 0..1 (not a
+// percentage -- the UI multiplies by 100 for display).
+extern float g_cpu_avg_load;
+extern float g_cpu_peak_load;

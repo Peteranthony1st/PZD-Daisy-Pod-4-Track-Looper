@@ -48,12 +48,60 @@ namespace
 // the hottest real factory patches (confirmed on a real ROM1A patch
 // using max feedback=7 and near-unity output levels on every operator
 // -- fine alone, audibly compressing tanhf() once a second note
-// stacked on top). See voice_headroom_scale_ (dexed_synth.h) for the
-// per-block voice-count compensation layered on top of this fixed
-// scale to handle that case without turning down single-note loudness
-// on any patch.
+// stacked on top). voice_headroom_scale_ (dexed_synth.h) exists for a
+// per-block voice-count compensation on top of this fixed scale, but
+// it's gated off (kEnableVoiceHeadroomCompensation) -- a real, measured
+// artifact: it keys off currently-HELD notes, not currently-SOUNDING
+// voices, so releasing one note of a chord makes the others audibly
+// louder mid-release-tail, before the released note has actually
+// finished sounding. So this fixed scale is doubled again here instead
+// -- matching the reference implementation's own approach (positionhigh/
+// MicroDexed-touch's Synth_Dexed: a single fixed headroom margin, no
+// per-chord dynamic compensation at all) rather than trying to fix the
+// compensation path's own release-tail bug. Trade-off: single notes
+// are now quieter too, not just chords, since this is a flat scale with
+// no way to apply more headroom only when it's actually needed --
+// compensate with the Output Level knob if needed (it sits after this
+// scale and before the live/record split point, same as this scale
+// itself -- so it compensates BOTH live monitoring and what gets
+// recorded into a layer equally, not just one or the other).
+// Doubled again (1/17.64 -> 1/35.28) after a real chord still clipping
+// at Output Level 50% -- confirmed that knob sits entirely after this
+// point and after the limiter, so it could never have reduced how hard
+// the limiter was compressing in the first place; only this constant
+// actually does that.
 constexpr float kQ24Scale      = 1.f / (float)(1 << 24);
-constexpr float kHeadroomScale = 1.f / 8.82f;
+constexpr float kHeadroomScale = 1.f / 35.28f;
+
+// Per-voice safety clamp, applied in RenderQuantum() to each voice's own
+// RAW (pre-kQ24Scale) int32 output before it's summed into the shared
+// float accumulator -- see voice_scratch_'s own comment in
+// dexed_synth.h for why this needs to happen per-voice, at the source,
+// not later on the already-summed result. 64x the nominal (1<<24)
+// unity scale: real measured peaks top out around 1.74x for a single
+// voice and 4.41x for a 3-note chord (see kHeadroomScale's own comment
+// above), so this is ~15x more headroom than the hottest real patch
+// measured so far ever reached -- comfortably clear of any legitimate
+// signal, while still well short of actual int32_t wraparound (~2^31,
+// i.e. ~128x this same nominal scale), which is the specific failure
+// mode this exists to prevent.
+constexpr int32_t kVoiceClampQ24 = (int32_t)1 << 30;
+
+// See DexedSynth::IsLimiting()'s own comment. 1.0 matches this engine's
+// own documented limiter behavior -- tanhf() only compresses hard once
+// a peak actually approaches/exceeds unity, so that's the meaningful
+// threshold for "the limiter is doing real work," not some fraction of
+// the bounded post-tanhf() output. 0.5s hold, same convention as every
+// other clip latch in this project (LooperLayer::clip_hold_, main.cpp's
+// own meters) -- long enough that a one-sample peak between two ~30Hz
+// UI redraws still has a real chance of being seen.
+constexpr float kPreLimiterClipThreshold = 1.f;
+constexpr float kClipHoldSeconds         = 0.5f;
+// Same peak-meter release shape as main.cpp's own kMeterReleaseSeconds
+// (see its own comment there) -- instant attack, 300ms release, so
+// GetPreLimiterLevel01() actually tracks a visible peak instead of a
+// symmetric follower that decays back to nothing in ~0.27ms @ 48kHz.
+constexpr float kMeterReleaseSeconds = 0.3f;
 
 // Temporarily false for an A/B listening test against the original
 // "classic DX7" behavior (notes stacking up saturates the final
@@ -268,7 +316,7 @@ void DexedSynth::NoteOff(uint8_t note)
 DSY_ITCM_TEXT
 void DexedSynth::RenderQuantum()
 {
-    std::memset(stage_i32_, 0, sizeof(stage_i32_));
+    std::memset(stage_f_, 0, sizeof(stage_f_));
 
     ctrls_.refresh();
     int32_t lfo_val   = lfo_.getsample();
@@ -279,12 +327,31 @@ void DexedSynth::RenderQuantum()
     // pre-init()'d, never garbage) and already cheap for a silent one
     // (msfa's own internal gain threshold collapses its real per-sample
     // cost, no bookkeeping needed here to get that).
+    //
+    // Each voice renders into its own freshly-zeroed voice_scratch_,
+    // gets clamped (kVoiceClampQ24) and converted to float, THEN summed
+    // into stage_f_ -- see voice_scratch_'s own doc comment in
+    // dexed_synth.h for why every voice previously sharing one raw
+    // int32_t accumulator (no clamp at all) was a real bug, not just a
+    // style choice, and matches how the reference implementation
+    // (positionhigh/MicroDexed-touch's Synth_Dexed) does this same step.
     int held = 0;
     for(int i = 0; i < kMaxVoices; i++)
     {
-        voices_[i].note.compute(stage_i32_, lfo_val, lfo_delay, &ctrls_);
+        std::memset(voice_scratch_, 0, sizeof(voice_scratch_));
+        voices_[i].note.compute(voice_scratch_, lfo_val, lfo_delay, &ctrls_);
         if(voices_[i].held_note != -1)
             held++;
+
+        for(int j = 0; j < kMsfaBlock; j++)
+        {
+            int32_t raw = voice_scratch_[j];
+            if(raw > kVoiceClampQ24)
+                raw = kVoiceClampQ24;
+            else if(raw < -kVoiceClampQ24)
+                raw = -kVoiceClampQ24;
+            stage_f_[j] += (float)raw * kQ24Scale;
+        }
     }
 
     // See voice_headroom_target_'s own comment -- a held note is
@@ -353,8 +420,10 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
                 voice_headroom_scale_ = voice_headroom_target_;
         }
 
-        float s = (float)stage_i32_[stage_pos_] * kQ24Scale * kHeadroomScale
-                  * voice_headroom_scale_;
+        // kQ24Scale is already applied per-voice in RenderQuantum() now
+        // (see stage_f_'s own comment in dexed_synth.h) -- stage_f_ here
+        // is the already-summed, already-scaled mix of every voice.
+        float s = stage_f_[stage_pos_] * kHeadroomScale * voice_headroom_scale_;
         stage_pos_++;
 
         // Post-mix bus filter, same shape/position as GranularEngine's
@@ -380,6 +449,22 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
                 default: break;
             }
         }
+
+        // See IsLimiting()'s/GetPreLimiterLevel01()'s own comments --
+        // both read the PRE-limiter value specifically, since tanhf()
+        // below bounds its own output to (-1,1) no matter how hard
+        // this is driving it, so either check on the result could
+        // never usefully fire. Same instant-attack/slow-release peak
+        // shape main.cpp's own meters use (see UpdateLevelMeter()).
+        float pre_mag = fabsf(s);
+        if(pre_mag > pre_limiter_level_)
+            pre_limiter_level_ = pre_mag;
+        else
+            pre_limiter_level_ -= pre_limiter_level_ * (1.f / (kMeterReleaseSeconds * sample_rate_));
+        if(pre_mag >= kPreLimiterClipThreshold)
+            pre_limiter_clip_hold_ = kClipHoldSeconds;
+        else if(pre_limiter_clip_hold_ > 0.f)
+            pre_limiter_clip_hold_ -= 1.f / sample_rate_;
 
         // Soft limiter, on top of kHeadroomScale's own real-measured
         // correction above -- catches genuinely rare peaks beyond what

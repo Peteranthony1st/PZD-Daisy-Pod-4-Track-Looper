@@ -94,7 +94,11 @@ The name, general concept, and file organization are based on
   the one knob everything already used; two more pages,
   `Global:RevTone` (PreDelay, PreFilter, DecayDiffusion, Damping) and
   `Global:RevDiff` (Input Diffusion 1+2), dial in the rest — from a
-  tight classic plate to a long, smeared, cloud-like wash
+  tight classic plate to a long, smeared, cloud-like wash. Turning Size
+  all the way down to 0% now fully switches the reverb off (and the
+  shared delay bus the same way, at its own Time knob's 0%) instead of
+  just running it on silence — a real, measured CPU cost with
+  everything else disabled, now avoidable when you're not using either
 - Bypass: hear your live input mixed into the output before you've even
   recorded anything
 - Startup defaults — save your usual BPM/Bars/Volume/Metro/Filter/Reverb
@@ -275,7 +279,13 @@ real-time Peak meter alongside its Vol/Rev bars, with a clip indicator
 past nominal full-scale — useful for checking levels before you record,
 since there's no other level feedback anywhere else in the UI. Rotate
 the encoder to step through each channel in turn; `Global:Mixer` itself
-shows an at-a-glance overview grid of all 8 channels' live Peak levels.
+shows an at-a-glance overview grid of all 8 channels' live Peak levels,
+plus a live CPU meter in its own footer (smoothed average and a peak
+reading that quietly rolls over every ~10 seconds, so changing a
+setting shows its own fresh peak again quickly instead of staying
+pinned to an old worst-case) — measures the audio engine's own time
+budget specifically, not the whole system (display/MIDI/UI overhead
+isn't included).
 
 **SD card management** — `Global:SdMgmt` lets you browse either of 2
 save categories (Performances/Grains Presets — Dexed Presets aren't

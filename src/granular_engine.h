@@ -281,6 +281,30 @@ class GranularEngine
     void  SetOutputLevel01(float v01);
     float GetOutputLevel01() const { return output_level01_; }
 
+    // True for a hold period after the PRE-limiter signal (before
+    // tanhf(), see Process()) last crossed unity -- "the limiter is
+    // actually compressing hard right now," not just "the output is
+    // loud." Same reasoning as DexedSynth::IsLimiting(): tanhf()
+    // mathematically bounds its own output to (-1,1) regardless of how
+    // hard the pre-limiter signal is driving it, so a clip check on the
+    // result could never usefully fire -- this engine's own
+    // output_level_ in particular can reach up to 12x (see
+    // SetOutputLevel01()), so the gap between "driving the limiter
+    // hard" and "the bounded output looks loud" is even bigger here
+    // than for Dexed.
+    bool IsLimiting() const { return pre_limiter_clip_hold_ > 0.f; }
+
+    // Live level for Screen::Mixer's own Peak bar -- same PRE-limiter
+    // tap point as IsLimiting() above, not the post-chain output this
+    // engine hands back to main.cpp. That signal looked permanently
+    // quiet even when genuinely driving the limiter hard: it's post-
+    // tanhf() (bounded to (-1,1) regardless of input), post-output_level_
+    // (which can reach up to 12x but is often well under unity), AND
+    // post-pan (halved again at dead center). This reads before any of
+    // that, so a genuinely hot signal now visibly reaches the top of
+    // the bar.
+    float GetPreLimiterLevel01() const { return pre_limiter_level_; }
+
     // --- Reverb send -- was previously an unconditional full send (no
     // control at all); now a real continuous knob, reachable from both
     // this engine's own Mix page and Global:Mixer -- same underlying
@@ -576,6 +600,12 @@ class GranularEngine
     float scan_volume01_   = 0.5f;
     float output_level01_  = 0.8f;
     float output_level_    = 1.f; // powf(output_level01_, 2.5f)*1.4f, cached by the setter
+    // See IsLimiting()'s own comment. Checked against the PRE-tanhf()
+    // value in Process(), same threshold/hold-seconds convention as
+    // DexedSynth's own equivalent (and every other clip latch in this
+    // project).
+    float pre_limiter_clip_hold_ = 0.f;
+    float pre_limiter_level_     = 0.f; // see GetPreLimiterLevel01()
     float reverb_send01_   = 0.f; // was an unconditional full send before this existed
     float delay_send01_    = 0.f;
 

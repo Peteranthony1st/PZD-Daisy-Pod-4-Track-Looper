@@ -3347,7 +3347,20 @@ void Ui::DrawGlobalScreen()
             TomThumbDrawText(disp_, (disp_->Width() - hw) / 2, 44, hint, true);
         }
 
-        DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+        // Live CPU load -- both footer rows were otherwise empty on this
+        // page (no knobs/buttons of their own), so this costs no extra
+        // screen space. Avg is a continuously-smoothed reading (see
+        // daisy::CpuLoadMeter's own 1-pole filter); Peak rolls over
+        // every ~10s (see main.cpp's kCpuPeakResetSeconds) so it reads
+        // fresh again shortly after you change something, rather than
+        // staying stuck on the worst moment from several minutes ago.
+        {
+            char avg_val[8], peak_val[8];
+            snprintf(avg_val, sizeof(avg_val), "%d%%", (int)(g_cpu_avg_load * 100.f + 0.5f));
+            snprintf(peak_val, sizeof(peak_val), "%d%%", (int)(g_cpu_peak_load * 100.f + 0.5f));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "CPU", avg_val, peak_val,
+                             "Peak");
+        }
         DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
         return;
     }
@@ -4637,8 +4650,16 @@ float Ui::MixerGetLevel01(int ch) const
     switch(ch)
     {
         case 0: case 1: case 2: case 3: return layers_[ch].GetLevel();
-        case 4: return g_grains_level;
-        case 5: return g_dexed_level;
+        // Grains/Dexed read their own PRE-limiter level now (same
+        // reasoning as MixerIsClipping()'s own comment) -- the
+        // post-chain g_grains_level/g_dexed_level globals are still
+        // computed (main.cpp's scope/meter loops need to run either
+        // way) but no longer drawn, since they looked permanently
+        // quiet: post-tanhf(), post-output_level_, and post-pan all
+        // stacked on top of each other between "the engine is working
+        // hard" and what that bar would have shown.
+        case 4: return granular_ ? granular_->GetPreLimiterLevel01() : 0.f;
+        case 5: return dexed_ ? dexed_->GetPreLimiterLevel01() : 0.f;
         case 6: return g_bypass_level;
         case 7: return g_master_level;
         default: return 0.f;
@@ -4650,8 +4671,17 @@ bool Ui::MixerIsClipping(int ch) const
     switch(ch)
     {
         case 0: case 1: case 2: case 3: return layers_[ch].IsClipping();
-        case 4: return g_grains_clip_hold > 0.f;
-        case 5: return g_dexed_clip_hold > 0.f;
+        // Grains/Dexed each own their own PRE-limiter clip check now
+        // (IsLimiting()) instead of the post-chain g_grains_clip_hold/
+        // g_dexed_clip_hold globals -- see those methods' own comments
+        // for why a post-tanhf() check could never usefully fire here:
+        // tanhf() bounds its output to (-1,1) no matter how hard it's
+        // being driven, so the only way to detect "the limiter is
+        // actually compressing hard" is to check before it, inside the
+        // engine itself. Bypass/Master have no such internal limiter,
+        // so those two keep using the plain post-chain check.
+        case 4: return granular_ && granular_->IsLimiting();
+        case 5: return dexed_ && dexed_->IsLimiting();
         case 6: return g_bypass_clip_hold > 0.f;
         case 7: return g_master_clip_hold > 0.f;
         default: return false;
