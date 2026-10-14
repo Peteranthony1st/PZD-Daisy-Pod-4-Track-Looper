@@ -170,10 +170,14 @@ Full control map:
 | Dexed: MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Dexed: Advanced | — | — | — | — (push encoder to enter Screen::DexedOperator) |
 | Dexed: Preset | Top: Files/Import/Load New. Files → group (Roms/Dexed/Imports/User) → folder list (not User) → presets | — | Save / Select (top+group) / Back (group+folder levels) | Open (group+folder levels) / Hold: Import (Import list) / Tap: preview, Hold 800ms: confirm (a real preset) |
+| DexedOperator: Algo | — (read-only; edit from Dexed:Algo instead) | — | Cycle operator (1-6) | — |
 | DexedOperator: RatioLevel | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
 | DexedOperator: Detune | Detune (0-14, 7=centered) | — | Cycle operator (1-6) | — |
 | DexedOperator: EgRate | Attack (or Sustain) | Decay (or Release) | Cycle operator (1-6) | Toggle AD/SR |
 | DexedOperator: EgLevel | Attack Level (or Sustain Level) | Decay Level (or Release Level) | Cycle operator (1-6) | Toggle AD/SR |
+| DexedOperator: AmpModSens | Amp/EG mod wheel sensitivity (0-3) | — | Cycle operator (1-6) | — |
+| DexedOperator: VelocitySens | Key velocity sensitivity (0-7) | — | Cycle operator (1-6) | — |
+| DexedOperator: KeybRateScale | Keyboard rate scaling (0-7) | — | Cycle operator (1-6) | — |
 | Granular: Grain | Size (or Grain's own Gap) | Fill (or Jitter) | Knobs → Size+Fill | Knobs → Gap+Jitter |
 | Granular: Position | Position (Grain layer's fixed anchor) | Direction (Grain's own, Forward/Reverse/Random) | Cycle Rhythm pattern | Cycle Speed |
 | Granular: Scan | Scan speed/direction (dead-zone-centered, off at center) | Scan's own Fill | Toggle Bounce/Wrap | Cycle Scan's own Direction |
@@ -185,7 +189,7 @@ Full control map:
 | Granular: GR-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
 | Granular: MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Granular: Capture | — (Import mode: browse .wav files) | — | Cycle source: Direct Record → Layer 1..N → Import | Hold = record (Direct) or capture/import (Layer/Import) |
-| Granular: Trim | Trim start | Trim end | — | — |
+| Granular: Trim | Trim start | Trim end | Play trimmed section | — |
 | Granular: Preset | Same Files/New chooser and browse-list convention as Global:File | — | Same Save/Load/Back convention as Global:File | Same hold-to-confirm convention as Global:File (live progress bar — audio-inclusive) |
 | Mixer: Layer/Grains/Dexed/Bypass | Volume | Pan | Knobs → Volume+Pan | Knobs → Reverb send |
 | Mixer: Master | Volume | Reverb size | — | — |
@@ -1262,15 +1266,46 @@ the existing "long-press from anywhere goes Home" handling in
 **Operator select, pages, and the v1 core scope**: Button 1 cycles
 through the 6 operators (shown as the real HW op number, `6 -
 dexed_op_index_`, matching the Algo diagram's own convention) --
-encoder rotate stays reserved for `DexedOpParamPage` navigation
-(RatioLevel, Detune, EgRate, EgLevel), matching every other screen's
-own "rotate cycles pages" rule. This is the "Core set for v1" scope
-chosen earlier in this project's own planning: Ratio (coarse only --
-fine is left at whatever the loaded preset stored, not exposed),
+encoder rotate stays reserved for `DexedOpParamPage` navigation (Algo,
+RatioLevel, Detune, EgRate, EgLevel, AmpModSens, VelocitySens,
+KeybRateScale), matching every other screen's own "rotate cycles
+pages" rule. RatioLevel/Detune/EgRate/EgLevel are the "Core set for v1"
+scope chosen earlier in this project's own planning: Ratio (coarse only
+-- fine is left at whatever the loaded preset stored, not exposed),
 Output Level, Detune, and the 4 EG Rates + 4 EG Levels via the existing
 AD/SR Button-toggle idiom every ADSR-shaped page in this codebase
-already uses. Keyboard scaling, velocity sensitivity, and amp-mod
-sensitivity remain deliberately deferred.
+already uses. The other three were added in later increments, each
+prompted by a real gap found through actual use rather than planned
+upfront: **AmpModSens** (`patch[off+14] & 3`) after a user report that
+the mod wheel's Amp/EG Bias targets had no audible effect, traced to
+this byte never being exposed anywhere (see `DexedSynth::
+ModWheelTarget`'s own comment); **VelocitySens** (`patch[off+15]`,
+read directly/unmasked by msfa's own `ScaleVelocity()`) and
+**KeybRateScale** (`patch[off+13]`, read directly/unmasked by `ScaleRate()`)
+after a user report that a low-velocity note sounded unexpectedly loud,
+traced to this specific patch's own velocity sensitivity being 0 -- a
+real, legitimate per-patch sound-design choice (some patches, e.g.
+pads/organs, intentionally don't respond to velocity at all), just one
+with no on-device way to see or change until now. Keyboard *level*
+scaling (breakpoint + left/right depth + curve, a 5-byte block) is a
+separate, larger feature and remains deliberately deferred.
+
+**Algo was added as this screen's own first page** (`DexedOpParamPage::
+Algo`), after a direct request to be able to see the routing/carrier
+diagram while browsing per-operator pages, without leaving back to
+`Screen::Dexed` for it. Read-only here specifically -- Button1 is
+already committed to operator-select duty on every page in this
+screen, so there's no button left free to cycle the algorithm the way
+`Screen::Dexed`'s own Algo page lets Button1/Button2 do; editing it
+stays there. Both pages read and draw the exact same single patch byte
+(`patch[134]`) through one shared `Ui::DrawAlgorithmDiagram(int algo0)`
+-- extracted from `DexedParamPage::Algo`'s own previously-inline body
+specifically so this screen could reuse it verbatim, not a second
+implementation to keep in sync. There is only ever one value to begin
+with, so "staying in sync" isn't something either page has to do --
+changing the algorithm from `Screen::Dexed` is immediately reflected
+here the next time this page draws, same as any other read of the same
+byte.
 
 **EgRate/EgLevel's AD/SR toggle is Button2-only, not Button1+Button2**:
 unlike Granular's own ADSR page (which uses Button1 to explicitly
@@ -1607,6 +1642,18 @@ truncated, not refused):
   captured — the underlying buffer is untouched, only the sub-range
   passed to `SetSource()` changes, so re-trimming always works from the
   original full capture, not whatever the previous trim left behind.
+  **Button1 plays the trimmed section directly** (`GranularEngine::
+  PlayTrimPreview()`), added after a direct request for a quick way to
+  actually hear it rather than inferring the result from the waveform
+  markers or playing a MIDI note through the grain engine. A straight,
+  one-shot linear read of `src_l_`/`src_r_`/`src_len_` — i.e. exactly
+  whatever `SetTrimRange()` currently has selected, live, nothing extra
+  to keep in sync — mixed in after Grain/Scan's own `env`/volume stage
+  (so it plays regardless of whether a note happens to be held) but
+  before the shared clamp/filter/pan/output-level chain (so it sounds
+  like it would if actually played, not a bypassed raw preview). Tapping
+  again always restarts from the beginning, same "tap to retrigger"
+  convention the preset browser's own live preview already uses.
 
 **Filter/Mix/Reverb send/Pan/Output level**: one bus-level `Svf` pair
 (same shape Dexed's own post-mix filter follows, see above), independent
@@ -1642,15 +1689,22 @@ parameters into ONE combined file per slot (`GRNP/PRESnnn.DAT`, up to 99
 slots — no factory range, there's no hand-tuned-capture equivalent to a
 hand-tuned patch), so this can take real SD-transfer time (up to ~1.9MB
 of audio) and shows a live progress bar during the save/load, unlike
-Dexed Presets' instant tiny-struct transfer. Output Level and Reverb Send are
-deliberately excluded from the saved struct (same reasoning as Pan) —
-session-level mixer settings, not part of the captured sound's own
-identity. `kGranularPresetFileVersion` has been bumped three times as
-the Scan/Rhythm work above changed the struct's layout (currently 3) —
-each bump means presets saved under an older version fail their
+Dexed Presets' instant tiny-struct transfer. Output Level, Pan, and
+Delay Send are deliberately excluded from the saved struct — session-
+level mixer settings, not part of the captured sound's own identity.
+Reverb Send used to be in that same excluded group but was pulled back
+out of it (see `GranularEngine::SetReverbSend01()`'s own comment) after
+a direct request to match how `DexedPresetData` already saves its own
+`reverb_send01` — this engine's one deliberate exception to its own
+"mixer settings aren't part of the sound" rule, not an oversight.
+`kGranularPresetFileVersion` has been bumped repeatedly as the struct's
+layout changed (currently 10, most recently for `reverb_send01` above)
+— each bump means presets saved under an older version fail their
 magic/version check on load (a clean, reported failure) instead of
-being read as garbage, so nothing from before this session's Scan
-redesign will load without being re-saved.
+being read as garbage, so nothing saved before the most recent bump
+loads without being re-saved. Unlike Performance files, this format has
+never carried a backward-compatible version chain across any of these
+bumps.
 
 **A known aliasing artifact with Map to Note**: playing notes well above
 or below the held note that a grain's Tune was set at can sound
@@ -1837,6 +1891,25 @@ that call site was left untouched by the 12 → 13 bump. Dexed Presets
 (`GRNP/PRESnnn.DAT`, audio-inclusive — see *Grains* above) are each their
 own separate on-disk format with their own independent numbering, not
 part of a performance file's own version tag.
+
+### Audio suspended during save
+
+Every SD write that can run long (`TriggerSave()`, `TriggerSaveGranularPreset()`,
+`TriggerSaveDexedPreset()`) sets `g_audio_suspended = true` for the
+duration, same as `TriggerLoad()`/`TriggerExport()` already did — while
+set, `AudioCallback()` skips every layer/Dexed/Grains/reverb/delay/filter
+and just outputs silence. This was added after a real hardware bug:
+saves (Performance and Grains Preset both) intermittently failed with
+`Fail:close9` (FatFs `FR_INVALID_OBJECT`, the file handle itself turning
+up invalid right at the final `f_close()`, after every actual write had
+already succeeded). Several other causes were suspected and ruled out
+first — a Grains preset struct change, SD filesystem corruption, card
+hot-swap — before tracing it to the audio ISR running at full cost,
+unsuspended, for the entire write, contending with the SD card's own
+SDMMC DMA transfer. Load/Export already avoided this for correctness
+reasons (consistent layer/tempo state while restoring); Save needed the
+same guard purely to stop it from racing the DMA, since Save only reads
+layer state and never mutates it.
 
 ### Save-file "bubbles"
 

@@ -523,15 +523,33 @@ class Ui
     // per-operator editor scope (Ratio/Level, Detune, and the 4 EG
     // Rates + 4 EG Levels via the existing AD/SR Button2-toggle idiom
     // already used for every ADSR-shaped page in this codebase -- see
-    // dexed_op_egrate_target_sr_/dexed_op_eglevel_target_sr_). Keyboard
-    // scaling, velocity sensitivity, and amp-mod sensitivity are
-    // deliberately deferred to a later increment. Operator select
+    // dexed_op_egrate_target_sr_/dexed_op_eglevel_target_sr_). AmpModSens
+    // was added in a later increment (see its own comment below);
+    // VelocitySens and KeybRateScale (keyboard RATE scaling only -- the
+    // full keyboard LEVEL scaling block, breakpoint + left/right depth +
+    // curve, is a separate, bigger feature, still deliberately deferred)
+    // were added after that, prompted by a real user report that a
+    // low-velocity note sounded unexpectedly loud -- traced to this
+    // patch's own velocity sensitivity byte being 0 (a real, legitimate
+    // per-patch sound-design choice some patches make on purpose), with
+    // no on-device way to see or change it until now. Operator select
     // (1-6, shown as the real HW op number, i.e. 6-dexed_op_index_) is
     // Button1-cycled, not a page of its own -- rotate stays reserved
     // for page navigation, matching every other screen's own
     // rotate-cycles-pages convention.
     enum class DexedOpParamPage
     {
+        // Read-only reference view, same diagram Screen::Dexed's own
+        // Algo page shows (see Ui::DrawAlgorithmDiagram(), shared
+        // between both) -- added as the first page here after a real
+        // user request, so you can see the current routing/carriers
+        // while browsing per-operator pages without leaving this
+        // screen. No knob of its own: Button1 is already committed to
+        // operator-select duty on every page in this screen, so
+        // there's no button left free to cycle the algorithm the way
+        // Screen::Dexed's own Algo page does -- change it from there
+        // instead.
+        Algo,
         RatioLevel, // K1 = Coarse ratio (quantized 0-31), K2 = Output Level
         Detune,     // K1 only, 0-14 centered on 7
         EgRate,     // K1/K2 = Rate1/Rate2 (AD) or Rate3/Rate4 (SR), Button2 toggles
@@ -544,6 +562,17 @@ class Ui
         // report ("I can hear no effect... on all of the cycles") traced
         // Amp/EG's silence to this byte never being exposed anywhere.
         AmpModSens,
+        // K1 only, 0-7 (patch[off+15], read directly by msfa's own
+        // ScaleVelocity() -- see dx7note.cpp). 0 means this operator's
+        // output level never changes with velocity at all, by design --
+        // some real DX7 patches (pads, organs, certain basses) are built
+        // that way on purpose, not a bug.
+        VelocitySens,
+        // K1 only, 0-7 (patch[off+13], read directly by msfa's own
+        // ScaleRate() -- see dx7note.cpp). How much playing higher up
+        // the keyboard speeds up this operator's envelope rates; 0 means
+        // every key uses the same rates regardless of pitch.
+        KeybRateScale,
         kCount
     };
 
@@ -645,6 +674,7 @@ class Ui
         // already uses for cursor_layer_/Cur(). EgRate/EgLevel each
         // split into two contexts for the AD/SR toggle, same shape as
         // GranularEnvAD/GranularEnvSR above.
+        DexedOpAlgo, // view-only -- see DexedOpParamPage::Algo's own comment
         DexedOpRatioLevel,
         DexedOpDetune,
         DexedOpEgRateAD,
@@ -652,6 +682,8 @@ class Ui
         DexedOpEgLevelAD,
         DexedOpEgLevelSR,
         DexedOpAmpModSens,
+        DexedOpVelocitySens,
+        DexedOpKeybRateScale,
         kCount
     };
     KnobContext CurrentKnobContext() const;
@@ -764,6 +796,17 @@ class Ui
     // DexedOpParamPage::EgRate/EgLevel -- both show the same real shape
     // regardless of which pair is currently the editable one.
     void DrawDx7EnvelopeShape(int top, int bottom, const uint8_t rates[4], const uint8_t levels[4]);
+    // Real box-and-arrow diagram of algo0's exact operator routing
+    // (0-indexed, i.e. patch byte 134 as-is) -- generically derived from
+    // FmCore::get_operator_routing() every call, never hand-authored per
+    // algorithm. Originally DexedParamPage::Algo's own inline body;
+    // extracted once Screen::DexedOperator's own Algo page (see
+    // DexedOpParamPage::Algo) needed the identical diagram -- draws the
+    // "ALGO N/32" label and the diagram itself, but deliberately NOT the
+    // footer control rows below it, since Button1/Button2's own meaning
+    // genuinely differs between the two screens (cycle algorithm vs.
+    // cycle operator).
+    void DrawAlgorithmDiagram(int algo0);
     // Live auto-scaled waveform trace from a small ring buffer -- shared
     // by whichever page wants a live timbre reference (Grains' own
     // Filter page shows its actual output changing as you turn its
@@ -1451,7 +1494,7 @@ class Ui
     // convention confirmed from the real DX7 SysEx spec and already used
     // throughout the Algo diagram. Button1-cycled, not a page of its own.
     int                dexed_op_index_ = 0;
-    DexedOpParamPage   dexed_op_page_  = DexedOpParamPage::RatioLevel;
+    DexedOpParamPage   dexed_op_page_  = DexedOpParamPage::Algo;
     // AD/SR toggles for the EgRate/EgLevel pages, same idiom as
     // granular_adsr_target_sr_ -- two independent bools since the two
     // pages' own toggle state shouldn't reset just from navigating

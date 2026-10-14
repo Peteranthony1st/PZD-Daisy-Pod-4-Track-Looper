@@ -1080,7 +1080,19 @@ struct GranularPresetFileHeader
     uint32_t version;
     uint32_t audio_len;
 };
-constexpr uint32_t kGranularPresetFileVersion = 9; // bumped again: added scan_gap01
+// 10: added GranularPresetData::reverb_send01 -- a plain clean-reject
+// bump like every one before it (see LoadGranularPreset()'s own
+// version check), not a backward-compatible chain the way Performance
+// files have for their own reverb fields -- this format has never
+// carried that, so existing v9 Grains presets will need re-saving
+// after this update, not just reload with a defaulted field. Briefly
+// suspected (and directly ruled out by testing a revert of just this
+// field) as the cause of a real save failure, which turned out instead
+// to be Save()/SaveGranularPreset() never suspending the audio engine
+// during a long SD write the way Load()/Export() already do -- see
+// Ui::TriggerSave()'s/TriggerSaveGranularPreset()'s own comment on
+// g_audio_suspended.
+constexpr uint32_t kGranularPresetFileVersion = 10;
 
 // Same shape as GranularPresetFileHeader above, own magic/version. No
 // audio, so no audio_len field -- just the header plus one raw

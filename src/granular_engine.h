@@ -60,6 +60,17 @@ class GranularEngine
     // by Trim's own live-adjustment path (see SetTrimRange()'s comment
     // for why that one can't just call this every tick too).
     void RecomputeWaveformPeaks();
+    // Straight, honest linear playback of src_l_/src_r_/src_len_ (i.e.
+    // exactly whatever Trim currently has selected, since SetTrimRange()
+    // already points those at it -- added after a direct request for a
+    // way to actually hear the trimmed section rather than inferring it
+    // from the waveform/grains alone) -- mixed in alongside Grain/Scan
+    // in Process(), through the same filter/pan/output-level chain, not
+    // a separate bypassed preview path, so what you hear here matches
+    // what playing a note will actually sound like. One-shot: (re)starts
+    // from the beginning every call, auto-stops on its own once
+    // preview_pos_ reaches src_len_ -- see Process()'s own comment.
+    void PlayTrimPreview();
     bool   HasSource() const { return src_len_ > 0; }
     size_t GetSourceLen() const { return src_len_; }
 
@@ -275,14 +286,19 @@ class GranularEngine
     // this engine's own Mix page and Global:Mixer -- same underlying
     // value either way (this field), so changing it in one place updates
     // the other with no extra sync needed, same as PadSynth's own
-    // reverb send.
+    // reverb send. Saved in GranularPresetData (see its own field's
+    // comment) -- the one exception to the "session-level, not saved"
+    // treatment Delay Send/Pan/Output Level below still get, added after
+    // a direct request to match how DexedPresetData already saves its
+    // own reverb_send01.
     void  SetReverbSend01(float v01) { reverb_send01_ = v01; }
     float GetReverbSend01() const { return reverb_send01_; }
 
     // Own independent send into the shared delay bus (main.cpp's
     // fx_delay_l/r) -- same relationship to it Reverb Send above has to
     // fx_reverb_shared, added on Grains' own new FX page. Same session-
-    // level (not saved in presets) treatment as Reverb Send.
+    // level (not saved in presets) treatment Reverb Send used to have,
+    // before that one became the one exception -- see its own comment.
     void  SetDelaySend01(float v01) { delay_send01_ = v01; }
     float GetDelaySend01() const { return delay_send01_; }
 
@@ -291,8 +307,9 @@ class GranularEngine
     // reads real L/R from whatever was captured/imported, unlike Pad's
     // mono voice sum) right before writing out_l/out_r. A session-level
     // mixer setting, not part of the captured sound's own identity --
-    // same reasoning that already excludes output_level01_/reverb_send01_
-    // from GranularPresetData below, kept consistent with those.
+    // same reasoning that still excludes output_level01_/delay_send01_
+    // from GranularPresetData below (reverb_send01_ used to be in this
+    // group too -- see its own comment for why it no longer is).
     void  SetPan01(float v01);
     float GetPan01() const { return pan01_; }
 
@@ -367,6 +384,22 @@ class GranularEngine
         int32_t grain_speed       = (int32_t)GrainSpeed::Slow;
         float   jitter01          = 0.f; // 0 = off, see SetJitter01()
         bool    scan_bounce       = true; // matches the class's own default
+        // Trailing field, added after Delay Send/Pan/Output Level had
+        // already established "session-level, not saved" for this whole
+        // group -- see SetReverbSend01()'s own comment for why this one
+        // specifically was pulled back out of that group, to match
+        // DexedPresetData's own reverb_send01. Default matches the live
+        // class member's own default (0.f) rather than picking a new
+        // number -- unlike Dexed's own 0.6 output_level01 default,
+        // there's no factory-preset-defaulting concern here to justify a
+        // different value. Any GranularPresetData written before this
+        // field existed is handled by a clean file-version reject (see
+        // kGranularPresetFileVersion in performance_store.cpp), not a
+        // silent default fill-in. Briefly suspected (and directly
+        // ruled out by reverting it alone and re-testing) as the cause
+        // of a real save failure found elsewhere -- see
+        // kGranularPresetFileVersion's own comment for the real cause.
+        float   reverb_send01     = 0.f;
     };
     void               ApplyPreset(const GranularPresetData& p);
     GranularPresetData CapturePreset() const;
@@ -444,7 +477,25 @@ class GranularEngine
     size_t       src_len_ = 0;
     float        sample_rate_ = 48000.f;
 
+    // See PlayTrimPreview()'s own comment.
+    bool   preview_active_ = false;
+    size_t preview_pos_    = 0;
+
     int   held_note_ = -1;
+    // Separate from held_note_ on purpose -- NoteOff() resets held_note_
+    // to -1 immediately (so Process()'s Adsr gate goes false right
+    // away), but grains keep spawning through the whole release tail
+    // regardless (see Process()'s own "Keep triggering new grains
+    // through the WHOLE release tail" comment), at whatever pitch this
+    // held. NoteOn()'s own choke check needs to know "what note actually
+    // last triggered something," including one that's now only
+    // releasing, not just "what's currently held" -- otherwise a new
+    // note arriving mid-release-tail never chokes that tail at all
+    // (held_note_ already reads -1 by then), and the old note's still-
+    // spawning grains bleed straight into the new note's own attack. A
+    // real user report ("I can hear the last note at the start of the
+    // next note I play") traced to exactly this gap.
+    int   last_triggered_note_ = -1;
     float note_rate_ = 1.f; // 2^((note-60)/12), read live if grain_follows_note_
     float note_gain_ = 1.f; // sqrt(velocity/127) taper, same as the old engine
 

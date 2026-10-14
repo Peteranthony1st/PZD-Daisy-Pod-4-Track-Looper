@@ -1086,6 +1086,17 @@ void Ui::OnButton1Short()
                     granular_import_files_dirty_ = true; // re-scan IMPORT/ on entry
                 granular_capture_status_[0] = '\0'; // stale result from the other source
             }
+            else if(granular_param_page_ == GranularParamPage::Trim && granular_)
+            {
+                // Tap to hear exactly the currently-selected trim range,
+                // straight through -- see GranularEngine::PlayTrimPreview()'s
+                // own comment. A direct user request, not planned
+                // upfront: turning Start/End already live-updates the
+                // actual source range, but there was no quick way to
+                // just hear it without playing a MIDI note through the
+                // grain engine.
+                granular_->PlayTrimPreview();
+            }
             else if(granular_param_page_ == GranularParamPage::Preset)
             {
                 if(save_load_mode_ == SaveLoadMode::BrowsingLoad && load_browsing_files_)
@@ -1415,6 +1426,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
         case Screen::DexedOperator:
             switch(dexed_op_page_)
             {
+                case DexedOpParamPage::Algo: return KnobContext::DexedOpAlgo;
                 case DexedOpParamPage::RatioLevel: return KnobContext::DexedOpRatioLevel;
                 case DexedOpParamPage::Detune: return KnobContext::DexedOpDetune;
                 case DexedOpParamPage::EgRate:
@@ -1424,6 +1436,8 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                     return dexed_op_eglevel_target_sr_ ? KnobContext::DexedOpEgLevelSR
                                                            : KnobContext::DexedOpEgLevelAD;
                 case DexedOpParamPage::AmpModSens: return KnobContext::DexedOpAmpModSens;
+                case DexedOpParamPage::VelocitySens: return KnobContext::DexedOpVelocitySens;
+                case DexedOpParamPage::KeybRateScale: return KnobContext::DexedOpKeybRateScale;
                 default: return KnobContext::DexedOpRatioLevel;
             }
         case Screen::Granular:
@@ -1615,6 +1629,7 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             break;
         case KnobContext::DexedAdvanced: break; // entry point only -- see Screen::DexedOperator instead
         case KnobContext::DexedPreset: break; // browses a list directly, no pickup used
+        case KnobContext::DexedOpAlgo: break; // view-only here -- see its own comment
         case KnobContext::DexedOpRatioLevel:
             if(dexed_)
             {
@@ -1667,6 +1682,20 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             {
                 int base = dexed_op_index_ * 21;
                 k1_pickup_raw_[i] = (float)(dexed_->GetPatchByte(base + 14) & 3) / 3.f;
+            }
+            break;
+        case KnobContext::DexedOpVelocitySens:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 15) / 7.f;
+            }
+            break;
+        case KnobContext::DexedOpKeybRateScale:
+            if(dexed_)
+            {
+                int base = dexed_op_index_ * 21;
+                k1_pickup_raw_[i] = (float)dexed_->GetPatchByte(base + 13) / 7.f;
             }
             break;
         case KnobContext::GranularGrainSizeFill:
@@ -2541,6 +2570,7 @@ void Ui::ApplyKnobs()
             int base = dexed_op_index_ * 21;
             switch(dexed_op_page_)
             {
+                case DexedOpParamPage::Algo: break; // view-only here -- see its own comment
                 case DexedOpParamPage::RatioLevel:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
                     {
@@ -2617,6 +2647,28 @@ void Ui::ApplyKnobs()
                         sens     = sens > 3 ? 3 : sens;
                         if((uint8_t)sens != (dexed_->GetPatchByte(base + 14) & 3))
                             dexed_->SetPatchByte(base + 14, (uint8_t)sens);
+                    }
+                    break;
+                case DexedOpParamPage::VelocitySens:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        // Real DX7 key velocity sensitivity range, read
+                        // directly (unmasked) by ScaleVelocity().
+                        int sens = (int)(Clampf(k1, 0.f, 1.f) * 7.f + 0.5f);
+                        sens     = sens > 7 ? 7 : sens;
+                        if((uint8_t)sens != dexed_->GetPatchByte(base + 15))
+                            dexed_->SetPatchByte(base + 15, (uint8_t)sens);
+                    }
+                    break;
+                case DexedOpParamPage::KeybRateScale:
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                    {
+                        // Real DX7 keyboard rate scaling range, read
+                        // directly (unmasked) by ScaleRate().
+                        int rs = (int)(Clampf(k1, 0.f, 1.f) * 7.f + 0.5f);
+                        rs     = rs > 7 ? 7 : rs;
+                        if((uint8_t)rs != dexed_->GetPatchByte(base + 13))
+                            dexed_->SetPatchByte(base + 13, (uint8_t)rs);
                     }
                     break;
                 default: break;
@@ -4344,7 +4396,7 @@ void Ui::DrawGranularScreen()
             snprintf(s_val, sizeof(s_val), "%d%%", (int)(granular_trim_start01_ * 100.f + 0.5f));
             snprintf(e_val, sizeof(e_val), "%d%%", (int)(granular_trim_end01_ * 100.f + 0.5f));
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Start", s_val, e_val, "End");
-            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Play", "", "", "");
             break;
         }
         case GranularParamPage::Preset:
@@ -4658,254 +4710,8 @@ void Ui::DrawDexedScreen()
     {
         case DexedParamPage::Algo:
         {
-            // Algorithm number (top-left, below the header) plus a real
-            // box diagram of its exact operator routing filling the rest
-            // of the page -- generically derived per-algorithm from
-            // FmCore::get_operator_routing() (never hand-authored per
-            // algorithm), so this is always exactly correct for whichever
-            // of the 32 is loaded.
-            int  algo0 = dexed_->GetPatchByte(134);
-            char line1[16];
-            snprintf(line1, sizeof(line1), "ALGO %d/32", algo0 + 1);
-            TomThumbDrawText(disp_, 0, 15, line1, true);
-
-            // --- Reconstruct the signal-flow graph -------------------
-            // Array index 0 = hardware OP6, index 5 = OP1 (confirmed from
-            // the real DX7 SysEx spec), matching render()'s own
-            // processing order (index 0..5) -- a bus can only ever be
-            // read by an operator whose index is higher than whichever
-            // operator(s) wrote it, so a single forward pass is enough to
-            // resolve every edge and depth.
-            int  input_bus[6], output_bus[6];
-            bool sums[6], is_carrier[6] = {}, has_fb[6];
-            for(int i = 0; i < 6; i++)
-            {
-                FmOperatorRouting r = FmCore::get_operator_routing((uint8_t)algo0, i);
-                input_bus[i]  = r.input_bus;
-                output_bus[i] = r.output_bus;
-                sums[i]       = r.sums;
-                has_fb[i]     = r.has_feedback;
-            }
-
-            int  edge_count[6] = {};
-            int  edge_from[6][6];
-            int  cur_writer_count[3] = {0, 0, 0}; // indexed by bus 1/2 (0 unused)
-            int  cur_writers[3][6];
-            for(int i = 0; i < 6; i++)
-            {
-                int ib = input_bus[i];
-                if(ib != 0)
-                {
-                    for(int k = 0; k < cur_writer_count[ib]; k++)
-                        edge_from[i][edge_count[i]++] = cur_writers[ib][k];
-                }
-                int ob = output_bus[i];
-                if(ob == 0)
-                {
-                    is_carrier[i] = true;
-                }
-                else if(sums[i] && cur_writer_count[ob] > 0)
-                {
-                    cur_writers[ob][cur_writer_count[ob]++] = i;
-                }
-                else
-                {
-                    cur_writers[ob][0] = i;
-                    cur_writer_count[ob] = 1;
-                }
-            }
-
-            // Row = depth from this operator's own chain root.
-            int depth[6];
-            for(int i = 0; i < 6; i++)
-            {
-                if(edge_count[i] == 0)
-                {
-                    depth[i] = 0;
-                }
-                else
-                {
-                    int maxd = 0;
-                    for(int k = 0; k < edge_count[i]; k++)
-                    {
-                        int pd = depth[edge_from[i][k]];
-                        if(pd > maxd)
-                            maxd = pd;
-                    }
-                    depth[i] = maxd + 1;
-                }
-            }
-
-            // Column: each independent chain root gets the next free
-            // column (in processing order, i.e. HW op6 first); an
-            // operator with a single parent extends that parent's column
-            // (straight chain) UNLESS the parent already has an earlier
-            // child claiming that column -- a parent feeding more than
-            // one child (e.g. algorithm 19's op6 feeding both op5 and
-            // op4) branches its later children into fresh columns
-            // instead of stacking them on top of each other. An operator
-            // with more than one parent (a converging algorithm, e.g.
-            // 16-18) sits centered between its parents' columns instead.
-            float column[6];
-            bool  column_claimed[6] = {};
-            int   next_root_col     = 0;
-            for(int i = 0; i < 6; i++)
-            {
-                if(edge_count[i] == 0)
-                {
-                    column[i] = (float)(next_root_col++);
-                }
-                else if(edge_count[i] == 1)
-                {
-                    int p = edge_from[i][0];
-                    if(!column_claimed[p])
-                    {
-                        column[i]         = column[p];
-                        column_claimed[p] = true;
-                    }
-                    else
-                    {
-                        column[i] = (float)(next_root_col++);
-                    }
-                }
-                else
-                {
-                    float sum = 0.f;
-                    for(int k = 0; k < edge_count[i]; k++)
-                        sum += column[edge_from[i][k]];
-                    column[i] = sum / (float)edge_count[i];
-                }
-            }
-            int num_columns = next_root_col;
-            int max_depth   = 0;
-            for(int i = 0; i < 6; i++)
-                if(depth[i] > max_depth)
-                    max_depth = depth[i];
-            int num_rows = max_depth + 1;
-
-            // --- Pixel layout, orthogonal connectors only -------------
-            // Diagram width stops short of the full screen width, and the
-            // OUT bus line only spans that same reduced width -- reserves
-            // a strip on the right no box or connector ever enters, so
-            // the "OUT" label can sit there with no risk of collision
-            // regardless of algorithm/column count.
-            const int kOutLabelW = 16;
-            const int kDiagTop   = 17;
-            const int kOutLineY  = kFooterDividerY - 1; // 45, just above the footer rule
-            const int kDiagWidth = disp_->Width() - kOutLabelW;
-            const float col_pitch = (float)kDiagWidth / (float)num_columns;
-            const float row_pitch = (float)(kOutLineY - kDiagTop) / (float)num_rows;
-            // Width is fixed and snug around the number's own ink (3px
-            // wide, see font_tomthumb.cpp's glyph table) plus a real 1px
-            // gap and a 1px border on each side -- not stretched to the
-            // column pitch, which has far more room to spare than the
-            // number ever needs and was what made boxes read as too
-            // wide. Height instead scales with row_pitch (rows are the
-            // genuinely scarce dimension), so the 29 algorithms with more
-            // vertical room to spare get visibly taller boxes; the floor
-            // (7 = 5px ink + 1px border each side, no extra gap left) is
-            // only actually reached by the three 4-row algorithms
-            // (1, 2, 18), where there's no more height to give.
-            const int box_w = 7;
-            int       box_h = (int)row_pitch;
-            if(box_h > 11) box_h = 11;
-            if(box_h < 7) box_h = 7;
-
-            int cx[6], cy[6];
-            for(int i = 0; i < 6; i++)
-            {
-                cx[i] = (int)(col_pitch * (column[i] + 0.5f));
-                cy[i] = kDiagTop + (int)(row_pitch * ((float)depth[i] + 0.5f));
-            }
-
-            // Connectors first (drawn under the boxes). A same-column
-            // parent drops a plain straight vertical line into the
-            // child's top edge. A cross-column parent (a converging
-            // algorithm, e.g. 16-18, or a parent branching into more than
-            // one child, e.g. 19) instead drops down to the CHILD's own
-            // row height and runs a horizontal segment straight into the
-            // middle of the child's near side edge -- no separate gutter
-            // row needed above the child, which is what leaves the extra
-            // vertical room for bigger boxes. Horizontal/vertical
-            // segments only, as required.
-            for(int i = 0; i < 6; i++)
-            {
-                for(int k = 0; k < edge_count[i]; k++)
-                {
-                    int p  = edge_from[i][k];
-                    int py = cy[p] + box_h / 2;
-                    if(cx[p] == cx[i])
-                    {
-                        disp_->DrawLine(cx[p], py, cx[i], cy[i] - box_h / 2, true);
-                    }
-                    else
-                    {
-                        int side_x = cx[p] < cx[i] ? cx[i] - box_w / 2 : cx[i] + box_w / 2;
-                        disp_->DrawLine(cx[p], py, cx[p], cy[i], true);
-                        disp_->DrawLine(cx[p], cy[i], side_x, cy[i], true);
-                    }
-                }
-            }
-
-            // OUT bus: every carrier drops a straight vertical line down
-            // to one shared horizontal line at the bottom of the diagram
-            // -- stops at kDiagWidth, clear of the reserved "OUT" label
-            // strip (see kOutLabelW above).
-            disp_->DrawLine(0, kOutLineY, kDiagWidth - 1, kOutLineY, true);
-            TomThumbDrawText(disp_, kDiagWidth + 2, kOutLineY - 1, "OUT", true);
-            for(int i = 0; i < 6; i++)
-                if(is_carrier[i])
-                    disp_->DrawLine(cx[i], cy[i] + box_h / 2, cx[i], kOutLineY, true);
-
-            // Boxes: filled = carrier (reaches the ear directly), outline
-            // = modulator. The real HW operator number (6-index) is
-            // punched through as "off" pixels when the box is filled so
-            // it still reads clearly against the solid fill.
-            for(int i = 0; i < 6; i++)
-            {
-                int x0 = cx[i] - box_w / 2, x1 = cx[i] + box_w / 2;
-                int y0 = cy[i] - box_h / 2, y1 = cy[i] + box_h / 2;
-                disp_->DrawRect(x0, y0, x1, y1, true, is_carrier[i]);
-                char num[2]  = {(char)('0' + (6 - i)), 0};
-                int  ink_w   = TomThumbInkWidth(num);
-                // Centered on ink width (not advance width) so the
-                // number sits with a true, symmetric 1px-or-more gap
-                // from the border on both sides -- box_w (7) is sized
-                // for the common 3px-wide digits, so '1' (2px ink) gets
-                // an extra spare pixel on the right rather than being
-                // pushed off-center.
-                int pen_x = x0 + 1 + (box_w - 2 - ink_w) / 2;
-                // Same margin-based centering vertically: ink is a fixed
-                // 5px tall, baseline sits 5 rows below its top -- when
-                // box_h is at its 7px floor this comes out flush against
-                // the border (no room left for a gap that small), but it
-                // grows into a real, symmetric gap on every algorithm
-                // with a taller box to spare.
-                int pen_y = y0 + 6 + (box_h - 7) / 2;
-                TomThumbDrawText(disp_, pen_x, pen_y, num, !is_carrier[i]);
-
-                // Feedback: an explicit "FB" tag beside the one operator
-                // (if any) with real self-feedback -- a small pixel
-                // bracket read poorly at this box size across several
-                // algorithms, so this uses actual text instead, which
-                // stays legible regardless of where that operator lands.
-                // Feedback operators are always chain roots (no incoming
-                // edges, confirmed from the routing data), so connectors
-                // only ever leave from their BOTTOM -- both side edges
-                // are always free for this label. Prefers the right side;
-                // falls back to the left if that would run past the
-                // reserved OUT-label strip.
-                if(has_fb[i])
-                {
-                    const char* fb = "FB";
-                    int         fb_w = TomThumbInkWidth(fb);
-                    int         fb_x = x1 + 2;
-                    if(fb_x + fb_w > kDiagWidth)
-                        fb_x = x0 - 2 - fb_w;
-                    TomThumbDrawText(disp_, fb_x, pen_y, fb, true);
-                }
-            }
-
+            int algo0 = dexed_->GetPatchByte(134);
+            DrawAlgorithmDiagram(algo0);
             char algo_val[8];
             snprintf(algo_val, sizeof(algo_val), "%d", algo0 + 1);
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Algo", algo_val, "", "");
@@ -5358,11 +5164,14 @@ void Ui::DrawDexedOperatorScreen()
     const char* page_name = "Ratio";
     switch(dexed_op_page_)
     {
+        case DexedOpParamPage::Algo: page_name = "Algo"; break;
         case DexedOpParamPage::RatioLevel: page_name = "Ratio"; break;
         case DexedOpParamPage::Detune: page_name = "Detune"; break;
         case DexedOpParamPage::EgRate: page_name = "EG Rate"; break;
         case DexedOpParamPage::EgLevel: page_name = "EG Level"; break;
         case DexedOpParamPage::AmpModSens: page_name = "AmpSens"; break;
+        case DexedOpParamPage::VelocitySens: page_name = "VelSens"; break;
+        case DexedOpParamPage::KeybRateScale: page_name = "RateScale"; break;
         default: break;
     }
     char title[24];
@@ -5374,6 +5183,16 @@ void Ui::DrawDexedOperatorScreen()
 
     switch(dexed_op_page_)
     {
+        case DexedOpParamPage::Algo:
+        {
+            // Read-only here -- see DexedOpParamPage::Algo's own comment
+            // for why Button1/Button2 don't cycle the algorithm on this
+            // page the way Screen::Dexed's own Algo page lets them.
+            DrawAlgorithmDiagram(dexed_->GetPatchByte(134));
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "", "", "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
         case DexedOpParamPage::RatioLevel:
         {
             char ratio_val[8], level_val[8];
@@ -5445,8 +5264,34 @@ void Ui::DrawDexedOperatorScreen()
             char val[8];
             snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(base + 14) & 3);
             disp_->SetCursor(0, 20);
-            WriteUpper("0 = wheel has no effect");
+            WriteUpper("0 = no wheel effect"); // 19 chars -- Font_6x8 only
+                                                 // fits 21 at this width,
+                                                 // "...has no effect" (23)
+                                                 // ran 10px off the right
+                                                 // edge
             DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "AmpSens", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
+        case DexedOpParamPage::VelocitySens:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(base + 15));
+            disp_->SetCursor(0, 20);
+            WriteUpper("0 = no vel. response");
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "VelSens", val, "", "");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
+            break;
+        }
+        case DexedOpParamPage::KeybRateScale:
+        {
+            char val[8];
+            snprintf(val, sizeof(val), "%d", dexed_->GetPatchByte(base + 13));
+            disp_->SetCursor(0, 20);
+            WriteUpper("0 = flat across keys"); // 22 chars ("...all
+                                                  // keys") ran 4px off
+                                                  // the right edge
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "RateScale", val, "", "");
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "Op", "", "", "");
             break;
         }
@@ -5645,6 +5490,256 @@ void Ui::DrawDx7EnvelopeShape(int top, int bottom, const uint8_t rates[4], const
     }
 }
 
+void Ui::DrawAlgorithmDiagram(int algo0)
+{
+    // Algorithm number (top-left, below the header) plus a real box
+    // diagram of its exact operator routing filling the rest of the
+    // page -- generically derived per-algorithm from
+    // FmCore::get_operator_routing() (never hand-authored per
+    // algorithm), so this is always exactly correct for whichever of
+    // the 32 is loaded.
+    char line1[16];
+    snprintf(line1, sizeof(line1), "ALGO %d/32", algo0 + 1);
+    TomThumbDrawText(disp_, 0, 15, line1, true);
+
+    // --- Reconstruct the signal-flow graph -------------------
+    // Array index 0 = hardware OP6, index 5 = OP1 (confirmed from
+    // the real DX7 SysEx spec), matching render()'s own
+    // processing order (index 0..5) -- a bus can only ever be
+    // read by an operator whose index is higher than whichever
+    // operator(s) wrote it, so a single forward pass is enough to
+    // resolve every edge and depth.
+    int  input_bus[6], output_bus[6];
+    bool sums[6], is_carrier[6] = {}, has_fb[6];
+    for(int i = 0; i < 6; i++)
+    {
+        FmOperatorRouting r = FmCore::get_operator_routing((uint8_t)algo0, i);
+        input_bus[i]  = r.input_bus;
+        output_bus[i] = r.output_bus;
+        sums[i]       = r.sums;
+        has_fb[i]     = r.has_feedback;
+    }
+
+    int  edge_count[6] = {};
+    int  edge_from[6][6];
+    int  cur_writer_count[3] = {0, 0, 0}; // indexed by bus 1/2 (0 unused)
+    int  cur_writers[3][6];
+    for(int i = 0; i < 6; i++)
+    {
+        int ib = input_bus[i];
+        if(ib != 0)
+        {
+            for(int k = 0; k < cur_writer_count[ib]; k++)
+                edge_from[i][edge_count[i]++] = cur_writers[ib][k];
+        }
+        int ob = output_bus[i];
+        if(ob == 0)
+        {
+            is_carrier[i] = true;
+        }
+        else if(sums[i] && cur_writer_count[ob] > 0)
+        {
+            cur_writers[ob][cur_writer_count[ob]++] = i;
+        }
+        else
+        {
+            cur_writers[ob][0] = i;
+            cur_writer_count[ob] = 1;
+        }
+    }
+
+    // Row = depth from this operator's own chain root.
+    int depth[6];
+    for(int i = 0; i < 6; i++)
+    {
+        if(edge_count[i] == 0)
+        {
+            depth[i] = 0;
+        }
+        else
+        {
+            int maxd = 0;
+            for(int k = 0; k < edge_count[i]; k++)
+            {
+                int pd = depth[edge_from[i][k]];
+                if(pd > maxd)
+                    maxd = pd;
+            }
+            depth[i] = maxd + 1;
+        }
+    }
+
+    // Column: each independent chain root gets the next free
+    // column (in processing order, i.e. HW op6 first); an
+    // operator with a single parent extends that parent's column
+    // (straight chain) UNLESS the parent already has an earlier
+    // child claiming that column -- a parent feeding more than
+    // one child (e.g. algorithm 19's op6 feeding both op5 and
+    // op4) branches its later children into fresh columns
+    // instead of stacking them on top of each other. An operator
+    // with more than one parent (a converging algorithm, e.g.
+    // 16-18) sits centered between its parents' columns instead.
+    float column[6];
+    bool  column_claimed[6] = {};
+    int   next_root_col     = 0;
+    for(int i = 0; i < 6; i++)
+    {
+        if(edge_count[i] == 0)
+        {
+            column[i] = (float)(next_root_col++);
+        }
+        else if(edge_count[i] == 1)
+        {
+            int p = edge_from[i][0];
+            if(!column_claimed[p])
+            {
+                column[i]         = column[p];
+                column_claimed[p] = true;
+            }
+            else
+            {
+                column[i] = (float)(next_root_col++);
+            }
+        }
+        else
+        {
+            float sum = 0.f;
+            for(int k = 0; k < edge_count[i]; k++)
+                sum += column[edge_from[i][k]];
+            column[i] = sum / (float)edge_count[i];
+        }
+    }
+    int num_columns = next_root_col;
+    int max_depth   = 0;
+    for(int i = 0; i < 6; i++)
+        if(depth[i] > max_depth)
+            max_depth = depth[i];
+    int num_rows = max_depth + 1;
+
+    // --- Pixel layout, orthogonal connectors only -------------
+    // Diagram width stops short of the full screen width, and the
+    // OUT bus line only spans that same reduced width -- reserves
+    // a strip on the right no box or connector ever enters, so
+    // the "OUT" label can sit there with no risk of collision
+    // regardless of algorithm/column count.
+    const int kOutLabelW = 16;
+    const int kDiagTop   = 17;
+    const int kOutLineY  = kFooterDividerY - 1; // 45, just above the footer rule
+    const int kDiagWidth = disp_->Width() - kOutLabelW;
+    const float col_pitch = (float)kDiagWidth / (float)num_columns;
+    const float row_pitch = (float)(kOutLineY - kDiagTop) / (float)num_rows;
+    // Width is fixed and snug around the number's own ink (3px
+    // wide, see font_tomthumb.cpp's glyph table) plus a real 1px
+    // gap and a 1px border on each side -- not stretched to the
+    // column pitch, which has far more room to spare than the
+    // number ever needs and was what made boxes read as too
+    // wide. Height instead scales with row_pitch (rows are the
+    // genuinely scarce dimension), so the 29 algorithms with more
+    // vertical room to spare get visibly taller boxes; the floor
+    // (7 = 5px ink + 1px border each side, no extra gap left) is
+    // only actually reached by the three 4-row algorithms
+    // (1, 2, 18), where there's no more height to give.
+    const int box_w = 7;
+    int       box_h = (int)row_pitch;
+    if(box_h > 11) box_h = 11;
+    if(box_h < 7) box_h = 7;
+
+    int cx[6], cy[6];
+    for(int i = 0; i < 6; i++)
+    {
+        cx[i] = (int)(col_pitch * (column[i] + 0.5f));
+        cy[i] = kDiagTop + (int)(row_pitch * ((float)depth[i] + 0.5f));
+    }
+
+    // Connectors first (drawn under the boxes). A same-column
+    // parent drops a plain straight vertical line into the
+    // child's top edge. A cross-column parent (a converging
+    // algorithm, e.g. 16-18, or a parent branching into more than
+    // one child, e.g. 19) instead drops down to the CHILD's own
+    // row height and runs a horizontal segment straight into the
+    // middle of the child's near side edge -- no separate gutter
+    // row needed above the child, which is what leaves the extra
+    // vertical room for bigger boxes. Horizontal/vertical
+    // segments only, as required.
+    for(int i = 0; i < 6; i++)
+    {
+        for(int k = 0; k < edge_count[i]; k++)
+        {
+            int p  = edge_from[i][k];
+            int py = cy[p] + box_h / 2;
+            if(cx[p] == cx[i])
+            {
+                disp_->DrawLine(cx[p], py, cx[i], cy[i] - box_h / 2, true);
+            }
+            else
+            {
+                int side_x = cx[p] < cx[i] ? cx[i] - box_w / 2 : cx[i] + box_w / 2;
+                disp_->DrawLine(cx[p], py, cx[p], cy[i], true);
+                disp_->DrawLine(cx[p], cy[i], side_x, cy[i], true);
+            }
+        }
+    }
+
+    // OUT bus: every carrier drops a straight vertical line down
+    // to one shared horizontal line at the bottom of the diagram
+    // -- stops at kDiagWidth, clear of the reserved "OUT" label
+    // strip (see kOutLabelW above).
+    disp_->DrawLine(0, kOutLineY, kDiagWidth - 1, kOutLineY, true);
+    TomThumbDrawText(disp_, kDiagWidth + 2, kOutLineY - 1, "OUT", true);
+    for(int i = 0; i < 6; i++)
+        if(is_carrier[i])
+            disp_->DrawLine(cx[i], cy[i] + box_h / 2, cx[i], kOutLineY, true);
+
+    // Boxes: filled = carrier (reaches the ear directly), outline
+    // = modulator. The real HW operator number (6-index) is
+    // punched through as "off" pixels when the box is filled so
+    // it still reads clearly against the solid fill.
+    for(int i = 0; i < 6; i++)
+    {
+        int x0 = cx[i] - box_w / 2, x1 = cx[i] + box_w / 2;
+        int y0 = cy[i] - box_h / 2, y1 = cy[i] + box_h / 2;
+        disp_->DrawRect(x0, y0, x1, y1, true, is_carrier[i]);
+        char num[2]  = {(char)('0' + (6 - i)), 0};
+        int  ink_w   = TomThumbInkWidth(num);
+        // Centered on ink width (not advance width) so the
+        // number sits with a true, symmetric 1px-or-more gap
+        // from the border on both sides -- box_w (7) is sized
+        // for the common 3px-wide digits, so '1' (2px ink) gets
+        // an extra spare pixel on the right rather than being
+        // pushed off-center.
+        int pen_x = x0 + 1 + (box_w - 2 - ink_w) / 2;
+        // Same margin-based centering vertically: ink is a fixed
+        // 5px tall, baseline sits 5 rows below its top -- when
+        // box_h is at its 7px floor this comes out flush against
+        // the border (no room left for a gap that small), but it
+        // grows into a real, symmetric gap on every algorithm
+        // with a taller box to spare.
+        int pen_y = y0 + 6 + (box_h - 7) / 2;
+        TomThumbDrawText(disp_, pen_x, pen_y, num, !is_carrier[i]);
+
+        // Feedback: an explicit "FB" tag beside the one operator
+        // (if any) with real self-feedback -- a small pixel
+        // bracket read poorly at this box size across several
+        // algorithms, so this uses actual text instead, which
+        // stays legible regardless of where that operator lands.
+        // Feedback operators are always chain roots (no incoming
+        // edges, confirmed from the routing data), so connectors
+        // only ever leave from their BOTTOM -- both side edges
+        // are always free for this label. Prefers the right side;
+        // falls back to the left if that would run past the
+        // reserved OUT-label strip.
+        if(has_fb[i])
+        {
+            const char* fb = "FB";
+            int         fb_w = TomThumbInkWidth(fb);
+            int         fb_x = x1 + 2;
+            if(fb_x + fb_w > kDiagWidth)
+                fb_x = x0 - 2 - fb_w;
+            TomThumbDrawText(disp_, fb_x, pen_y, fb, true);
+        }
+    }
+}
+
 void Ui::DrawOscilloscope(int top, int bottom, const float* buf, size_t capacity)
 {
     const int center_y = (top + bottom) / 2;
@@ -5703,6 +5798,22 @@ void Ui::TriggerSave(bool force_new)
         return;
     }
 
+    // Suspend the audio engine for the whole write, same as TriggerLoad()
+    // already does and for a closely related reason: Save() is a long
+    // blocking main-loop call (streaming every layer's recorded audio to
+    // SD), and unlike Load() this was never a correctness issue for the
+    // audio itself (Save() only reads layer state, never mutates it) --
+    // but a real, reproduced hardware bug traced an intermittent
+    // "Fail:close9" (FatFs FR_INVALID_OBJECT, i.e. the file handle
+    // itself turning up invalid right at the final f_close(), after
+    // every actual write already succeeded) to the full-cost audio ISR
+    // continuing to run, completely unsuspended, the entire time --
+    // contending with the SD card's own SDMMC DMA transfer for the same
+    // bus/timing for however long the write takes. Intermittent even
+    // without any of this session's other changes (confirmed by
+    // reverting everything else and still seeing it fail sometimes),
+    // consistently reproducible with enough extra audio-ISR load on top.
+    g_audio_suspended    = true;
     g_progress_disp      = disp_;
     file_op_in_progress_ = true;
     bool ok = PerformanceStore::Save(slot, *tempo_, layers_, num_layers_, master_volume01_,
@@ -5715,6 +5826,7 @@ void Ui::TriggerSave(bool force_new)
                                        granular_midi_channel_, &Ui::OnSaveLoadProgress);
     file_op_in_progress_ = false;
     g_progress_disp       = nullptr;
+    g_audio_suspended     = false;
 
     if(ok)
     {
@@ -6068,11 +6180,18 @@ void Ui::TriggerSaveGranularPreset(bool force_new)
     }
 
     GranularEngine::GranularPresetData preset = granular_->CapturePreset();
-    g_progress_disp = disp_;
+
+    // See the g_audio_suspended comment in TriggerSave() above -- same
+    // long blocking SD write, same intermittent "Fail:close9"
+    // (FR_INVALID_OBJECT) risk from the full-cost audio ISR contending
+    // with the SDMMC DMA transfer for the whole write duration.
+    g_audio_suspended = true;
+    g_progress_disp   = disp_;
     bool ok = PerformanceStore::SaveGranularPreset(
         slot, preset, granular_->GetSourceL(), granular_->GetSourceR(), granular_->GetSourceLen(),
         &Ui::OnSaveLoadProgress);
-    g_progress_disp = nullptr;
+    g_progress_disp   = nullptr;
+    g_audio_suspended = false;
 
     if(ok)
     {
@@ -6238,7 +6357,13 @@ void Ui::TriggerSaveDexedPreset(bool force_new)
         snprintf(dexed_preset_status_, sizeof(dexed_preset_status_), "Card full/missing");
         return;
     }
-    bool ok = PerformanceStore::SaveDexedPreset(slot, dexed_->CapturePreset());
+    // See the g_audio_suspended comment in TriggerSave() above. Dexed
+    // presets are a single small struct (no chunked audio), so the write
+    // is much shorter-lived than Performance/Grains, but it's still a
+    // blocking SD write and the same race is possible in principle.
+    g_audio_suspended = true;
+    bool ok           = PerformanceStore::SaveDexedPreset(slot, dexed_->CapturePreset());
+    g_audio_suspended = false;
     if(ok)
     {
         dexed_loaded_preset_slot_ = slot;

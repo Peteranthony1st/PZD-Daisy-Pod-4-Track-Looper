@@ -137,6 +137,20 @@ void GranularEngine::SetTrimRange(const float* buf_l, const float* buf_r, size_t
     src_len_ = len;
 }
 
+void GranularEngine::PlayTrimPreview()
+{
+    // Always restarts from the beginning, even if a previous preview is
+    // still playing -- same "tap to (re)trigger" convention the preset
+    // browser's own live preview already uses elsewhere in this
+    // project, simplest thing that still feels responsive on repeated
+    // taps. Process() reads src_l_/src_r_/src_len_ directly every
+    // sample while active, so this always plays back whatever Trim
+    // currently has selected, live -- there is nothing else to keep in
+    // sync.
+    preview_active_ = src_len_ > 0;
+    preview_pos_     = 0;
+}
+
 void GranularEngine::RecomputeWaveformPeaks()
 {
     if(src_len_ == 0)
@@ -171,18 +185,19 @@ void GranularEngine::NoteOn(uint8_t note, uint8_t velocity)
     // Monophonic in more than just pitch-tracking: a genuinely different
     // note interrupting one that's still sounding (e.g. playing a chord
     // fast enough that several NoteOns land before the first note's
-    // grains finish) chokes whatever's currently ringing in both
-    // clusters first, so the new note's grains don't just stack on top
-    // of the old ones -- without this, fast chord-like playing sounded
-    // like real polyphony even though held_note_ only ever tracks one
-    // note at a time.
-    if(held_note_ != -1 && held_note_ != (int)note)
+    // grains finish, OR a new note arriving while the previous one is
+    // only still releasing -- see last_triggered_note_'s own comment for
+    // why that needs checking separately from held_note_) chokes
+    // whatever's currently ringing in both clusters first, so the new
+    // note's grains don't just stack on top of the old ones.
+    if(last_triggered_note_ != -1 && last_triggered_note_ != (int)note)
     {
         ChokeCluster(grain_cluster_);
         ChokeCluster(scan_cluster_);
     }
 
-    held_note_ = note;
+    held_note_           = note;
+    last_triggered_note_ = note;
     note_rate_ = powf(2.f, ((float)note - 60.f) / 12.f);
     // Square-root taper, not linear -- same reasoning the old engine's
     // NoteOn() used (hearing is roughly logarithmic).
@@ -939,6 +954,30 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
             mixed_r *= 0.70710678f;
         }
 
+        // Trim preview (see PlayTrimPreview()'s own comment) -- a
+        // straight, unscaled linear read of src_l_/src_r_, mixed in
+        // AFTER the env/grain_volume01_/scan_volume01_ multiply above
+        // (so it plays regardless of whether a note is actually held --
+        // those only shape the granular engine's own grains, not a
+        // one-shot preview) but BEFORE the shared clamp/filter/pan/
+        // output-level chain below, so what you hear here already
+        // matches what playing a note would actually sound like, and
+        // still gets the same clipping safety net if a note happens to
+        // be playing at the same time.
+        if(preview_active_)
+        {
+            if(preview_pos_ < src_len_)
+            {
+                mixed_l += src_l_[preview_pos_];
+                mixed_r += src_r_[preview_pos_];
+                preview_pos_++;
+            }
+            else
+            {
+                preview_active_ = false;
+            }
+        }
+
         // Safety backstop -- the overlap-gain compensation above handles
         // the common case, but the release-fade grain, Grain+Scan summing
         // together, and both Mix knobs pushed high at once can still add
@@ -1015,6 +1054,7 @@ void GranularEngine::ApplyPreset(const GranularPresetData& p)
     grain_speed_ = (GrainSpeed)(p.grain_speed % 4);
     SetJitter01(p.jitter01);
     scan_bounce_ = p.scan_bounce;
+    SetReverbSend01(p.reverb_send01);
 }
 
 GranularEngine::GranularPresetData GranularEngine::CapturePreset() const
@@ -1046,5 +1086,6 @@ GranularEngine::GranularPresetData GranularEngine::CapturePreset() const
     p.grain_speed         = (int32_t)grain_speed_;
     p.jitter01            = jitter01_;
     p.scan_bounce         = scan_bounce_;
+    p.reverb_send01       = reverb_send01_;
     return p;
 }

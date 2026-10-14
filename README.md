@@ -184,9 +184,14 @@ just one engine at a time, or both can stay on Omni as before.
   being played as a chord.
 - **Advanced editor** — the last simple page before Preset drills into a
   real per-operator editor (encoder click to enter, short click to
-  return, long-press to Home like everywhere else): pick one of the 6
-  operators (Button 1) and edit its Ratio/Level, Detune, and Attack/
-  Decay/Sustain/Release for both its pitch-EG rate and level pairs.
+  return, long-press to Home like everywhere else). Its first page is
+  the same Algorithm diagram as the Algo page above (read-only here —
+  edit it from there), handy as a routing/carrier reference while
+  browsing operators without leaving the screen. Pick one of the 6
+  operators (Button 1) and edit its Ratio/Level, Detune, Attack/Decay/
+  Sustain/Release for both its pitch-EG rate and level pairs, mod-wheel
+  Amp/EG sensitivity, key velocity sensitivity, and keyboard rate
+  scaling.
 
 Dexed sound demos:
 
@@ -417,10 +422,14 @@ Advanced page above, rotate to cycle pages)**
 
 | Page | Knob 1 | Knob 2 | Button 1 | Button 2 |
 |---|---|---|---|---|
+| Algo | — (read-only; edit from Global:Dexed's own Algo page) | — | Cycle operator (1-6) | — |
 | Ratio | Coarse ratio (0-31) | Output level | Cycle operator (1-6) | — |
 | Detune | Detune (0-14, 7=centered) | — | Cycle operator (1-6) | — |
 | EG Rate | Attack | Decay (or Sustain/Release) | Cycle operator (1-6) | Toggle AD/SR |
 | EG Level | Attack Level | Decay Level (or Sustain/Release Level) | Cycle operator (1-6) | Toggle AD/SR |
+| AmpModSens | Mod wheel Amp/EG Bias sensitivity (0-3) | — | Cycle operator (1-6) | — |
+| VelocitySens | Key velocity sensitivity (0-7) | — | Cycle operator (1-6) | — |
+| KeybRateScale | Keyboard rate scaling (0-7) | — | Cycle operator (1-6) | — |
 
 A short encoder click here returns to Screen::Dexed's own Advanced
 page; long-press still goes all the way to Home, same as everywhere
@@ -441,7 +450,7 @@ else. The real DX7 operator number (1-6) is always shown in the title.
 | GR-FX | Reverb send / Delay send | Shared reverb size / delay time | Toggle Reverb/Delay | — |
 | MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Capture | — | — | Cycle source (Direct/Layer/Import) | Hold = record or capture |
-| Trim | Trim start | Trim end | — | — |
+| Trim | Trim start | Trim end | Play trimmed section | — |
 | Preset | See Save/load above | — | Save / Select (Load) / Back | Hold 800ms = confirm |
 
 Clicking the encoder on any Grains page also mutes/unmutes all 4 loop
