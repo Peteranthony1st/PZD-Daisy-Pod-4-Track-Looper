@@ -43,7 +43,9 @@ The name, general concept, and file organization are based on
   removing/reinserting a card, then power back on. See
   [`sdcard-template/`](sdcard-template/) for a ready-made folder set to
   copy onto a fresh card (most folders are created automatically as you
-  use each feature, but the two Import folders aren't).
+  use each feature, but the two Import folders aren't). It also ships 9
+  starter Grains presets (`GRNP/PRES001.DAT`-`PRES009.DAT`) so Grains has
+  something to play with out of the box.
 
 - **PZD Daisy Pod Case**
   available at:
@@ -501,7 +503,8 @@ first time right after the bootloader install above):
   fresh card, copy the contents of [`sdcard-template/`](sdcard-template/)
   onto the same root first (or alongside `main.bin`, order doesn't
   matter) — it sets up the folders Grains/Dexed importing needs
-  (`IMPORT/`, `DXIMPORT/`), which aren't created automatically.
+  (`IMPORT/`, `DXIMPORT/`), which aren't created automatically, and
+  pre-loads 9 starter Grains presets.
 - **Alternative — DFU**: put the Pod into DFU mode the same way as above,
   then either `make program-dfu` from `src/`, or drop `main.bin` onto
   [Electrosmith's web programmer](https://flash.daisy.audio/). The
