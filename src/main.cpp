@@ -102,9 +102,14 @@ daisysp::Phaser DSY_SDRAM_BSS fx_phaser[kNumLayers];
 // Reverb-Send-scaled signal is summed (see LooperLayer::Process()'s
 // reverb_send_out parameter) and run through this single instance once
 // per sample in AudioCallback() -- see fx_reverb_size01 below for how
-// its shared Size control works. In SDRAM for the same reason as
-// fx_phaser above.
-DattorroReverb DSY_SDRAM_BSS fx_reverb_shared;
+// its shared Size control works. The 13 big delay buffers this needs
+// (~166KB) live in fx_reverb_storage below, in SDRAM for the same
+// reason as fx_phaser above; fx_reverb_shared itself only holds small,
+// constantly-touched bookkeeping state now (DelayBuffer structs, the
+// "amount" coefficients), so it's a plain object -- see
+// DattorroReverbStorage's own doc comment for why this split exists.
+DattorroReverb              fx_reverb_shared;
+DattorroReverbStorage DSY_SDRAM_BSS fx_reverb_storage;
 
 // ONE shared cross-feedback ("ping-pong") delay, same "one shared
 // instance, fed by per-engine sends" architecture as fx_reverb_shared
@@ -824,6 +829,21 @@ int main(void)
     // safety margin.
     memcpy(_sitcm_text, _siitcm_text, (size_t)(_eitcm_text - _sitcm_text));
 
+    // Flush-to-zero: without this, the FPU can fall back to slow
+    // microcoded handling for denormalized floats -- and a feedback
+    // network decaying toward silence (the shared reverb's tail, the
+    // shared delay's repeats, every layer's own fade-outs) is exactly
+    // the signal shape that produces them, on every single use. No
+    // audible cost: denormals are values near 1e-38 and smaller.
+    // __set_FPSCR takes effect immediately for the foreground context;
+    // FPU->FPDSCR is the DEFAULT status word a lazily-saved FPU context
+    // gets restored to after an interrupt, so that path doesn't quietly
+    // come back without it. Same "as early as possible" placement as
+    // the ITCM copy just above -- before any floating-point code (which
+    // is effectively everything past this point) ever runs.
+    __set_FPSCR(__get_FPSCR() | FPU_FPDSCR_FZ_Msk);
+    FPU->FPDSCR |= FPU_FPDSCR_FZ_Msk;
+
     hw.Init();
 
     // hw.Init() -> InitMidi() claims D13 as MIDI UART TX via
@@ -880,8 +900,11 @@ int main(void)
     // start out holding raw leftover SDRAM contents, not zero (libDaisy's
     // own sdram.h says as much, and the linker script/startup code
     // confirm it -- only ordinary .bss gets zero-filled at boot).
-    memset(&fx_reverb_shared, 0, sizeof(fx_reverb_shared));
-    fx_reverb_shared.Init(hw.AudioSampleRate());
+    // fx_reverb_shared itself no longer needs this -- it's plain .bss
+    // now (see its own declaration comment), already zero at boot; only
+    // fx_reverb_storage (the actual SDRAM object) needs the manual zero.
+    memset(&fx_reverb_storage, 0, sizeof(fx_reverb_storage));
+    fx_reverb_shared.Init(hw.AudioSampleRate(), fx_reverb_storage);
     // Init() itself seeds every parameter (PreDelay, PreFilter, both Input
     // Diffusions, DecayDiffusion, Damping) to the original library's own
     // tuned defaults -- nothing else to set here. Decay itself (the one

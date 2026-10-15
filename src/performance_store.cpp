@@ -52,6 +52,25 @@ void ClearError()
 // by per-call SD overhead.
 constexpr UINT kChunkSamples = 4096;
 
+// Save()/Load()/SaveGranularPreset()/LoadGranularPreset() used to stream
+// their own raw audio to/from the SD card in chunks too, under their own
+// separate kSdStreamChunkSamples constant -- unlike kChunkSamples above
+// (also used by ExportWav()/ImportWav()'s per-block render/convert
+// pipeline, which needs real same-sized scratch buffers per unit of
+// chunk size), those 4 functions f_write()/f_read() directly into/from
+// the caller's own existing SDRAM buffer with no intermediate buffer at
+// all, so chunking there was never paying for anything memory-wise.
+// Real-world measurement chased this down precisely: a Load() timed at
+// ~15s for ~20MB (far below what the SDMMC bus itself can do at either
+// FAST or VERY_FAST) dropped to ~2.5s just by cutting the chunk-call
+// count ~16x (4096 -> 65536 samples/call) for the same total data,
+// isolating ~10.5ms of fixed per-call DMA setup/teardown overhead as
+// the real cost, not bus clock or SD bandwidth (measured at ~12.7MB/s,
+// a believable number for FAST). Since the audio engine is already
+// suspended for this whole call (TriggerLoad()/TriggerSave()), chunking
+// was never protecting real-time audio either -- so those 4 functions
+// now do one f_write()/f_read() per channel, no chunk loop at all.
+
 // Kept inside its own "PERF/" subfolder, same reasoning as "custom/"
 // below -- tidier SD root, and it's still a plain PERFxxx.DAT name
 // underneath so nothing else about the format changes.
@@ -455,14 +474,31 @@ constexpr size_t kFileHeaderV12Size
 void Init()
 {
     SdmmcHandler::Config sd_cfg;
-    // Dropped from STANDARD (25MHz) to MEDIUM_SLOW (12.5MHz) -- this is a
-    // hand-wired SD socket, not a factory module, and an intermittent
-    // FR_INVALID_OBJECT specifically at f_close() (after writes had
-    // already succeeded earlier in the same call) is a classic symptom
-    // of marginal signal integrity at higher SDMMC clock rates rather
-    // than a logic bug. Trades some transfer speed for a lot more
-    // margin, which matters more than raw throughput here.
-    sd_cfg.speed = SdmmcHandler::Speed::MEDIUM_SLOW;
+    // Was MEDIUM_SLOW (12.5MHz), raised to STANDARD (25MHz) and
+    // stress-tested clean (many repeated Performance/Grains/Dexed
+    // saves+loads, no FR_INVALID_OBJECT) -- the original slowdown
+    // assumed a hand-wired SD socket with marginal signal integrity at
+    // higher clock rates, but this is the real Daisy Pod's own built-in
+    // socket, not hand-wired, so that justification didn't hold for
+    // this hardware. The actual intermittent FR_INVALID_OBJECT symptom
+    // was separately diagnosed and fixed this session (TriggerSave()/
+    // TriggerSaveGranularPreset()/TriggerSaveDexedPreset() never
+    // suspending the audio engine during the blocking SD write, racing
+    // the SDMMC DMA transfer -- see g_audio_suspended's own comment in
+    // audio_engine.h). FAST (50MHz) was then also stress-tested clean.
+    // Tried VERY_FAST (ClockDiv=1, 100MHz) next but it gave no felt
+    // speed improvement over FAST -- for files this small, fixed
+    // overhead (f_open/f_close, FAT table updates, directory traversal,
+    // SD command/response round-trips, the card's own internal NAND
+    // write latency) almost certainly dominates total save/load time
+    // far more than the raw bus clock does, so doubling the clock had
+    // nothing left to buy. Reverted back to FAST, which is both
+    // equally fast in practice and further from the SD controller's
+    // spec edge. One single SdmmcHandler/FatFS mount backs every SD
+    // operation in this project (Performance, Dexed preset, and Grains
+    // preset save/load alike), so this setting governs all of them
+    // uniformly -- there's no separate, per-file-type SD path.
+    sd_cfg.speed = SdmmcHandler::Speed::FAST;
     sdmmc.Init(sd_cfg);
 
     FatFSInterface::Config fsi_cfg;
@@ -808,29 +844,26 @@ bool Save(int                slot,
         if(len == 0)
             continue;
 
+        // One f_write() per channel covering the whole layer -- no chunk
+        // loop. See this file's own comment above kChunkSamples for why
+        // (chunking here was pure per-call DMA overhead for no benefit
+        // beyond progress-bar granularity -- removed after measurement).
         float* srcs[2] = {layer.GetBufferL(), layer.GetBufferR()};
         for(int ch = 0; ok && ch < 2; ch++)
         {
-            size_t written = 0;
-            while(ok && written < len)
+            UINT bytes = (UINT)(len * sizeof(float));
+            fr = f_write(&file, srcs[ch], bytes, &bw);
+            ok = fr == FR_OK && bw == bytes;
+            if(!ok)
             {
-                UINT n = (UINT)((len - written) < kChunkSamples ? (len - written)
-                                                                  : kChunkSamples);
-                UINT bytes = n * sizeof(float);
-                fr = f_write(&file, srcs[ch] + written, bytes, &bw);
-                ok = fr == FR_OK && bw == bytes;
-                if(!ok)
-                {
-                    char step[8];
-                    snprintf(step, sizeof(step), "aud%d%d", i, ch);
-                    SetError(step, fr);
-                    break;
-                }
-                written += n;
-                done_units += n;
-                if(on_progress && total_units > 0)
-                    on_progress((float)done_units / (float)total_units);
+                char step[8];
+                snprintf(step, sizeof(step), "aud%d%d", i, ch);
+                SetError(step, fr);
+                break;
             }
+            done_units += len;
+            if(on_progress && total_units > 0)
+                on_progress((float)done_units / (float)total_units);
         }
     }
 
@@ -1035,29 +1068,24 @@ bool Load(int          slot,
 
         if(len > 0)
         {
+            // One f_read() per channel covering the whole layer -- see
+            // Save()'s own comment on why chunking bought nothing here.
             float* dsts[2] = {layer.GetBufferL(), layer.GetBufferR()};
             for(int ch = 0; ok && ch < 2; ch++)
             {
-                size_t got = 0;
-                while(ok && got < len)
+                UINT bytes = (UINT)(len * sizeof(float));
+                fr = f_read(&file, dsts[ch], bytes, &br);
+                ok = fr == FR_OK && br == bytes;
+                if(!ok)
                 {
-                    UINT n_samp = (UINT)((len - got) < kChunkSamples ? (len - got)
-                                                                       : kChunkSamples);
-                    UINT bytes = n_samp * sizeof(float);
-                    fr = f_read(&file, dsts[ch] + got, bytes, &br);
-                    ok = fr == FR_OK && br == bytes;
-                    if(!ok)
-                    {
-                        char step[8];
-                        snprintf(step, sizeof(step), "aud%d%d", i, ch);
-                        SetError(step, fr);
-                        break;
-                    }
-                    got += n_samp;
-                    done_units += n_samp;
-                    if(on_progress && total_units > 0)
-                        on_progress((float)done_units / (float)total_units);
+                    char step[8];
+                    snprintf(step, sizeof(step), "aud%d%d", i, ch);
+                    SetError(step, fr);
+                    break;
                 }
+                done_units += len;
+                if(on_progress && total_units > 0)
+                    on_progress((float)done_units / (float)total_units);
             }
         }
         layer.RestoreRecordedLength(len);
@@ -1157,29 +1185,24 @@ bool SaveGranularPreset(int                                       slot,
 
     size_t total_units = audio_len * 2;
     size_t done_units  = 0;
+    // One f_write() per channel covering the whole capture -- see
+    // Save()'s own comment on why chunking bought nothing here.
     const float* srcs[2] = {audio_l, audio_r};
     for(int ch = 0; ok && ch < 2; ch++)
     {
-        size_t written = 0;
-        while(ok && written < audio_len)
+        UINT bytes = (UINT)(audio_len * sizeof(float));
+        fr = f_write(&file, srcs[ch], bytes, &bw);
+        ok = fr == FR_OK && bw == bytes;
+        if(!ok)
         {
-            UINT n = (UINT)((audio_len - written) < kChunkSamples ? (audio_len - written)
-                                                                    : kChunkSamples);
-            UINT bytes = n * sizeof(float);
-            fr = f_write(&file, srcs[ch] + written, bytes, &bw);
-            ok = fr == FR_OK && bw == bytes;
-            if(!ok)
-            {
-                char step[8];
-                snprintf(step, sizeof(step), "aud%d", ch);
-                SetError(step, fr);
-                break;
-            }
-            written += n;
-            done_units += n;
-            if(on_progress && total_units > 0)
-                on_progress((float)done_units / (float)total_units);
+            char step[8];
+            snprintf(step, sizeof(step), "aud%d", ch);
+            SetError(step, fr);
+            break;
         }
+        done_units += audio_len;
+        if(on_progress && total_units > 0)
+            on_progress((float)done_units / (float)total_units);
     }
 
     FRESULT close_res = f_close(&file);
@@ -1245,28 +1268,24 @@ bool LoadGranularPreset(int                                  slot,
 
     size_t total_units = len * 2;
     size_t done_units  = 0;
+    // One f_read() per channel covering the whole capture -- see
+    // Save()'s own comment on why chunking bought nothing here.
     float* dsts[2]       = {out_audio_l, out_audio_r};
     for(int ch = 0; ok && ch < 2; ch++)
     {
-        size_t got = 0;
-        while(ok && got < len)
+        UINT bytes = (UINT)(len * sizeof(float));
+        fr = f_read(&file, dsts[ch], bytes, &br);
+        ok = fr == FR_OK && br == bytes;
+        if(!ok)
         {
-            UINT n_samp = (UINT)((len - got) < kChunkSamples ? (len - got) : kChunkSamples);
-            UINT bytes  = n_samp * sizeof(float);
-            fr = f_read(&file, dsts[ch] + got, bytes, &br);
-            ok = fr == FR_OK && br == bytes;
-            if(!ok)
-            {
-                char step[8];
-                snprintf(step, sizeof(step), "aud%d", ch);
-                SetError(step, fr);
-                break;
-            }
-            got += n_samp;
-            done_units += n_samp;
-            if(on_progress && total_units > 0)
-                on_progress((float)done_units / (float)total_units);
+            char step[8];
+            snprintf(step, sizeof(step), "aud%d", ch);
+            SetError(step, fr);
+            break;
         }
+        done_units += len;
+        if(on_progress && total_units > 0)
+            on_progress((float)done_units / (float)total_units);
     }
 
     FRESULT close_res = f_close(&file);
@@ -1459,16 +1478,60 @@ int ListDexedPresets(int* out_numbers, int max_out)
 {
     if(!card_ready)
         return 0;
-    int count = 0;
-    for(int slot = DexedSynth::GetNumFactoryPresets() + 1;
-        slot <= kMaxDexedPresets && count < max_out; slot++)
+    // One real directory scan (f_readdir(), same pattern as
+    // ListImportWavFiles() above) instead of the ~370 individual
+    // f_stat() calls (one per possible slot from GetNumFactoryPresets()
+    // up to kMaxDexedPresets=3500) this used to do -- each f_stat() is
+    // a real, separate SD filesystem lookup with its own real latency,
+    // same per-call overhead class diagnosed and fixed for bulk audio
+    // streaming elsewhere in this file (see kChunkSamples's own doc
+    // comment), just never applied here before. Confirmed as the real
+    // cause of a genuinely slow, audible-on-hardware delay entering
+    // Dexed's Preset page (RefreshDexedPresetSlots()) -- Grains' own
+    // equivalent (ListGranularPresets()) has the same f_stat()-loop
+    // shape but only scans up to kMaxGranularPresets=99, ~4x fewer
+    // calls, which was fast/quiet enough never to be noticed.
+    static DIR dir; // see the DTCMRAM/DMA comment on Save() above
+    if(f_opendir(&dir, "DEXP") != FR_OK)
+        return 0; // no DEXP/ folder yet -- not an error, just nothing to list
+
+    int first_user_slot = DexedSynth::GetNumFactoryPresets() + 1;
+    int count            = 0;
+    static FILINFO fno; // see the DTCMRAM/DMA comment on Save() above
+    while(count < max_out)
     {
-        char    fname[24];
-        FILINFO fno;
-        DexedPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) == FR_OK)
-            out_numbers[count++] = slot;
+        if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0)
+            break; // error or end of directory
+        if(fno.fattrib & AM_DIR)
+            continue;
+        int slot = 0;
+        if(sscanf(fno.fname, "PRES%d.DAT", &slot) != 1)
+            continue; // not a real preset file (stray/foreign), skip
+        if(slot < first_user_slot || slot > kMaxDexedPresets)
+            continue; // guard against a corrupt/out-of-range name
+        out_numbers[count++] = slot;
     }
+    f_closedir(&dir);
+
+    // f_readdir() returns entries in whatever order the FAT directory
+    // itself stores them (creation order, not numeric) -- the old
+    // f_stat()-loop version always produced ascending slot order by
+    // construction, and callers (the Preset browser) expect that same
+    // ordering, so sort before returning. count is always small (at
+    // most max_out, itself bounded well under kMaxDexedPresets), so a
+    // plain insertion sort is plenty.
+    for(int i = 1; i < count; i++)
+    {
+        int key = out_numbers[i];
+        int j   = i - 1;
+        while(j >= 0 && out_numbers[j] > key)
+        {
+            out_numbers[j + 1] = out_numbers[j];
+            j--;
+        }
+        out_numbers[j + 1] = key;
+    }
+
     return count;
 }
 
@@ -1479,14 +1542,52 @@ int NextFreeDexedPresetSlot(int search_from)
     int first = DexedSynth::GetNumFactoryPresets() + 1;
     if(search_from > first)
         first = search_from;
-    for(int slot = first; slot <= kMaxDexedPresets; slot++)
+
+    // One real directory scan (same fix/reasoning as ListDexedPresets()
+    // above) instead of this function's own former f_stat()-per-slot
+    // loop -- same bug class, just less exercised there (the old loop
+    // usually found a free slot, and stopped, quickly in the common
+    // case of mostly-contiguous saves; it only paid its full per-slot
+    // cost in a less common case -- many scattered gaps, or saving
+    // right after deleting a whole block of old presets). Marks every
+    // existing file's own bit in a packed bitmap, indexed directly by
+    // its slot number, rather than reusing ListDexedPresets() itself:
+    // that function caps its own output at max_out, and f_readdir()'s
+    // directory order has no relationship to slot number order, so a
+    // capped call could miss a real gap below a slot it happened not
+    // to enumerate yet. A full-range bitmap has no such cap -- every
+    // entry found sets its own precise bit, in any order, and
+    // kMaxDexedPresets=3500 packs into (3500+8)/8 = ~438 bytes, far
+    // cheaper than a plain int array over the same range.
+    static uint8_t used[(kMaxDexedPresets + 8) / 8];
+    memset(used, 0, sizeof(used));
+
+    static DIR dir;
+    if(f_opendir(&dir, "DEXP") == FR_OK)
     {
-        char    fname[24];
-        FILINFO fno;
-        DexedPresetFilename(slot, fname, sizeof(fname));
-        if(f_stat(fname, &fno) != FR_OK)
-            return slot;
+        static FILINFO fno; // see the DTCMRAM/DMA comment on Save() above
+        while(true)
+        {
+            if(f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0)
+                break; // error or end of directory
+            if(fno.fattrib & AM_DIR)
+                continue;
+            int slot = 0;
+            if(sscanf(fno.fname, "PRES%d.DAT", &slot) != 1)
+                continue; // not a real preset file (stray/foreign), skip
+            if(slot < 1 || slot > kMaxDexedPresets)
+                continue; // guard against a corrupt/out-of-range name
+            used[slot / 8] |= (uint8_t)(1u << (slot % 8));
+        }
+        f_closedir(&dir);
     }
+    // No DEXP/ folder at all yet -- every slot is free, used[] stays
+    // all-zero from the memset above, same as the loop below finding
+    // nothing taken.
+
+    for(int slot = first; slot <= kMaxDexedPresets; slot++)
+        if(!(used[slot / 8] & (1u << (slot % 8))))
+            return slot;
     return -1;
 }
 
@@ -2397,20 +2498,28 @@ bool ExportWav(TempoClock&  tempo,
     // Local shared reverb bus, mirroring main.cpp's fx_reverb_shared --
     // every layer's Send-scaled signal (see LooperLayer::Process()'s
     // reverb_send_out parameter) is summed and run through this ONE
-    // instance, same as live playback. `static` (not stack-local) AND
-    // SDRAM-placed like main.cpp's, since it's the same ~386KB object --
+    // instance, same as live playback. `static` (not stack-local) --
     // this project's stack lives in DTCMRAM (128K total), nowhere near
-    // enough room. Primed by pass 0 below same as the master filter.
-    // Zeroed before every Init() call, same reasoning as main.cpp's
-    // fx_reverb_shared and LooperLayer::Init()'s fx_phaser:
-    // .sdram_bss isn't zero-initialized by startup code, so this object's
-    // memory is raw leftover contents the first time this runs, and
-    // (being `static`) whatever a previous export call left behind on
-    // every call after that -- re-zeroing each time keeps every export
-    // starting from the same clean state.
-    static DattorroReverb DSY_SDRAM_BSS export_reverb;
-    memset(&export_reverb, 0, sizeof(export_reverb));
-    export_reverb.Init((float)sample_rate);
+    // enough room for the ~166KB export_reverb_storage below. Kept as
+    // its own fully independent instance/storage rather than sharing
+    // main.cpp's live fx_reverb_shared/fx_reverb_storage: exports run
+    // with the real-time engine suspended, but reusing the live
+    // reverb's own tank would leave it clobbered by whatever this
+    // export just rendered once playback resumes. Primed by pass 0
+    // below same as the master filter. export_reverb itself is a plain
+    // object now (see DattorroReverbStorage's own doc comment for why
+    // only the big delay buffers need SDRAM); export_reverb_storage is
+    // zeroed before every Init() call, same reasoning as main.cpp's
+    // fx_reverb_storage and LooperLayer::Init()'s fx_phaser:
+    // .sdram_bss isn't zero-initialized by startup code, so this
+    // object's memory is raw leftover contents the first time this
+    // runs, and (being `static`) whatever a previous export call left
+    // behind on every call after that -- re-zeroing each time keeps
+    // every export starting from the same clean state.
+    static DattorroReverbStorage DSY_SDRAM_BSS export_reverb_storage;
+    static DattorroReverb        export_reverb;
+    memset(&export_reverb_storage, 0, sizeof(export_reverb_storage));
+    export_reverb.Init((float)sample_rate, export_reverb_storage);
     // All 7 parameters re-applied from the live values passed in, same
     // treatment as main.cpp's AudioCallback() -- so an exported WAV
     // actually matches live playback instead of silently falling back

@@ -284,6 +284,14 @@ class DexedSynth
     // The real, committed voice count -- chosen from Phase 2's own
     // hardware CPU measurement (see the class doc comment above), not a
     // guess or a value carried over from any other engine.
+    //
+    // Briefly dropped to 4 as a static, always-on cap to recover CPU
+    // headroom for a full chord + Grains both active together hitting
+    // 100% -- reverted: a flat cap also limits Dexed-alone polyphony
+    // even with Grains off and CPU to spare, which wasn't the intent.
+    // A real fix for the chord+Grains case specifically would need a
+    // runtime-conditional limit (lower only while Grains is actually
+    // active), not a fixed array size -- not yet implemented.
     static constexpr int kMaxVoices = 10;
 
   private:

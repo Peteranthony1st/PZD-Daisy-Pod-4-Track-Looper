@@ -1408,6 +1408,109 @@ Cortex-M7 cores with a hardware FPU, same DSP class; Teensy's ~25%
 higher clock and its PSRAM-gated extra polyphony explain its own specs,
 not this specific behavior.
 
+### Skipping idle voices in RenderQuantum()
+
+A real, free CPU win, found while investigating a report that Dexed and
+Grains together were overloading the CPU: `RenderQuantum()` was calling
+every one of the `kMaxVoices = 10` voice slots' `note.compute()`
+*unconditionally* every block, on the assumption (stated directly in
+this file's own prior wording of that loop's comment) that msfa's own
+internal gain threshold made a silent voice's cost negligible. Checking
+msfa's actual `Dx7Note::compute()` disproved that: there is no
+early-exit in there at all — every operator's full pitch/amp-mod/
+envelope math runs regardless of whether that voice is sounding. A
+typical played note uses only a few of the 10 slots at once, so this
+meant paying for several voices' full FM synthesis every single block
+for nothing. `VoiceIsIdle()` (already trusted elsewhere in this same
+file for voice-stealing allocation — see *Voice architecture* above)
+checks the real per-operator envelope state, so `RenderQuantum()` now
+skips `compute()` entirely for any voice that is both unheld and
+confirmed idle by that same check — provably silent already, not a
+guess, and a voice can never get stuck wrongly skipped since a new
+`NoteOn()` always re-triggers whichever voice it allocates. Confirmed
+on real hardware as a genuine (if modest) CPU reduction — the saving is
+proportional to how many of the 10 slots are actually idle, so it helps
+most for sparse/single-note playing and least for a dense chord using
+most or all of them at once.
+
+**The chord+Grains CPU ceiling, and a reverted experiment**: real
+hardware testing confirmed a full chord plus Grains both active
+together still reaches ~100% CPU even with the idle-voice skip above —
+expected, since a dense chord keeps most/all 10 voices legitimately
+sounding, leaving little idle to skip. Lowering the hard polyphony cap
+itself (`kMaxVoices`, 10 → 4) was tried as a direct way to recover
+headroom for exactly that combination, and was reverted at the user's
+own request: a flat, compile-time cap also limits Dexed's own
+*standalone* polyphony, even with Grains completely off and CPU to
+spare, which wasn't the actual intent. A real fix targeting the
+chord+Grains combination specifically would need a runtime-conditional
+polyphony limit — full 10 voices while Grains is idle, capped lower
+only while Grains is actually producing output — rather than a fixed
+array size; not yet implemented.
+
+### Preset directory listing: one real scan instead of hundreds of f_stat() calls
+
+A real hardware report ("slow to get to the Dexed save/load screen,
+and makes a quiet electrical sound — also happens loading
+performances") led to a wrong guess corrected by actually checking the
+code. Dexed's factory presets are baked into QSPI flash
+(`dexed_factory_data.cpp`'s `const uint8_t kXxxPacked[8192]` arrays) on
+this `BOOT_QSPI` build, so the first theory was that the Preset page
+was doing real QSPI flash reads Grains never does (it has no baked-in
+presets at all). Checking `GetFactoryCategoryCount()` disproved that —
+it's a trivial, instant lookup into a small static table, not a scan of
+anything. The real cause was in `performance_store.cpp`:
+`ListDexedPresets()` looped every possible user slot number
+(`GetNumFactoryPresets() + 1` through `kMaxDexedPresets = 3500`, ~370
+iterations) calling `f_stat()` once per slot — a real, individual SD
+filesystem lookup each time, every single time the Preset page was
+entered. The exact same per-call SD overhead class already diagnosed
+and fixed for bulk audio streaming (see *Removing the chunk loop*
+above), just never applied to directory listing. `ListGranularPresets()`
+has the identical `f_stat()`-loop shape, but only scans up to
+`kMaxGranularPresets = 99` — ~4x fewer calls, fast/quiet enough that it
+was never noticed as a problem, which is what first pointed away from
+Grains and toward Dexed specifically.
+
+Fixed by replacing the loop with one real `f_opendir()`/`f_readdir()`/
+`f_closedir()` scan of the `DEXP/` folder (same pattern this file
+already uses in `ListImportWavFiles()`), parsing each filename's slot
+number directly instead of probing for it. Confirmed much faster on
+hardware, and the electrical sound got noticeably quieter too —
+consistent with it being genuine electrical coupling from the SD
+card's own bus activity (confirmed separately: the *same* sound occurs
+during a Performance Load, which runs with the audio engine fully
+suspended — output forced to literal digital zero — so it cannot be a
+digital audio artifact; it has to be something electrical), not fully
+eliminated since Performance Load's own (now much shorter, but still
+real) SD transfers remain. `NextFreeDexedPresetSlot()` had the exact
+same `f_stat()`-loop shape (used when saving a *new* preset, searching
+for the next free slot) — fixed the same way, except via a packed
+bitmap (one bit per slot, ~438 bytes for the full `kMaxDexedPresets`
+range) rather than reusing `ListDexedPresets()` itself: that function
+caps its own output at `max_out`, and `f_readdir()`'s directory order
+has no relationship to slot-number order, so a capped call could
+miss a real gap below a slot it simply hadn't enumerated yet. A full
+bitmap has no such cap — every file found sets its own precise bit,
+in any order.
+
+One subtlety the fix had to preserve deliberately: the old loop always
+produced slots in ascending numeric order by construction; `f_readdir()`
+returns entries in whatever order the FAT directory itself stores them
+(creation order, not numeric), and the Preset browser UI expects
+ascending order — so `ListDexedPresets()`'s new version sorts its
+(always small) result before returning.
+
+Controls and LEDs were checked as a possible other source of CPU
+competition while investigating this, and ruled out: button/knob/
+encoder polling runs on a dedicated TIM5 ISR at a guaranteed 1kHz,
+independent of and lower-priority than the audio DMA ISR, doing only a
+few GPIO/already-DMA-converted-ADC reads per tick; LEDs update once
+per main-loop iteration via pure software PWM (one phase-accumulator
+add, one compare, one GPIO write per color channel). Neither is
+measured by the CPU meter (which only ever covers `AudioCallback()`'s
+own time) and neither is a realistic contributor to any of this.
+
 ## Dexed advanced editor (Screen::DexedOperator)
 
 The per-operator FM editor referenced in *Dexed*'s own Presets section
@@ -2159,6 +2262,65 @@ reasons (consistent layer/tempo state while restoring); Save needed the
 same guard purely to stop it from racing the DMA, since Save only reads
 layer state and never mutates it.
 
+### Removing the chunk loop: ~15s → ~1.8s for a 20MB Performance load
+
+`Save()`/`Load()`/`SaveGranularPreset()`/`LoadGranularPreset()` used to
+stream their own raw audio to/from the SD card in small chunks
+(`kChunkSamples`, 4096 samples/call, same constant `ExportWav()`/
+`ImportWav()`'s own per-block render pipeline still uses), on the
+assumption that chunking was needed to keep progress updates responsive
+and avoid some unmeasured "per-call SD overhead." A real hardware
+report ("it takes about 30 seconds to load a performance") led to
+actually timing it: a 20MB Performance load measured at **~15s**,
+working out to only ~1.3MB/s effective throughput — far below what the
+SDMMC bus itself should sustain even at `FAST` (50MHz/4-bit). Raising
+the SD card's own clock further, to `VERY_FAST` (100MHz, the fastest
+`SdmmcHandler::Speed` offers), made no felt difference at all,
+confirming the bottleneck was never bus clock. The real cause,
+isolated by comparing two chunk sizes on real hardware: ~10.5ms of
+**fixed overhead per `f_read()`/`f_write()` call** (DMA setup/
+teardown), not bandwidth — the true sustained throughput, once that
+fixed cost is subtracted out, measured at a believable ~12.7MB/s for
+`FAST`.
+
+These four functions, unlike `ExportWav()`/`ImportWav()`'s own
+per-block pipeline, read/write directly into/from the caller's already-
+existing SDRAM buffer with no intermediate scratch buffer at all — so,
+unlike that pipeline (which genuinely needs a same-sized buffer per
+unit of chunk size, and stays on the original small `kChunkSamples`),
+raising or removing their chunk size costs nothing extra in memory.
+Bumping the chunk 16x (4096 → 65536 samples/call) alone cut the same
+20MB load to ~2.46s. Chunking here was also never protecting real-time
+audio continuity either — `g_audio_suspended` already blocks the whole
+operation (see above), so `AudioCallback()` never runs concurrently
+with it regardless of chunk size. With nothing left chunking was
+actually buying beyond progress-bar granularity, these four functions
+now do **one `f_write()`/`f_read()` per channel**, no chunk loop at
+all — landing the same 20MB load at **~1.83s**, roughly an 8x
+improvement over the original ~15s, confirmed clean on repeated
+Performance/Grains saves and loads.
+
+**A real bug this surfaced**: `TriggerLoadGranularPreset()` turned out
+to be the one load/save function in `ui.cpp` still missing its own
+`g_audio_suspended` guard (every other one already has it — see above).
+The old small chunking had apparently kept the audio-ISR-vs-SDMMC-DMA
+contention window narrow enough to avoid visibly tripping it; removing
+the chunk loop widened a Grains preset load into one long, uninterrupted
+transfer, wide enough to reliably fail with `AUD0:1` (FatFs
+`FR_DISK_ERR`) on real hardware. A narrower fix was tried first —
+detaching just the granular engine from the buffer being overwritten
+(`GranularEngine::SetSource(nullptr, nullptr, 0)` for the duration,
+restoring the real source afterward) — on the theory that the race was
+specifically `GranularEngine::Process()` reading `src_l_`/`src_r_`
+while the SD DMA transfer rewrote them. Real hardware testing disproved
+this directly: the failure persisted identically with the engine fully
+detached, ruling out a buffer-specific race and confirming the same
+general contention class as the original "close9" bug. Fixed instead
+with the same full `g_audio_suspended` wrap every analogous function
+already uses — yes, this does silence Dexed and the Looper layers too
+for the ~1-2s a Grains load now takes, but real hardware testing showed
+that's genuinely not avoidable here, not an unnecessarily blunt hammer.
+
 ### Save-file "bubbles"
 
 A performance deals **only** with the looper (audio + tempo/global/
@@ -2408,6 +2570,60 @@ A few things that are intentional, not bugs:
   macro above needs
 - `Makefile` — source list for the build, `APP_TYPE`/`LDSCRIPT` overrides
   for the bootloader/QSPI build (see below)
+
+## Compiler optimization flags
+
+`src/Makefile`'s `OPT` was `-Os` originally (justified by flash space
+that's no longer tight — see *Boot process* below), raised to `-O2`
+then `-O3` in an earlier session, each measured as a real win on
+hardware via the Global:Mixer CPU meter, not assumed. Two more levers
+exist past `-O3` itself, both added and measured this session, neither
+enabled by default by any `-O` level:
+
+**`-ffast-math`**: `-O2`/`-O3` only change inlining/unrolling
+heuristics within strict IEEE float semantics. This whole audio path
+is float-math-bound DSP (FM synthesis, granular, reverb, filters), so
+relaxing that (allowing reassociation, faster reciprocal/division,
+assuming no NaN/Inf) is a real, separate lever, not just more of the
+same knob. Measured on hardware: idle 8%→6%, reverb 32%→30%,
+reverb+delay+Dexed 44%→42% — a consistent ~2pt reduction across every
+scenario tested. Real trade-off, not a free win like `-O2`/`-O3` were:
+output is no longer strict IEEE-compliant floating point (common and
+generally safe for audio DSP, but a genuine semantic change) —
+confirmed clean by ear afterward across Dexed, Grains, and reverb/delay
+tails under real playing, not just measured.
+
+**`-flto`** (link-time optimization): every other flag here optimizes
+each `.cpp` file in isolation — the compiler working on
+`dexed_synth.cpp` has zero visibility into `dx7note.cpp`/
+`fm_core.cpp`/`env.cpp`/etc. even though it calls into all of them
+every audio block, so those stay real function calls (no inlining, no
+cross-file constant propagation) no matter how aggressive the per-file
+flags get. `-flto` defers final optimization to the link step, once
+every object file is being combined, so the compiler can see and
+optimize across those boundaries too — real potential upside
+specifically because this project's hot audio path (the whole msfa DX7
+core alone is 11 separate `.cpp` files) is this fragmented. Needs the
+flag on both `CFLAGS` (so each object file carries LTO info) and
+`LDFLAGS` (so the final link actually performs the merge) — `$(OPT)`
+added to `LDFLAGS` too, since GCC's LTO re-optimizes at link time using
+whatever `-O` level the *link* command itself gets, not whatever was
+used per-file originally. The simple baselines barely moved further
+(idle 6%, reverb 29-30%, reverb+delay+Dexed 41% — expected, not much
+cross-file call overhead to inline away there), but the heaviest real
+scenario tested (4 active layers, reverb, fast Dexed playing) dropped
+from 85-90% peak to **72% peak** — a substantial win concentrated
+exactly where the theory predicts it should be, since that scenario
+has the most cross-file call graph (Dexed's 11-file msfa core, Looper,
+reverb) active at once. Real trade-off: noticeably longer build times,
+a modest code-size increase (QSPI flash usage ticked up from more
+aggressive inlining), and whole-program visibility can occasionally
+surface latent bugs that happened to work under separate compilation —
+confirmed real once, not just theoretical: enabling LTO surfaced a
+genuine pre-existing `-Wformat` bug (a `%d` format specifier fed an
+`unsigned long` argument, in since-removed temporary load-timing
+instrumentation) that `-O3` alone had never caught. Confirmed clean by
+ear afterward, same as `-ffast-math` above.
 
 ## Boot process: bootloader + QSPI flash
 

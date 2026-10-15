@@ -322,26 +322,41 @@ void DexedSynth::RenderQuantum()
     int32_t lfo_val   = lfo_.getsample();
     int32_t lfo_delay = lfo_.getdelay();
 
-    // Every voice, unconditionally -- see the class doc comment and
-    // Init()'s own comment for why this is both correct (every voice is
-    // pre-init()'d, never garbage) and already cheap for a silent one
-    // (msfa's own internal gain threshold collapses its real per-sample
-    // cost, no bookkeeping needed here to get that).
+    // Every voice NOT already confirmed idle -- used to unconditionally
+    // compute() every one of the kMaxVoices slots every block on the
+    // theory that msfa's own internal gain threshold made a silent
+    // voice already cheap, but that was never actually true: msfa runs
+    // the full per-operator pitch/amp-mod/envelope math (see
+    // Dx7Note::compute()) regardless of whether a voice is sounding --
+    // there's no early-exit in there at all. A played note typically
+    // uses only a few of the kMaxVoices=10 slots at once, so computing
+    // all 10 unconditionally meant paying for several silent voices'
+    // full FM synthesis on every single block for nothing. VoiceIsIdle()
+    // (see its own comment -- already trusted elsewhere in this file for
+    // voice-stealing allocation) checks the real per-operator envelope
+    // state, so skipping compute() once a free voice is confirmed idle
+    // is provably silent already, not a guess -- a NEW NoteOn always
+    // re-triggers whichever voice it allocates, so a skipped voice can
+    // never get stuck silent when it shouldn't be.
     //
-    // Each voice renders into its own freshly-zeroed voice_scratch_,
-    // gets clamped (kVoiceClampQ24) and converted to float, THEN summed
-    // into stage_f_ -- see voice_scratch_'s own doc comment in
-    // dexed_synth.h for why every voice previously sharing one raw
-    // int32_t accumulator (no clamp at all) was a real bug, not just a
-    // style choice, and matches how the reference implementation
+    // Each computed voice renders into its own freshly-zeroed
+    // voice_scratch_, gets clamped (kVoiceClampQ24) and converted to
+    // float, THEN summed into stage_f_ -- see voice_scratch_'s own doc
+    // comment in dexed_synth.h for why every voice previously sharing
+    // one raw int32_t accumulator (no clamp at all) was a real bug, not
+    // just a style choice, and matches how the reference implementation
     // (positionhigh/MicroDexed-touch's Synth_Dexed) does this same step.
     int held = 0;
     for(int i = 0; i < kMaxVoices; i++)
     {
+        bool is_held = voices_[i].held_note != -1;
+        if(is_held)
+            held++;
+        else if(VoiceIsIdle(i))
+            continue; // confirmed fully silent -- nothing to compute or add
+
         std::memset(voice_scratch_, 0, sizeof(voice_scratch_));
         voices_[i].note.compute(voice_scratch_, lfo_val, lfo_delay, &ctrls_);
-        if(voices_[i].held_note != -1)
-            held++;
 
         for(int j = 0; j < kMsfaBlock; j++)
         {

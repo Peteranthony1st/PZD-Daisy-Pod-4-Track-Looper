@@ -1,4 +1,5 @@
 #include "dattorro_reverb.h"
+#include "itcm.h"
 #include <cstring>
 
 // Real delay lengths and tap offsets below are el-visio/dattorro-verb's own
@@ -76,68 +77,68 @@ float DattorroReverb::ProcessLowPass(float& state, float freq, float in)
     return state;
 }
 
-void DattorroReverb::Init(float /*sample_rate*/)
+void DattorroReverb::Init(float /*sample_rate*/, DattorroReverbStorage& storage)
 {
     // Hardcoded for 48kHz, see this class's own header comment.
-    memset(pre_delay_storage_, 0, sizeof(pre_delay_storage_));
-    memset(in_diffusion0_storage_, 0, sizeof(in_diffusion0_storage_));
-    memset(in_diffusion1_storage_, 0, sizeof(in_diffusion1_storage_));
-    memset(in_diffusion2_storage_, 0, sizeof(in_diffusion2_storage_));
-    memset(in_diffusion3_storage_, 0, sizeof(in_diffusion3_storage_));
-    memset(decay_diffusion1_storage0_, 0, sizeof(decay_diffusion1_storage0_));
-    memset(decay_diffusion1_storage1_, 0, sizeof(decay_diffusion1_storage1_));
-    memset(pre_damping_storage0_, 0, sizeof(pre_damping_storage0_));
-    memset(pre_damping_storage1_, 0, sizeof(pre_damping_storage1_));
-    memset(decay_diffusion2_storage0_, 0, sizeof(decay_diffusion2_storage0_));
-    memset(decay_diffusion2_storage1_, 0, sizeof(decay_diffusion2_storage1_));
-    memset(post_damping_storage0_, 0, sizeof(post_damping_storage0_));
-    memset(post_damping_storage1_, 0, sizeof(post_damping_storage1_));
+    memset(storage.pre_delay_storage_, 0, sizeof(storage.pre_delay_storage_));
+    memset(storage.in_diffusion0_storage_, 0, sizeof(storage.in_diffusion0_storage_));
+    memset(storage.in_diffusion1_storage_, 0, sizeof(storage.in_diffusion1_storage_));
+    memset(storage.in_diffusion2_storage_, 0, sizeof(storage.in_diffusion2_storage_));
+    memset(storage.in_diffusion3_storage_, 0, sizeof(storage.in_diffusion3_storage_));
+    memset(storage.decay_diffusion1_storage0_, 0, sizeof(storage.decay_diffusion1_storage0_));
+    memset(storage.decay_diffusion1_storage1_, 0, sizeof(storage.decay_diffusion1_storage1_));
+    memset(storage.pre_damping_storage0_, 0, sizeof(storage.pre_damping_storage0_));
+    memset(storage.pre_damping_storage1_, 0, sizeof(storage.pre_damping_storage1_));
+    memset(storage.decay_diffusion2_storage0_, 0, sizeof(storage.decay_diffusion2_storage0_));
+    memset(storage.decay_diffusion2_storage1_, 0, sizeof(storage.decay_diffusion2_storage1_));
+    memset(storage.post_damping_storage0_, 0, sizeof(storage.post_damping_storage0_));
+    memset(storage.post_damping_storage1_, 0, sizeof(storage.post_damping_storage1_));
 
-    InitDelayBuffer(pre_delay_, pre_delay_storage_, kPreDelayCapacity,
+    InitDelayBuffer(pre_delay_, storage.pre_delay_storage_, kPreDelayCapacity,
                      (uint16_t)kPreDelayLen);
 
-    InitDelayBuffer(in_diffusion_[0], in_diffusion0_storage_, kInDiffusion0Capacity,
+    InitDelayBuffer(in_diffusion_[0], storage.in_diffusion0_storage_, kInDiffusion0Capacity,
                      (uint16_t)kInDiffusion0Len);
-    InitDelayBuffer(in_diffusion_[1], in_diffusion1_storage_, kInDiffusion1Capacity,
+    InitDelayBuffer(in_diffusion_[1], storage.in_diffusion1_storage_, kInDiffusion1Capacity,
                      (uint16_t)kInDiffusion1Len);
-    InitDelayBuffer(in_diffusion_[2], in_diffusion2_storage_, kInDiffusion2Capacity,
+    InitDelayBuffer(in_diffusion_[2], storage.in_diffusion2_storage_, kInDiffusion2Capacity,
                      (uint16_t)kInDiffusion2Len);
-    InitDelayBuffer(in_diffusion_[3], in_diffusion3_storage_, kInDiffusion3Capacity,
+    InitDelayBuffer(in_diffusion_[3], storage.in_diffusion3_storage_, kInDiffusion3Capacity,
                      (uint16_t)kInDiffusion3Len);
 
-    InitDelayBuffer(decay_diffusion1_[0], decay_diffusion1_storage0_,
+    InitDelayBuffer(decay_diffusion1_[0], storage.decay_diffusion1_storage0_,
                      kDecayDiffusion1Capacity, (uint16_t)kDecayDiffusion1Len);
-    InitDelayBuffer(decay_diffusion1_[1], decay_diffusion1_storage1_,
+    InitDelayBuffer(decay_diffusion1_[1], storage.decay_diffusion1_storage1_,
                      kDecayDiffusion1Capacity, (uint16_t)kDecayDiffusion1Len1);
 
-    InitDelayBuffer(pre_damping_[0], pre_damping_storage0_, kPreDampingCapacity,
+    InitDelayBuffer(pre_damping_[0], storage.pre_damping_storage0_, kPreDampingCapacity,
                      (uint16_t)kPreDamping0Len);
     SetTapDelay(pre_damping_[0], kTapOut1, 353);
     SetTapDelay(pre_damping_[0], kTapOut2, 3627);
     SetTapDelay(pre_damping_[0], kTapOut3, 1990);
 
-    InitDelayBuffer(pre_damping_[1], pre_damping_storage1_, kPreDampingCapacity,
+    InitDelayBuffer(pre_damping_[1], storage.pre_damping_storage1_, kPreDampingCapacity,
                      (uint16_t)kPreDamping1Len);
     SetTapDelay(pre_damping_[1], kTapOut1, 266);
     SetTapDelay(pre_damping_[1], kTapOut2, 2974);
     SetTapDelay(pre_damping_[1], kTapOut3, 2111);
 
-    InitDelayBuffer(decay_diffusion2_[0], decay_diffusion2_storage0_,
+    InitDelayBuffer(decay_diffusion2_[0], storage.decay_diffusion2_storage0_,
                      kDecayDiffusion2Capacity0, (uint16_t)kDecayDiffusion2Len0);
     SetTapDelay(decay_diffusion2_[0], kTapOut1, 187);
     SetTapDelay(decay_diffusion2_[0], kTapOut2, 1228);
 
-    InitDelayBuffer(decay_diffusion2_[1], decay_diffusion2_storage1_,
+    InitDelayBuffer(decay_diffusion2_[1], storage.decay_diffusion2_storage1_,
                      kDecayDiffusion2Capacity1, (uint16_t)kDecayDiffusion2Len1);
     SetTapDelay(decay_diffusion2_[1], kTapOut1, 335);
     SetTapDelay(decay_diffusion2_[1], kTapOut2, 1913);
 
-    InitDelayBuffer(post_damping_[0], post_damping_storage0_, kPostDampingCapacity,
+    InitDelayBuffer(post_damping_[0], storage.post_damping_storage0_, kPostDampingCapacity,
                      (uint16_t)kPostDamping0Len);
     SetTapDelay(post_damping_[0], kTapOut1, 1066);
     SetTapDelay(post_damping_[0], kTapOut2, 2673);
 
-    InitDelayBuffer(post_damping_[1], post_damping_storage1_, kPostDampingCapacity,
+    InitDelayBuffer(post_damping_[1], storage.post_damping_storage1_, kPostDampingCapacity,
                      (uint16_t)kPostDamping1Len);
     SetTapDelay(post_damping_[1], kTapOut1, 121);
     SetTapDelay(post_damping_[1], kTapOut2, 1996);
@@ -203,6 +204,12 @@ void DattorroReverb::SetDecayDiffusion01(float v01)
     decay_diffusion1_amount_ = v01;
 }
 
+// Runs once per sample, unconditionally, whenever reverb isn't bypassed
+// (see main.cpp's reverb_bypassed) -- the one function in the real-time
+// call graph that hadn't already been moved to ITCM (DexedSynth's own
+// RenderQuantum()/Process() already are; see itcm.h's own doc comment
+// for the general policy).
+DSY_ITCM_TEXT
 void DattorroReverb::Process(float in1, float in2, float* out1, float* out2)
 {
     // Mono-sum into the tank -- see this class's own header comment on why.

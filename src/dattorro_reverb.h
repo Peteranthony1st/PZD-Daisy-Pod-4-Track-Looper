@@ -29,13 +29,53 @@
 // the original library's own magic numbers (e.g. the 100ms pre-delay
 // ceiling) are tuned for exactly this rate and were never actually
 // parameterized by sample rate in the original either.
+// The 13 real delay-line buffers (~166KB total -- see this class's own
+// doc comment for the ReverbSc comparison), split out into their own
+// plain POD struct so they can be placed in SDRAM independently of
+// everything else in DattorroReverb below. Those arrays are too big
+// for internal SRAM and have to live in external SDRAM; nothing else
+// in this reverb does, and keeping tiny, constantly-touched bookkeeping
+// fields (DelayBuffer's own mask_/read_offset_, the "amount" scalars)
+// bundled into the same SDRAM-placed object as these forced them to
+// pay SDRAM's own real per-access latency on every single sample for
+// no reason -- see DattorroReverb's own class doc comment for the full
+// story. Caller declares one of these DSY_SDRAM_BSS and passes it into
+// Init(); DattorroReverb itself no longer needs any SDRAM placement at
+// all.
+struct DattorroReverbStorage
+{
+    float pre_delay_storage_[8192];
+    float in_diffusion0_storage_[256];
+    float in_diffusion1_storage_[128];
+    float in_diffusion2_storage_[512];
+    float in_diffusion3_storage_[512];
+    float decay_diffusion1_storage0_[1024];
+    float decay_diffusion1_storage1_[1024];
+    float pre_damping_storage0_[8192];
+    float pre_damping_storage1_[8192];
+    float decay_diffusion2_storage0_[2048];
+    float decay_diffusion2_storage1_[4096];
+    float post_damping_storage0_[4096];
+    float post_damping_storage1_[4096];
+};
+
+// Split from DattorroReverbStorage above (see its own doc comment for
+// why): this class now holds only small, frequently-touched bookkeeping
+// state (DelayBuffer structs, filter/damping state, the "amount"
+// coefficients) -- nothing here is too big for ordinary SRAM, so unlike
+// daisysp::ReverbSc or this class's own previous single-object shape,
+// the caller declares this as a PLAIN object (no DSY_SDRAM_BSS), and
+// separately declares one DattorroReverbStorage (which DOES still need
+// DSY_SDRAM_BSS) to pass into Init().
 class DattorroReverb
 {
   public:
     // sample_rate is accepted for API-shape parity with
     // daisysp::ReverbSc::Init() but not otherwise used -- see this
-    // class's own doc comment above.
-    void Init(float sample_rate);
+    // class's own doc comment above. storage is the caller-owned,
+    // separately-SDRAM-placed backing store for the 13 big delay
+    // buffers -- see DattorroReverbStorage's own doc comment.
+    void Init(float sample_rate, DattorroReverbStorage& storage);
 
     void Process(float in1, float in2, float* out1, float* out2);
 
@@ -128,23 +168,14 @@ class DattorroReverb
     // (MAX_PREDELAY).
     static constexpr uint16_t kMaxPreDelaySamples = 4800;
 
-    // Also plain, uninitialized members (no `= {}`) -- see DelayBuffer's
-    // own comment above for why. Init() memsets every storage array and
-    // the setters it calls fill in every "amount"/state field.
-    float pre_delay_storage_[kPreDelayCapacity];
-    float in_diffusion0_storage_[kInDiffusion0Capacity];
-    float in_diffusion1_storage_[kInDiffusion1Capacity];
-    float in_diffusion2_storage_[kInDiffusion2Capacity];
-    float in_diffusion3_storage_[kInDiffusion3Capacity];
-    float decay_diffusion1_storage0_[kDecayDiffusion1Capacity];
-    float decay_diffusion1_storage1_[kDecayDiffusion1Capacity];
-    float pre_damping_storage0_[kPreDampingCapacity];
-    float pre_damping_storage1_[kPreDampingCapacity];
-    float decay_diffusion2_storage0_[kDecayDiffusion2Capacity0];
-    float decay_diffusion2_storage1_[kDecayDiffusion2Capacity1];
-    float post_damping_storage0_[kPostDampingCapacity];
-    float post_damping_storage1_[kPostDampingCapacity];
-
+    // The 13 big storage arrays themselves now live in the caller-owned
+    // DattorroReverbStorage (see its own doc comment above) -- this
+    // class keeps only the DelayBuffer structs below, whose own buf_
+    // pointer gets wired to point into that external storage in
+    // Init(). Also plain, uninitialized members (no `= {}`) -- see
+    // DelayBuffer's own comment above for why; Init() memsets the
+    // storage object's arrays and its own setters fill in every
+    // "amount"/state field here.
     DelayBuffer pre_delay_;
     DelayBuffer in_diffusion_[4];
     DelayBuffer decay_diffusion1_[2];

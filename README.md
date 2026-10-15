@@ -133,6 +133,8 @@ The name, general concept, and file organization are based on
   file) and Save New; loading shows the same style of choice between
   browsing existing files or starting fresh with New — identical
   convention across performances, Dexed presets, and Grains presets.
+- Loading a performance is now much faster — a full 4-layer save that
+  used to take around 15 seconds now loads in under 2.
 - Export the current performance as a standard stereo WAV file — one full
   loop, every layer's live filter/effect/reverb chain and the
   master filter applied, peak-normalized so it doesn't come out quiet.
@@ -167,7 +169,9 @@ just one engine at a time, or both can stay on Omni as before.
   banks (see below). Button 1 is Back, Button 2 is Open at the group and
   folder-list levels; once inside an actual folder, a short Button 2 tap
   previews the highlighted patch live without leaving the browser, hold
-  to commit.
+  to commit. Opening this page used to be noticeably slow (and audibly
+  noisy) — fixed by replacing hundreds of individual SD card lookups
+  with one real directory scan.
 - **Import your own SysEx patches** — drop a `.syx` file (a single voice
   or a full 32-voice bank dump) into `DXIMPORT/` on the SD card, then
   Preset → Files → Import → hold Button 2. Each import gets its own
@@ -269,6 +273,20 @@ The Looper can also be switched off entirely while still playing Dexed
 and/or Grains live — they don't depend on it at all, and Bypass (live
 mic monitoring) keeps working too, so you can jam with Dexed/Grains plus
 a live mic with the whole looper switched off and using none of its CPU.
+
+Dexed now skips its own idle voice slots instead of always computing
+all 10 — a real, free CPU saving for sparse/single-note playing. A full
+chord still uses most or all of those 10 voices for real, though, so
+it doesn't help there: **playing a dense Dexed chord together with
+Grains active can still reach 100% CPU**. If you hit that ceiling, drop
+back toward monophonic/sparser Dexed playing while Grains is running,
+or switch one of them off while you dial in the other.
+
+The firmware itself also got more CPU-efficient across the board this
+session (compiler-level changes, nothing to turn on) — same sound,
+confirmed by ear, just more headroom before you hit a ceiling. Playing
+everything at once (all 4 layers, both instruments, reverb/delay) will
+still top out the CPU eventually — there's only so much one chip can do.
 
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
 there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains, Dexed,

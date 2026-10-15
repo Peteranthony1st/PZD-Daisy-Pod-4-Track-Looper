@@ -6315,14 +6315,33 @@ void Ui::TriggerLoadGranularPreset()
 
     GranularEngine::GranularPresetData preset;
     size_t audio_len = 0;
-    g_progress_disp = disp_;
+    // Tried detaching just the granular engine from the buffer being
+    // overwritten (SetSource(nullptr, nullptr, 0) instead of a full
+    // g_audio_suspended) on the theory that the real race was Process()
+    // reading src_l_/src_r_ while the SD DMA transfer rewrote them --
+    // real hardware testing disproved that: the failure (AUD0:1,
+    // FR_DISK_ERR) persisted identically with the engine detached. That
+    // rules out a buffer-specific race and points at the same general
+    // audio-ISR-vs-SDMMC-DMA contention the original "close9"
+    // (FR_INVALID_OBJECT) bug had -- which every other load/save
+    // function in this file already guards against with a full
+    // g_audio_suspended (TriggerLoad(), TriggerSave(),
+    // TriggerSaveGranularPreset(), TriggerLoadDexedPreset(),
+    // TriggerSaveDexedPreset()). This was simply the one left out.
+    // Yes, this does silence Dexed and the Looper layers too for the
+    // ~1-2s a Grains load now takes (down from ~15s pre-fix) -- real
+    // hardware showed that's not actually avoidable here, not an
+    // unnecessary blunt hammer.
+    g_audio_suspended = true;
+    g_progress_disp   = disp_;
     // Loaded audio lands in the same owned capture buffer Direct Record/
     // From-Layer already use -- whichever source most recently filled it
     // is exactly what SetSource() should be pointing at.
     bool ok = PerformanceStore::LoadGranularPreset(
         slot, &preset, granular_capture_buf_l_, granular_capture_buf_r_,
         granular_capture_capacity_, &audio_len, &Ui::OnSaveLoadProgress);
-    g_progress_disp = nullptr;
+    g_progress_disp   = nullptr;
+    g_audio_suspended = false;
 
     if(ok)
     {
