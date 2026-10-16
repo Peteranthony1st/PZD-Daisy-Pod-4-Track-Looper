@@ -739,6 +739,61 @@ is kept as cheap insurance against this exact failure shape for any
 current or future SDRAM-placed effect, not just the one that first
 surfaced it.
 
+### Swapping memory tiers: the reverb's big buffers into SRAM, Export/Import's scratch buffers into SDRAM
+
+The single biggest CPU win measured this session, bigger than the
+compiler-flag work combined. The shared reverb's 13 delay-line/
+allpass/lowpass stages (`DattorroReverbStorage`, ~166KB) had always
+lived in SDRAM, simply because that was the only place with room. An
+earlier attempt to test whether SDRAM's own per-access latency was
+the reverb's real bottleneck only moved ~300 bytes of small
+bookkeeping fields (`DelayBuffer` structs, the "amount" scalars) and
+measured no improvement — unsurprising in hindsight, since the actual
+166KB of big arrays, the real candidate for the cost, were never
+touched by that test.
+
+Testing the real hypothesis needed room SRAM didn't have (only ~51KB
+free at the time). `ExportWav()`/`ImportWav()`'s own scratch buffers
+(`performance_store.cpp`, all sized by `kChunkSamples=4096` — `raw_buf`,
+`dummy_in_l`/`dummy_in_r`/`dummy_ticks`, `chunk_l`/`chunk_r`,
+`reverb_send_l`/`reverb_send_r`, `delay_send_l`/`delay_send_r`,
+`pcm_chunk`) total ~196KB and sat in plain SRAM for no real reason —
+both functions already run with the audio engine fully suspended (see
+*Audio suspended during save* above), never measured by the live CPU
+meter, so SDRAM's extra latency costs nothing there. Moving that
+~196KB to SDRAM and the reverb's ~166KB the other way into SRAM nets
+out as a **drop** in SRAM usage overall (measured: 461KB → 430.6KB
+used, ~30KB freed, not consumed), not a tight squeeze.
+
+One real correctness catch, not just a mechanical tag swap:
+`dummy_in_l`/`dummy_in_r`/`dummy_ticks` relied on a declaration-time
+`= {}` zero-initializer ("an all-zero, never-written array is safe to
+reuse every chunk"). Confirmed directly against the startup code and
+linker script: only ordinary `.bss` gets zero-filled at boot (see the
+section above) — `.sdram_bss` never does, so that initializer would
+have silently stopped doing anything once these moved to SDRAM. Fixed
+with an explicit `memset()` each call instead, the same "re-zero every
+call" treatment `export_reverb_storage` already gets a few lines away.
+
+**Measured result, confirming the real hypothesis cleanly**: reverb's
+own marginal CPU contribution (over an idle baseline of 6%) dropped
+from ~29-30% down to **~11-12%** — roughly a 60% cut, not a marginal
+one. The heaviest combined scenario tested (4 recorded layers, reverb,
+Dexed, and Grains all active and playing at once) landed at **70%
+peak**, down from the 85-100%+ territory earlier combinations of
+engines had been hitting. SDRAM's own per-access latency, not the
+algorithm's arithmetic, really was the dominant cost of this
+memory-bound hot loop — moving the big arrays somewhere faster helped
+far more than anything that changed what the loop actually computes.
+Confirmed clean by ear afterward: the live reverb's sound is
+unchanged (same algorithm, same constants, only where its backing
+memory lives moved), and both an actual Export and an actual WAV
+Import were run end-to-end to verify the buffer-tier swap didn't
+introduce any artifacts — both came out clean. Export itself likely
+runs a little slower wall-clock-wise now (its own scratch buffers pay
+SDRAM's extra latency), accepted deliberately since Export already
+runs fully audio-suspended and isn't time-critical.
+
 ### Bypass's own mix volume/pan
 
 Home's Bypass (Button 2) mixes live input directly into the output; it

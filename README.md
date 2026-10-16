@@ -277,16 +277,19 @@ a live mic with the whole looper switched off and using none of its CPU.
 Dexed now skips its own idle voice slots instead of always computing
 all 10 — a real, free CPU saving for sparse/single-note playing. A full
 chord still uses most or all of those 10 voices for real, though, so
-it doesn't help there: **playing a dense Dexed chord together with
-Grains active can still reach 100% CPU**. If you hit that ceiling, drop
-back toward monophonic/sparser Dexed playing while Grains is running,
-or switch one of them off while you dial in the other.
+that specific case doesn't benefit as much.
 
-The firmware itself also got more CPU-efficient across the board this
-session (compiler-level changes, nothing to turn on) — same sound,
-confirmed by ear, just more headroom before you hit a ceiling. Playing
-everything at once (all 4 layers, both instruments, reverb/delay) will
-still top out the CPU eventually — there's only so much one chip can do.
+The firmware itself also got a lot more CPU-efficient across the board
+this session — same sound, confirmed by ear every step, just real
+headroom gained back. Part of it was compiler-level (nothing to turn
+on), and part was moving the reverb's own internal buffers to faster
+memory, which turned out to be the single biggest win of all —
+reverb's own CPU cost dropped by roughly 60%. Even the heaviest
+realistic combination (all 4 layers recorded, reverb, Dexed, and
+Grains all playing at once) now tops out well under 100% rather than
+pinning the ceiling. Playing absolutely everything at once will still
+cost real CPU eventually — there's only so much one chip can do — but
+the ceiling is much further away than it used to be.
 
 **Mixer** — one screen (`Global:Mixer`, opened by clicking the encoder
 there) with Volume/Pan/Reverb-Send for all 4 loop layers, Grains, Dexed,

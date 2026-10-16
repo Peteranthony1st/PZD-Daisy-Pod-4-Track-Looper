@@ -1896,8 +1896,12 @@ bool ImportWav(const char* filename, float* out_l, float* out_r, size_t audio_ca
     // Raw bytes, not int16_t -- unlike the 16-bit-only version of this
     // function, the sample width varies by file (2/3/4 bytes), so this
     // reads and decodes generically instead of assuming int16_t layout.
-    // Sized for the worst case (stereo, 4 bytes/sample).
-    static uint8_t raw_buf[kChunkSamples * 2 * 4];
+    // Sized for the worst case (stereo, 4 bytes/sample). SDRAM, not
+    // plain SRAM -- see the SRAM/SDRAM swap comment on the reverb's
+    // own storage in main.cpp for why (freeing room there); this is
+    // also a real SD card DMA target already, same as every other
+    // SDRAM-placed DMA-target buffer in this project.
+    static uint8_t DSY_SDRAM_BSS raw_buf[kChunkSamples * 2 * 4];
     uint32_t       bytes_per_sample = (uint32_t)bits_per_sample / 8;
     uint32_t       bytes_per_frame  = (uint32_t)num_channels * bytes_per_sample;
     uint32_t       total_frames     = data_size / bytes_per_frame;
@@ -2568,22 +2572,33 @@ bool ExportWav(TempoClock&  tempo,
     // Dummy input/ticks for the offline Process() calls below -- a
     // Playing-state layer never reads either (confirmed against
     // LooperLayer::Process()'s Playing/Paused/Overdubbing block), so an
-    // all-zero, never-written static array is safe to reuse every chunk.
-    static float                 dummy_in_l[kChunkSamples] = {};
-    static float                 dummy_in_r[kChunkSamples] = {};
+    // all-zero, never-written array is safe to reuse every chunk. SDRAM
+    // now (see the SRAM/SDRAM swap comment on the reverb's own storage
+    // in main.cpp for why), which -- unlike plain SRAM .bss -- is never
+    // auto-zeroed at boot (confirmed against the startup code and the
+    // linker script's own .sdram_bss NOLOAD section), so the old
+    // declaration-time `= {}` initializer would silently stop doing
+    // anything here; zeroed explicitly below instead, every call, same
+    // "re-zero every call" treatment export_reverb_storage already gets
+    // a few lines down.
+    static float                 dummy_in_l[kChunkSamples] DSY_SDRAM_BSS;
+    static float                 dummy_in_r[kChunkSamples] DSY_SDRAM_BSS;
     const float*                 in_ptrs[2] = {dummy_in_l, dummy_in_r};
-    static TempoClock::TempoTick dummy_ticks[kChunkSamples] = {};
+    static TempoClock::TempoTick dummy_ticks[kChunkSamples] DSY_SDRAM_BSS;
+    memset(dummy_in_l, 0, sizeof(dummy_in_l));
+    memset(dummy_in_r, 0, sizeof(dummy_in_r));
+    memset(dummy_ticks, 0, sizeof(dummy_ticks));
 
-    static float   chunk_l[kChunkSamples];
-    static float   chunk_r[kChunkSamples];
-    static float   reverb_send_l[kChunkSamples];
-    static float   reverb_send_r[kChunkSamples];
+    static float   chunk_l[kChunkSamples] DSY_SDRAM_BSS;
+    static float   chunk_r[kChunkSamples] DSY_SDRAM_BSS;
+    static float   reverb_send_l[kChunkSamples] DSY_SDRAM_BSS;
+    static float   reverb_send_r[kChunkSamples] DSY_SDRAM_BSS;
     // Same idea as reverb_send_l/r above, now processed through
     // export_delay_l/r below (mirroring main.cpp's fx_delay_l/r) so
     // exported WAVs include Delay too, not just Reverb.
-    static float   delay_send_l[kChunkSamples];
-    static float   delay_send_r[kChunkSamples];
-    static int16_t pcm_chunk[kChunkSamples * 2];
+    static float   delay_send_l[kChunkSamples] DSY_SDRAM_BSS;
+    static float   delay_send_r[kChunkSamples] DSY_SDRAM_BSS;
+    static int16_t pcm_chunk[kChunkSamples * 2] DSY_SDRAM_BSS;
 
     // Two full passes over the loop: pass 0 is a throwaway priming pass
     // (runs every layer's real effects chain plus the master filter, but

@@ -103,13 +103,22 @@ daisysp::Phaser DSY_SDRAM_BSS fx_phaser[kNumLayers];
 // reverb_send_out parameter) and run through this single instance once
 // per sample in AudioCallback() -- see fx_reverb_size01 below for how
 // its shared Size control works. The 13 big delay buffers this needs
-// (~166KB) live in fx_reverb_storage below, in SDRAM for the same
-// reason as fx_phaser above; fx_reverb_shared itself only holds small,
-// constantly-touched bookkeeping state now (DelayBuffer structs, the
-// "amount" coefficients), so it's a plain object -- see
-// DattorroReverbStorage's own doc comment for why this split exists.
-DattorroReverb              fx_reverb_shared;
-DattorroReverbStorage DSY_SDRAM_BSS fx_reverb_storage;
+// (~166KB) live in fx_reverb_storage below -- moved from SDRAM into
+// plain SRAM to test a real hypothesis: this is a memory-bound hot
+// loop (13 delay-line/allpass/lowpass stages reading/writing those
+// arrays every sample), so if SDRAM's own per-access latency was the
+// dominant cost, SRAM's lower latency should cut real CPU, with zero
+// audio-quality change (same algorithm, same constants, bit-identical
+// output). Room for this was freed by moving ExportWav()/ImportWav()'s
+// own scratch buffers (~196KB, performance_store.cpp) the other way
+// into SDRAM -- those only ever run with the audio engine suspended,
+// so SDRAM's extra latency costs nothing there. fx_reverb_shared
+// itself only holds small, constantly-touched bookkeeping state
+// (DelayBuffer structs, the "amount" coefficients), so it stays a
+// plain object -- see DattorroReverbStorage's own doc comment for why
+// this split exists.
+DattorroReverb        fx_reverb_shared;
+DattorroReverbStorage fx_reverb_storage;
 
 // ONE shared cross-feedback ("ping-pong") delay, same "one shared
 // instance, fed by per-engine sends" architecture as fx_reverb_shared
@@ -895,15 +904,16 @@ int main(void)
     // starting state every boot, not just as something the Fill knob
     // could reach if asked for.
 
-    // Zeroed before Init() for the same reason LooperLayer::Init() now
-    // zeros fx_phaser: this project's .sdram_bss objects
-    // start out holding raw leftover SDRAM contents, not zero (libDaisy's
-    // own sdram.h says as much, and the linker script/startup code
-    // confirm it -- only ordinary .bss gets zero-filled at boot).
-    // fx_reverb_shared itself no longer needs this -- it's plain .bss
-    // now (see its own declaration comment), already zero at boot; only
-    // fx_reverb_storage (the actual SDRAM object) needs the manual zero.
-    memset(&fx_reverb_storage, 0, sizeof(fx_reverb_storage));
+    // No manual zero needed here any more -- fx_reverb_shared AND
+    // fx_reverb_storage (see its own declaration comment: moved out of
+    // SDRAM into plain SRAM to test whether SDRAM's own per-access
+    // latency was the reverb's dominant CPU cost) are both plain .bss
+    // now, already zero at boot. Contrast fx_delay_l/r's own memset()
+    // just below -- those are still real .sdram_bss objects, which
+    // (per libDaisy's own sdram.h, confirmed against the linker
+    // script/startup code) start out holding raw leftover SDRAM
+    // contents, not zero, since only ordinary .bss gets zero-filled at
+    // boot.
     fx_reverb_shared.Init(hw.AudioSampleRate(), fx_reverb_storage);
     // Init() itself seeds every parameter (PreDelay, PreFilter, both Input
     // Diffusions, DecayDiffusion, Damping) to the original library's own
