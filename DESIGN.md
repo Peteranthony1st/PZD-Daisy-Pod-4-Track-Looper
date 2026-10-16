@@ -1971,12 +1971,28 @@ truncated, not refused):
   markers or playing a MIDI note through the grain engine. A straight,
   one-shot linear read of `src_l_`/`src_r_`/`src_len_` — i.e. exactly
   whatever `SetTrimRange()` currently has selected, live, nothing extra
-  to keep in sync — mixed in after Grain/Scan's own `env`/volume stage
-  (so it plays regardless of whether a note happens to be held) but
-  before the shared clamp/filter/pan/output-level chain (so it sounds
-  like it would if actually played, not a bypassed raw preview). Tapping
-  again always restarts from the beginning, same "tap to retrigger"
-  convention the preset browser's own live preview already uses.
+  to keep in sync.
+
+  **Real hardware bug, since fixed**: this preview used to be mixed in
+  *before* the shared clamp/filter/pan/output-level chain, on the
+  theory that it would then "sound like it would if actually played."
+  It didn't — `output_level_` scales up to 12x (see its own comment
+  below) specifically to compensate for how quiet a *real* grain
+  signal is after Hann-window overlap-gain division and Grain/Scan
+  Volume, and the raw, unattenuated preview sample hit that same
+  12x-ceiling compensation at near-full-scale, playing back
+  dramatically loud. Scaling the preview down by `grain_volume01_`
+  alone wasn't a real fix either — 0.8x against a 12x multiplier is
+  still ~9.6x, no perceptible difference. The actual fix: the preview
+  is now injected *after* `output_level_`/pan (and after the filter —
+  previewing the raw trim selection, not a filtered version of it),
+  with its own small fixed gain (`kPreviewGain = 0.5f`) completely
+  independent of Output Level, Grain Volume, or the filter, so its
+  loudness stays predictable regardless of how those are set. It still
+  runs through the same pre-limiter tracking and `tanhf()` safety net
+  as everything else. Tapping again always restarts from the
+  beginning, same "tap to retrigger" convention the preset browser's
+  own live preview already uses.
 
 **Filter/Mix/Reverb send/Pan/Output level**: one bus-level `Svf` pair
 (same shape Dexed's own post-mix filter follows, see above), independent

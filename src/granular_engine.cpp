@@ -967,30 +967,6 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
             mixed_r *= 0.70710678f;
         }
 
-        // Trim preview (see PlayTrimPreview()'s own comment) -- a
-        // straight, unscaled linear read of src_l_/src_r_, mixed in
-        // AFTER the env/grain_volume01_/scan_volume01_ multiply above
-        // (so it plays regardless of whether a note is actually held --
-        // those only shape the granular engine's own grains, not a
-        // one-shot preview) but BEFORE the shared clamp/filter/pan/
-        // output-level chain below, so what you hear here already
-        // matches what playing a note would actually sound like, and
-        // still gets the same clipping safety net if a note happens to
-        // be playing at the same time.
-        if(preview_active_)
-        {
-            if(preview_pos_ < src_len_)
-            {
-                mixed_l += src_l_[preview_pos_];
-                mixed_r += src_r_[preview_pos_];
-                preview_pos_++;
-            }
-            else
-            {
-                preview_active_ = false;
-            }
-        }
-
         // Safety backstop -- the overlap-gain compensation above handles
         // the common case, but the release-fade grain, Grain+Scan summing
         // together, and both Mix knobs pushed high at once can still add
@@ -1016,6 +992,40 @@ void GranularEngine::Process(size_t size, float* out_l, float* out_r, float* rev
 
         fl *= output_level_ * pan_l_gain_;
         fr *= output_level_ * pan_r_gain_;
+
+        // Trim preview (see PlayTrimPreview()'s own comment), injected
+        // here -- AFTER output_level_/pan, not mixed into mixed_l/
+        // mixed_r earlier -- on purpose. output_level_ can scale up to
+        // 12x (see SetOutputLevel01()'s own comment), tuned to
+        // compensate for how quiet a REAL grain signal is after Hann-
+        // window overlap-gain division and grain_volume01_/
+        // scan_volume01_; a real hardware bug confirmed this previously
+        // added the raw, unattenuated source sample into mixed_l/r
+        // BEFORE that multiply, so it got hit by the same up-to-12x
+        // compensation a real (far quieter) grain signal needs, playing
+        // back extremely loud even after a first attempt to fix it by
+        // scaling down by grain_volume01_ alone -- nowhere near enough
+        // against a 12x multiplier. Added here instead, with its own
+        // small fixed gain completely independent of output_level_/pan/
+        // the filter (previewing the raw trim selection, not a filtered
+        // or panned version of it), so its loudness stays predictable
+        // regardless of how Output Level or Grain Volume happen to be
+        // set. Still runs through the pre-limiter tracking and tanhf()
+        // safety net just below, same as everything else.
+        constexpr float kPreviewGain = 0.5f;
+        if(preview_active_)
+        {
+            if(preview_pos_ < src_len_)
+            {
+                fl += src_l_[preview_pos_] * kPreviewGain;
+                fr += src_r_[preview_pos_] * kPreviewGain;
+                preview_pos_++;
+            }
+            else
+            {
+                preview_active_ = false;
+            }
+        }
 
         // See IsLimiting()'s/GetPreLimiterLevel01()'s own comments --
         // both read the PRE-limiter value specifically, since tanhf()
