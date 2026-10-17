@@ -166,6 +166,21 @@ class DexedSynth
     void       SetFilterResonance01(float v01) { filter_res01_ = v01; }
     float      GetFilterResonance01() const { return filter_res01_; }
 
+    // Wavefolder -- a true West-Coast-style fold (reflects overshoot
+    // back into the waveform instead of clamping it), Dexed-only in
+    // this project since FM content pairs well with it but recorded/
+    // granular audio tends to just sound broken. amount01=0 maps to
+    // gain=1.0 inside daisysp::Wavefolder, which is an exact unity
+    // passthrough by construction (see Process()'s own comment) -- no
+    // bypass-threshold guard needed, unlike the (removed) clip-
+    // distortion feature this replaced.
+    void  SetFoldAmount01(float v01);
+    float GetFoldAmount01() const { return fold_amount01_; }
+    // Post-fold output trim, 0..1, default 1.0 = unity (no change) --
+    // tames the perceived loudness folding can add at high Amount.
+    void  SetFoldTrim01(float v01);
+    float GetFoldTrim01() const { return fold_trim01_; }
+
     // Bipolar macro knobs, centered at "as stored in the preset" (0.5),
     // matching the soft-pickup convention every other knob in this
     // project uses -- both scale linearly from 0x at v01=0 to 1x
@@ -234,6 +249,12 @@ class DexedSynth
         // DexedPresetData written before this field existed still gets a
         // sensible "no delay" default.
         float   delay_send01 = 0.f;
+        // Added once the Dexed-only wavefolder existed -- same trailing-
+        // field/safe-default convention pan01/delay_send01 above used.
+        // 0.f = bypass (matches gain=1.0 unity default), 1.f = trim
+        // unity (no change).
+        float   fold_amount01 = 0.f;
+        float   fold_trim01   = 1.f;
     };
     void ApplyPreset(const DexedPresetData& p)
     {
@@ -243,6 +264,8 @@ class DexedSynth
         SetFilterResonance01(p.filter_res01);
         SetPan01(p.pan01);
         SetDelaySend01(p.delay_send01);
+        SetFoldAmount01(p.fold_amount01);
+        SetFoldTrim01(p.fold_trim01);
     }
     DexedPresetData CapturePreset() const;
 
@@ -413,6 +436,11 @@ class DexedSynth
     FilterMode   filter_mode_     = FilterMode::Off;
     float        filter_cutoff01_ = 1.f;
     float        filter_res01_    = 0.f;
+
+    daisysp::Wavefolder fold_;
+    float fold_amount01_ = 0.f;
+    float fold_trim01_   = 1.f;
+    float fold_trim_     = 1.f; // cached scalar, see SetFoldTrim01()
 
     // msfa's native quantum -- Dx7Note::compute()/EngineMsfa::render()
     // always produce exactly this many samples per call (hardcoded via

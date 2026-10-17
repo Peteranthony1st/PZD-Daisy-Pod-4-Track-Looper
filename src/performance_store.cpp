@@ -1131,7 +1131,15 @@ struct DexedPresetFileHeader
     char     magic[4]; // "DEXP"
     uint32_t version;
 };
-constexpr uint32_t kDexedPresetFileVersion = 2; // bumped: added delay_send01
+constexpr uint32_t kDexedPresetFileVersion   = 3; // bumped: added fold_amount01/fold_trim01
+constexpr uint32_t kDexedPresetFileVersionV2 = 2; // previous version, still loadable
+// Same offsetof()-based incremental-version marker FileHeader/LayerHeader
+// already use (see kFileHeaderV11Size's own comment) -- everything up
+// to here is common to both v2 and v3; the 2 new trailing fields are
+// read only for v3, defaulted (via DexedPresetData's own member
+// initializers) for v2.
+constexpr size_t kDexedPresetDataV2Size
+    = offsetof(DexedSynth::DexedPresetData, fold_amount01);
 } // namespace
 
 bool SaveGranularPreset(int                                       slot,
@@ -1446,7 +1454,10 @@ bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset)
     UINT br;
     fr      = f_read(&file, &hdr, sizeof(hdr), &br);
     bool ok = fr == FR_OK && br == sizeof(hdr);
-    if(ok && (memcmp(hdr.magic, "DEXP", 4) != 0 || hdr.version != kDexedPresetFileVersion))
+    if(ok
+       && (memcmp(hdr.magic, "DEXP", 4) != 0
+           || (hdr.version != kDexedPresetFileVersion
+               && hdr.version != kDexedPresetFileVersionV2)))
     {
         ok = false;
         SetError("magic", FR_OK); // not a FatFS error -- file content itself is wrong
@@ -1457,13 +1468,24 @@ bool LoadDexedPreset(int slot, DexedSynth::DexedPresetData* out_preset)
     }
 
     static DexedSynth::DexedPresetData data;
-    data = DexedSynth::DexedPresetData{};
+    data = DexedSynth::DexedPresetData{}; // fold_amount01=0/fold_trim01=1 if a v2 file
     if(ok)
     {
-        fr = f_read(&file, &data, sizeof(data), &br);
-        ok = fr == FR_OK && br == sizeof(data);
+        // Common to v2 and v3 -- read unconditionally.
+        fr = f_read(&file, &data, kDexedPresetDataV2Size, &br);
+        ok = fr == FR_OK && br == (UINT)kDexedPresetDataV2Size;
         if(!ok)
             SetError("data", fr);
+    }
+    if(ok && hdr.version == kDexedPresetFileVersion)
+    {
+        // v3 only -- the 2 trailing fold fields. A v2 file leaves
+        // data's own default-member-initializer values in place.
+        UINT fold_br;
+        fr = f_read(&file, &data.fold_amount01, sizeof(data) - kDexedPresetDataV2Size, &fold_br);
+        ok = fr == FR_OK && fold_br == (UINT)(sizeof(data) - kDexedPresetDataV2Size);
+        if(!ok)
+            SetError("fold", fr);
     }
     if(ok)
         *out_preset = data;

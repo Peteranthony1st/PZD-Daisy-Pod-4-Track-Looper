@@ -1,4 +1,4 @@
-# PZD-4LOOP-DEXED-GRAINS — design notes
+# PZD-Daisy-Pod-Looper-DX7-FM-Granular — design notes
 
 ## Credit
 
@@ -144,7 +144,7 @@ Full control map:
 | Layer: Gain | Input gain (1x-4x) | — | — | — |
 | Layer: Speed | Speed (0.3x-2x, deadzone-centered on 1.0x) | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff (~20Hz-9kHz, log taper) | Resonance | Cycle filter mode (Off/Low/High/Band) | — |
-| Layer: Effect | Effect param A | Effect param B | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
+| Layer: Effect | Effect param A | Effect param B (Drive: output trim, 50% = unchanged -- see *Per-layer signal chain* below) | Cycle effect (Off/Drive/Bitcrush/Chorus/Tremolo/Phaser/AutoWah/Flanger) | — |
 | Layer: LYR-FX | Send (into the shared reverb bus, see below) | — | — | — |
 | Global: Tempo | BPM (50-240) | Bars per loop (1-16, lower-capped at slower BPM — see *Tempo, metronome, and count-in* below) | Toggle metronome | Hold 800ms = save as startup default |
 | Global: Speed | Project vari-speed (0.3x-2x, deadzone-centered on 1.0x, same curve as Layer:Speed) | — | Cycle transport mode: Normal/Scrub/Freeze (see below) | Reset to 1.0x |
@@ -167,6 +167,7 @@ Full control map:
 | Dexed: Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Dexed: Mix | Reverb send | Output level | — | — |
 | Dexed: DX-FX | Reverb send (or Delay send) | Shared reverb size (or shared delay time) | Toggle Reverb/Delay target | — |
+| Dexed: DX-FOLD | Fold Amount (0% = exact unity bypass) | Output trim (100% = unchanged) | — | — |
 | Dexed: MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Dexed: Advanced | — | — | — | — (push encoder to enter Screen::DexedOperator) |
 | Dexed: Preset | Top: Files/Import/Load New. Files → group (Roms/Dexed/Imports/User) → folder list (not User) → presets | — | Save / Select (top+group) / Back (group+folder levels) | Open (group+folder levels) / Hold: Import (Import list) / Tap: preview, Hold 800ms: confirm (a real preset) |
@@ -543,8 +544,9 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
 - **Filter**: cutoff and resonance are both live, turnable while the
   loop plays. Off/Low-pass/High-pass/Band-pass, cycled with Button 1.
 - **Character effect** (one per layer, DaisySP-backed, mutually
-  exclusive — pick one): Drive (Overdrive), Bitcrush (Decimator — Param
-  A = bit depth, Param B = downsample), Chorus (Param A = depth, Param B
+  exclusive — pick one): Drive (Overdrive — Param A = drive amount,
+  Param B = output trim), Bitcrush (Decimator — Param A = bit depth,
+  Param B = downsample), Chorus (Param A = depth, Param B
   = rate — fed the left channel only, generates its own stereo spread, a
   deliberate simplification), Tremolo (depth/rate), Phaser (depth/rate),
   AutoWah (wah amount/level), Flanger (depth/rate). Switching effect type
@@ -552,6 +554,24 @@ looped sample -> Filter (Svf: Low/High/Band) -> one selectable character
   verified against DaisySP's actual source, not assumed) so a newly
   selected effect never starts already dialed in loud — you turn each
   knob up from 0 to bring it in.
+  **Drive's Param B specifically is a real exception to that "0 = off"
+  framing**, and worth stating plainly: Overdrive is a genuine gain
+  stage (louder drive = louder output, not just more saturated), so a
+  plain 0..1 trim knob was mapped bipolar instead — the same "0x at 0,
+  1x/unchanged at 0.5, 2x at 1" convention `DexedSynth::SetBrightness01()`/
+  `SetEnvSpeed01()` already use — specifically so the shared param
+  pair's own pre-existing *default* (0.5) means "no change" for anyone
+  who saves a preset with Drive selected and never touches Knob 2. A
+  real, direct consequence of this that's easy to miss: `SetEffect()`'s
+  own reset-to-0-on-type-change (above) still fires for Drive like every
+  other effect, so freshly *selecting* Drive via Button 1 lands Trim at
+  0% — which under the bipolar mapping means 0x (silence), not unity.
+  Confirmed, explained, and deliberately left as-is rather than special-
+  cased: the reset convention predates Trim and is correct for every
+  other effect's Param B (a real rate/depth knob, where 0 is a sensible
+  "off"); fixing the one Drive-specific collision would mean making
+  `SetEffect()` itself aware of which effect it's switching into, not a
+  change to Trim's own math.
 - **Reverb**: ONE shared `DattorroReverb` bus (`main.cpp`'s
   `fx_reverb_shared`), not one per layer. Every layer's Send-scaled
   signal is summed into a shared accumulator (`LooperLayer::Process()`'s
@@ -1462,6 +1482,90 @@ Teensy 4.1 (NXP i.MX RT1062) and the Daisy Seed (STM32H750) are both
 Cortex-M7 cores with a hardware FPU, same DSP class; Teensy's ~25%
 higher clock and its PSRAM-gated extra polyphony explain its own specs,
 not this specific behavior.
+
+### Wavefolder (DexedParamPage::Fold)
+
+A direct follow-up request after an earlier hard/soft-clip "Distortion"
+feature (Dexed + Grains + all 4 Looper layers, each with its own Soft/
+Hard toggle) was fully implemented, flashed, and real-hardware-tested,
+but ultimately reverted whole: Soft and Hard kept sounding
+indistinguishable even after two separate fix attempts (first widening
+the drive-gain ceiling, then switching Soft's curve from the original
+cubic polynomial to a `tanhf()`-based one, then giving that curve a
+lower asymptote than Hard's so the two could never converge at extreme
+drive) — the user's own verdict was "I don't like it," not a specific
+remaining bug, so the whole feature was shelved (`git stash`, not
+deleted) rather than iterated on further.
+
+The replacement idea, Dexed-only this time: a true wavefolder
+(`daisysp::Wavefolder`, MIT, already vendored and already linked into
+this project's DaisySP build — no new code needed for the DSP itself).
+Two reasons this is a different bet, not a repeat of the same mistake:
+
+- **A fundamentally different nonlinearity, not two flavors of the
+  same one.** Clipping (hard or soft) just flattens peaks — on Dexed's
+  already harmonically dense FM output, both flavors converged to
+  "generically crunchy," which was the real root cause of the old
+  feature's "can't tell them apart" complaint. Folding reflects
+  overshoot back into the waveform instead, generating genuinely new
+  harmonic/inharmonic content proportional to drive. There's also only
+  one mode this time (no Soft/Hard toggle to confuse), so the "do two
+  sub-modes actually sound different" problem doesn't exist here by
+  construction.
+- **Dexed-only is deliberate, not a first step toward everywhere.**
+  Folding on recorded/granular audio (Grains, Looper layers) tends to
+  read as broken digital artifacts rather than character — this is
+  treated as a synthesis-stage effect (the classic FM + West-Coast-
+  style wavefolding pairing), not a general-purpose "make anything
+  crunchy" effect.
+
+**A real unity-bypass win over the old Distortion feature, found by
+reading `Wavefolder::Process()`'s own math rather than assuming it**:
+with `gain=1, offset=0` (its own `Init()` defaults), the fold formula
+returns its input completely unchanged for any value in (-1,1). Mapping
+Fold Amount's `0%` knob position to `gain=1.0` (not `gain=0`, which
+would be the exact "drive=0 silences everything" trap the old
+Distortion feature needed a caller-side bypass-threshold special case
+to avoid) gives a genuine, exact unity bypass for free — no equivalent
+of `kDriveBypassThreshold` needed anywhere in this feature.
+
+**Insertion point**: right after the post-mix bus filter, before the
+pre-limiter tap — i.e. operating on `kHeadroomScale`'s own output (see
+*FM voice summing and chord headroom* above), deliberately the
+quietest point in Dexed's whole chain (a single voice peaks ~0.05
+there, a 3-note chord ~0.125). `kFoldMaxGain` (currently `40.f`,
+explicitly a retune-by-ear starting point, not a settled value) exists
+specifically to push that quiet signal into the fold's own interesting
+range at all — chosen a little below the old Distortion feature's own
+`kDriveMaxGain=60` at this identical insertion point, after a real hot/
+feedback-heavy patch was found to already start audibly distorting at
+just 6% knob position under that 60x.
+
+**A real, expected (not buggy) consequence, confirmed directly rather
+than assumed**: minor chords fold noticeably worse than major ones, and
+polyphony in general folds worse than a single note. The fold stage
+sits *after* every voice is already summed into one mono signal
+(`stage_f_`, see *FM voice summing and chord headroom*), so folding a
+chord means folding the sum of several frequencies at once —
+intermodulation distortion, new tones at the sums/differences of every
+pair of frequencies present, not just harmonics of any one note. A
+folder is especially prone to this versus a clip: every fold-crossing
+re-reflects the whole complex waveform, so small amplitude changes from
+notes beating against each other get thrown into large, chaotic
+harmonic reshuffling. Minor intervals (a minor third's 6:5 ratio
+overlaps less cleanly with the root's harmonic series than a major
+third's 5:4) are a bit rougher even dry, so folding turns that mild
+roughness into outright dissonance faster than it does for a major
+chord. This matches real analog/digital wavefolder behavior generally
+(classically paired with a single oscillator or unison, not chords, for
+exactly this reason) — not something specific to this implementation,
+and not something this change tries to engineer around.
+
+An independent output trim knob (Knob 2, same `powf(v01, 2.5f)` taper
+as this project's other Output Level-style knobs, default 100% =
+unchanged) exists for the same reason Drive's own Param B trim does
+(above): folding is a real gain stage before the clip, so loudness
+climbs with Amount even though the folded output's peak is bounded.
 
 ### Skipping idle voices in RenderQuantum()
 

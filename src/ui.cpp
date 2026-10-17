@@ -73,8 +73,9 @@ const char* EffectName(LayerEffect e)
 }
 
 // Knob 1 / Knob 2 labels for the Effect page -- matches the param
-// mapping in LooperLayer::ProcessEffectsChain(). Drive only reads
-// ParamA (ParamB does nothing for it), everything else uses both.
+// mapping in LooperLayer::ProcessEffectsChain(). Every mode uses both
+// knobs (Drive's ParamB is an output trim, not a core Overdrive param
+// -- see ProcessEffectsChain()'s own comment).
 const char* EffectParamALabel(LayerEffect e)
 {
     switch(e)
@@ -104,7 +105,7 @@ const char* EffectParamBLabel(LayerEffect e)
 {
     switch(e)
     {
-        case LayerEffect::Drive: return "-";
+        case LayerEffect::Drive: return "Trim";
         case LayerEffect::Bitcrush: return "Rate";
         case LayerEffect::Chorus: return "Rate";
         case LayerEffect::Tremolo: return "Rate";
@@ -1418,6 +1419,7 @@ Ui::KnobContext Ui::CurrentKnobContext() const
                 case DexedParamPage::FX:
                     return dexed_fx_target_delay_ ? KnobContext::DexedFxDelay
                                                      : KnobContext::DexedFxReverb;
+                case DexedParamPage::Fold: return KnobContext::DexedFold;
                 case DexedParamPage::MIDI: return KnobContext::DexedMidi;
                 case DexedParamPage::Advanced: return KnobContext::DexedAdvanced;
                 case DexedParamPage::Preset: return KnobContext::DexedPreset;
@@ -1618,6 +1620,13 @@ void Ui::SyncPickupTargets(KnobContext ctx)
             {
                 k1_pickup_raw_[i] = dexed_->GetDelaySend01();
                 k2_pickup_raw_[i] = delay_time01_;
+            }
+            break;
+        case KnobContext::DexedFold:
+            if(dexed_)
+            {
+                k1_pickup_raw_[i] = dexed_->GetFoldAmount01();
+                k2_pickup_raw_[i] = dexed_->GetFoldTrim01();
             }
             break;
         case KnobContext::DexedMidi:
@@ -2425,6 +2434,14 @@ void Ui::ApplyKnobs()
                         if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
                             delay_time01_ = Clampf(k2, 0.f, 1.f);
                     }
+                    break;
+                case DexedParamPage::Fold:
+                    // K1 = Fold Amount, K2 = output trim -- no
+                    // sub-mode, unlike FX above.
+                    if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
+                        dexed_->SetFoldAmount01(k1);
+                    if(KnobPickUp(k2, k2_pickup_raw_[ci], k2_pickup_engaged_[ci]))
+                        dexed_->SetFoldTrim01(k2);
                     break;
                 case DexedParamPage::MIDI:
                     if(KnobPickUp(k1, k1_pickup_raw_[ci], k1_pickup_engaged_[ci]))
@@ -4762,6 +4779,7 @@ void Ui::DrawDexedScreen()
         case DexedParamPage::Filter: page_name = "Filter"; break;
         case DexedParamPage::Mix: page_name = "Mix"; break;
         case DexedParamPage::FX: page_name = "DX-FX"; break;
+        case DexedParamPage::Fold: page_name = "DX-FOLD"; break;
         case DexedParamPage::MIDI: page_name = "MIDI"; break;
         case DexedParamPage::Advanced: page_name = "Advanced"; break;
         case DexedParamPage::Preset: page_name = "Preset"; break;
@@ -4924,6 +4942,21 @@ void Ui::DrawDexedScreen()
             DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY,
                              dexed_fx_target_delay_ ? "Reverb" : "Reverb*", "", "",
                              dexed_fx_target_delay_ ? "Delay*" : "Delay");
+            break;
+        }
+        case DexedParamPage::Fold:
+        {
+            // No sub-mode, unlike FX above -- just Amount + Trim, same
+            // "no body text, scope takes the rest" idiom as Mix/MIDI.
+            char amt_val[8], trim_val[8];
+            snprintf(amt_val, sizeof(amt_val), "%d%%",
+                      (int)(dexed_->GetFoldAmount01() * 100.f + 0.5f));
+            snprintf(trim_val, sizeof(trim_val), "%d%%",
+                      (int)(dexed_->GetFoldTrim01() * 100.f + 0.5f));
+            DrawOscilloscope(12, kFooterDividerY - 2, dexed_scope_buf_, dexed_scope_capacity_);
+            DrawControlRow(kFooterRow1Y, false, kFooterDividerY, "Amt", amt_val, trim_val,
+                             "Trim");
+            DrawControlRow(kFooterRow2Y, true, kFooterInterRowDividerY, "", "", "", "");
             break;
         }
         case DexedParamPage::MIDI:

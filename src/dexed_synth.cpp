@@ -87,6 +87,18 @@ constexpr float kHeadroomScale = 1.f / 35.28f;
 // mode this exists to prevent.
 constexpr int32_t kVoiceClampQ24 = (int32_t)1 << 30;
 
+// Wavefolder -- Dexed-only effect (see SetFoldAmount01()'s own comment).
+// This insertion point (right after kHeadroomScale, see its own comment
+// above) is deliberately the quietest point in this engine's whole
+// chain -- a single voice's real measured peak there is ~0.05, a 3-note
+// chord ~0.125 -- so, same reasoning the old (removed) Drive feature's
+// kDriveMaxGain=60 needed at this identical point, real gain is needed
+// to push a typical signal into the fold's own "interesting" range at
+// all. Started lower than that 60x given a real hot/feedback-heavy
+// patch was already distorting at just 6% knob position with the old
+// feature's 60x -- retune by ear on real hardware, not a final value.
+constexpr float kFoldMaxGain = 40.f;
+
 // See DexedSynth::IsLimiting()'s own comment. 1.0 matches this engine's
 // own documented limiter behavior -- tanhf() only compresses hard once
 // a peak actually approaches/exceeds unity, so that's the meaningful
@@ -131,6 +143,7 @@ void DexedSynth::Init(float sample_rate)
 
     filter_l_.Init(sample_rate_);
     filter_r_.Init(sample_rate_);
+    fold_.Init();
 
     ctrls_.core          = &engine_;
     ctrls_.values_[kControllerPitch]        = 0x2000; // centered, see Dx7Note::compute()'s pb math
@@ -215,6 +228,26 @@ void DexedSynth::SetPan01(float v01)
     pan01_      = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
     pan_l_gain_ = 1.f - pan01_;
     pan_r_gain_ = pan01_;
+}
+
+void DexedSynth::SetFoldAmount01(float v01)
+{
+    fold_amount01_ = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    // amount01=0 -> gain=1.0, an exact unity passthrough through
+    // daisysp::Wavefolder::Process() (see its own comment) -- no
+    // bypass-threshold guard needed, unlike the removed Drive feature.
+    fold_.SetGain(1.f + fold_amount01_ * (kFoldMaxGain - 1.f));
+}
+
+void DexedSynth::SetFoldTrim01(float v01)
+{
+    fold_trim01_ = v01 < 0.f ? 0.f : (v01 > 1.f ? 1.f : v01);
+    // Deliberately NOT the *1.4f boosted-ceiling convention
+    // SetOutputLevel01() above uses -- this trim's default (1.0) has
+    // to mean exactly "unity, no change" (see fold_trim01's own doc
+    // comment in DexedPresetData), so v01=1.0 must land at gain 1.0,
+    // not a +40% boost.
+    fold_trim_ = powf(fold_trim01_, 2.5f);
 }
 
 bool DexedSynth::VoiceIsIdle(int voice_index)
@@ -465,6 +498,15 @@ void DexedSynth::Process(size_t size, float* out_l, float* out_r, float* reverb_
             }
         }
 
+        // Wavefolder -- after the bus filter, before the pre-limiter
+        // tap just below, so IsLimiting()/GetPreLimiterLevel01() read
+        // the post-fold signal (same "read what's actually about to
+        // hit the limiter" principle the filter above already
+        // follows). No bypass-threshold guard needed: amount01=0 maps
+        // to gain=1.0, an exact unity passthrough (see
+        // SetFoldAmount01()'s own comment).
+        s = fold_.Process(s) * fold_trim_;
+
         // See IsLimiting()'s/GetPreLimiterLevel01()'s own comments --
         // both read the PRE-limiter value specifically, since tanhf()
         // below bounds its own output to (-1,1) no matter how hard
@@ -614,6 +656,8 @@ DexedSynth::DexedPresetData DexedSynth::CapturePreset() const
     p.filter_res01    = filter_res01_;
     p.pan01           = pan01_;
     p.delay_send01    = delay_send01_;
+    p.fold_amount01   = fold_amount01_;
+    p.fold_trim01     = fold_trim01_;
     return p;
 }
 

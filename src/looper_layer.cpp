@@ -392,11 +392,25 @@ void LooperLayer::ProcessEffectsChain(float dry_l, float dry_r, float& out_l, fl
     switch(effect_)
     {
         case LayerEffect::Drive:
+        {
             fx_drive_[0].SetDrive(effect_param_a_);
             fx_drive_[1].SetDrive(effect_param_a_);
             out_l = fx_drive_[0].Process(dry_l);
             out_r = fx_drive_[1].Process(dry_r);
+            // ParamB as output trim -- same bipolar "0x at 0, 1x
+            // (unchanged) at 0.5, 2x at 1" convention DexedSynth::
+            // SetBrightness01()/SetEnvSpeed01() already use, chosen
+            // specifically so effect_param_b_'s existing default (0.5,
+            // shared across every LayerEffect mode) still means "no
+            // change" here -- any layer saved before this existed, or
+            // that never touched K2 on this page, keeps sounding
+            // exactly as loud as before.
+            float trim = effect_param_b_ >= 0.5f ? 1.f + (effect_param_b_ - 0.5f) * 2.f
+                                                    : effect_param_b_ * 2.f;
+            out_l *= trim;
+            out_r *= trim;
             break;
+        }
 
         case LayerEffect::Bitcrush:
             fx_bitcrush_[0].SetBitcrushFactor(effect_param_a_);

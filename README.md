@@ -2,7 +2,7 @@
 
 Video and looper generated WAV file below!
 
-# PZD-4LOOP-DEXED-GRAINS
+# PZD-Daisy-Pod-Looper-DX7-FM-Granular
 
 A 4-layer stereo loop station firmware for the [Electrosmith Daisy
 Pod](https://daisy.audio/products/pod), with an I2C OLED
@@ -78,7 +78,9 @@ The name, general concept, and file organization are based on
 - Filter: Off / Low-pass / High-pass / Band-pass, with live cutoff and
   resonance
 - One character effect at a time: Drive, Bitcrush, Chorus, Tremolo,
-  Phaser, AutoWah, or Flanger
+  Phaser, AutoWah, or Flanger. Drive's second knob is an output trim
+  (0%–200%, centered at 100% = unchanged) to compensate for how much
+  louder a heavily-driven signal gets
 - Reverb send (each layer sends into one shared reverb — see Size below)
 - Input gain (1x–4x) for quiet sources
 
@@ -192,6 +194,15 @@ just one engine at a time, or both can stay on Omni as before.
   pages. Automatically compensates its own headroom when several notes
   play at once, so a hot, high-feedback patch doesn't distort just from
   being played as a chord.
+- **DX-FOLD — a true wavefolder, Dexed-only.** Unlike a clip-style
+  distortion (which just flattens peaks), folding reflects an
+  overshooting signal back into the waveform, generating genuinely new
+  harmonic content the harder it's driven — a classic pairing with FM
+  synthesis, not something that suits recorded/granular audio as well,
+  which is why it's kept exclusive to Dexed rather than added
+  everywhere. Knob 1 is Fold Amount (0% is an exact, click-free bypass);
+  Knob 2 is output trim, same role as Drive's own trim above. Sits
+  right after DX-FX in the page order.
 - **Advanced editor** — the last simple page before Preset drills into a
   real per-operator editor (encoder click to enter, short click to
   return, long-press to Home like everywhere else). Its first page is
@@ -414,7 +425,7 @@ Export gets baked into the file on purpose.
 | Layer: Gain | Input gain | — | — | — |
 | Layer: Speed | Speed | — | Tap = reset to 1.0x | — |
 | Layer: Filter | Cutoff | Resonance | Cycle filter mode | — |
-| Layer: Effect | Effect param A | Effect param B | Cycle effect | — |
+| Layer: Effect | Effect param A | Effect param B (Drive: output trim, center = unchanged) | Cycle effect | — |
 | Layer: LYR-FX | Send | — | — | — |
 | Global: Tempo | BPM (50–240) | Bars (1–16, lower-capped at slower BPM) | Toggle metronome | Hold 800ms = Save as startup default |
 | Global: Speed | Vari-speed | — | Cycle Normal/Scrub/Freeze | Reset to 1.0x |
@@ -442,6 +453,7 @@ Export gets baked into the file on purpose.
 | Filter | Cutoff | Resonance | Cycle filter mode | — |
 | Mix | Reverb send | Output level | — | — |
 | DX-FX | Reverb send / Delay send | Shared reverb size / delay time | Toggle Reverb/Delay | — |
+| DX-FOLD | Fold Amount (0% = bypass) | Output trim | — | — |
 | MIDI | MIDI channel (Omni, 1-16) | — | — | — |
 | Advanced | — | — | — | — (push encoder to enter the operator editor) |
 | Preset | Top: Files/Import/New. Files → Roms/Dexed/Imports/User group → folder → presets | — | Save / Select (top) / Back (group+folder) | Open (group+folder) / Hold: Import / Tap: preview, Hold: confirm |

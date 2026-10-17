@@ -470,6 +470,11 @@ class Ui
         // places, same "same value, multiple entry points" idiom already
         // established for Reverb Send across Mix/Global Mixer).
         FX,
+        // Dexed-only wavefolder. K1 = Fold Amount, K2 = output trim --
+        // no Button1/Button2 toggle, unlike FX above, since folding
+        // has no sub-mode (see DexedSynth::SetFoldAmount01()'s own
+        // comment).
+        Fold,
         // K1 only, knob-quantized across 17 buckets (Omni + channels
         // 1-16) -- which incoming MIDI channel this engine responds to.
         // Default Omni (respond to everything), same behavior as before
@@ -665,6 +670,7 @@ class Ui
         // GranularFxReverb/GranularFxDelay above.
         DexedFxReverb,
         DexedFxDelay,
+        DexedFold, // Wavefolder's own Amount + Trim pair -- no sub-mode toggle
         DexedMidi, // K1 only -- which MIDI channel this engine listens on
         DexedAdvanced, // entry point only -- see Screen::DexedOperator instead
         DexedPreset, // browses a list directly, no pickup used
